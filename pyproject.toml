@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "esg-chatbot"
+version = "0.1.0"
+description = "ESG document RAG chatbot with persistent vector retrieval"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openai",
+    "python-dotenv",
+    "sentence-transformers",
+    "transformers",
+    "scikit-learn",
+    "numpy",
+    "sqlite-vec",
+    "httpx",
+    "fastapi",
+    "uvicorn",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+esg-chatbot = "chatbot.cli:main"
+view-index = "chatbot.view_index:main"
+esg-api = "chatbot.api:run"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

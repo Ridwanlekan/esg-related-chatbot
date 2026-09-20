@@ -1,0 +1,6 @@
+AZURE_OPENAI_API_KEY = "<put API key here>"
+AZURE_OPENAI_ENDPOINT = "<Azure OpenAI endpoint>"
+OPENAI_API_VERSION = "<Azure OpenAI API version>"
+MODEL_NAME = "<Azure OpenAI model name>"
+TOKENIZERS_PARALLELISM = False
+# MAX_RETAINED_SESSIONS = 500   # chat sessions kept (oldest auto-pruned)

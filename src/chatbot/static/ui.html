@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESG RAG Chatbot</title>
+<style>
+  :root {
+    --bg: #0f1520; --panel: #17202f; --panel-2: #1e293b; --border: #2b3a52;
+    --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; --accent-2: #0ea5e9;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .badge {
+    font-size: 11px; padding: 3px 10px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .badge.ok { color: #4ade80; border-color: rgba(74,222,128,.4); }
+  .badge.err { color: #f87171; border-color: rgba(248,113,113,.4); }
+  .spacer { flex: 1; }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 7px 12px; font-size: 12px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  main { flex: 1; display: grid; grid-template-columns: 1fr 320px; min-height: 0; }
+  #chat {
+    display: flex; flex-direction: column; min-width: 0;
+    border-right: 1px solid var(--border);
+  }
+  #messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 78%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: var(--accent-2); color: #062033; }
+  .msg.bot { align-self: flex-start; background: var(--panel-2); border: 1px solid var(--border); }
+  .msg .sources { margin-top: 8px; font-size: 11px; color: var(--muted); }
+  .msg .sources span { margin-right: 8px; }
+  .cursor::after { content: "▌"; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #composer { display: flex; gap: 10px; padding: 14px 20px; border-top: 1px solid var(--border); }
+  #input {
+    flex: 1; resize: none; background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
+    font-size: 14px; font-family: inherit; min-height: 42px; max-height: 140px;
+  }
+  #input:focus { outline: none; border-color: var(--accent); }
+  aside { display: flex; flex-direction: column; gap: 16px; padding: 20px; overflow-y: auto; }
+  aside section { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+  aside h2 { margin: 0 0 10px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  aside input {
+    width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; font-size: 13px; margin-bottom: 8px;
+  }
+  .search-row { display: flex; gap: 8px; }
+  .search-row input { flex: 1; margin-bottom: 0; }
+  #search-results { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
+  #search-results .hit { border: 1px solid var(--border); border-radius: 8px; padding: 8px; background: var(--panel-2); }
+  #search-results .hit .meta { color: var(--muted); margin-bottom: 4px; }
+  #ingest-result { margin-top: 10px; font-size: 12px; color: var(--muted); white-space: pre-wrap; }
+  aside button { width: 100%; }
+  aside .muted { color: var(--muted); font-size: 12px; }
+  #session-list { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+  .session-row {
+    display: flex; align-items: center; gap: 8px; padding: 8px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--panel-2); cursor: pointer;
+  }
+  .session-row:hover { border-color: var(--accent); }
+  .session-row.current { border-color: var(--accent); }
+  .session-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+  .session-del { width: auto; flex: none; padding: 2px 8px; color: var(--muted); }
+  .session-del:hover { color: var(--text); border-color: var(--border); }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { border-top: 1px solid var(--border); } }
+</style>
+</head>
+<body>
+<header>
+  <h1>ESG RAG Chatbot</h1>
+  <span id="health" class="badge">checking…</span>
+  <span class="spacer"></span>
+  <span id="session-label" class="badge">session: —</span>
+  <button id="new-session">New session</button>
+</header>
+
+<main>
+<section id="chat">
+      <div id="messages">
+        <div class="msg bot">Hello! Ask me anything about the documents in the index (current: Jupiter, Ada Lovelace, CRISPR). Follow-up questions are auto-expanded from history. Type below. Press Enter to send, Shift+Enter for a new line.</div>
+      </div>
+      <div id="composer">
+        <textarea id="input" rows="1" placeholder="Ask about the documents…"></textarea>
+        <button id="send">Send</button>
+      </div>
+    </section>
+
+  <aside>
+    <section>
+      <h2>Sessions</h2>
+      <div id="session-list"><div class="muted">no sessions yet</div></div>
+      <button id="load-more" style="display:none; margin-top:8px;">Load more</button>
+    </section>
+    <section>
+      <h2>Search (no LLM)</h2>
+      <div class="search-row">
+        <input id="search-q" placeholder="retrieval query">
+        <button id="search-btn">Go</button>
+      </div>
+      <div id="search-results"></div>
+    </section>
+    <section>
+      <h2>Tools</h2>
+      <button id="ingest">Re-index data/</button>
+      <div id="ingest-result"></div>
+    </section>
+  </aside>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const SESSION_PAGE = 12;
+let sessionId = localStorage.getItem("esg_session") || null;
+let streaming = false;
+let sessionOffset = 0;
+
+function setSession(id) {
+  sessionId = id;
+  if (id) localStorage.setItem("esg_session", id);
+  else localStorage.removeItem("esg_session");
+  $("session-label").textContent = "session: " + (id ? id.slice(0, 8) : "—");
+}
+
+function addMsg(role, text) {
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  if (role === "bot") {
+    div.innerHTML = '<span class="body"></span>';
+    div.querySelector(".body").textContent = text;
+  } else {
+    div.textContent = text;
+  }
+  $("messages").appendChild(div);
+  $("messages").scrollTop = $("messages").scrollHeight;
+  return div;
+}
+
+function addSources(botEl, sources) {
+  const seen = [...new Set(sources)];
+  const prev = botEl.querySelector(".sources");
+  if (prev) prev.remove();
+  if (!seen.length) return;
+  const s = document.createElement("div");
+  s.className = "sources";
+  s.textContent = "sources: " + seen.join(" · ");
+  botEl.appendChild(s);
+}
+
+function clearMessages() { $("messages").innerHTML = ""; }
+function renderWelcome() { addMsg("bot", "Hello! Ask me anything about the documents in the index. Follow-ups auto-expand from history."); }
+
+async function health() {
+  try {
+    const r = await fetch("/health");
+    const ok = r.ok;
+    const b = $("health");
+    b.className = "badge " + (ok ? "ok" : "err");
+    b.textContent = ok ? "server online" : "error";
+  } catch {
+    const b = $("health");
+    b.className = "badge err";
+    b.textContent = "offline";
+  }
+}
+
+async function loadMessages(id) {
+  clearMessages();
+  const res = await fetch("/sessions/" + id);
+  const data = await res.json();
+  if (!data.messages || !data.messages.length) { renderWelcome(); return; }
+  for (const m of data.messages) {
+    if (m.role === "user") addMsg("user", m.content);
+    else addMsg("bot", m.content);
+  }
+}
+
+async function renderSessions() {
+  const box = $("session-list");
+  let data;
+  try {
+    const res = await fetch("/sessions?limit=" + SESSION_PAGE + "&offset=" + sessionOffset);
+    data = res.ok ? await res.json() : { sessions: [], total: 0 };
+  } catch { data = { sessions: [], total: 0 }; }
+  if (!sessionOffset) box.innerHTML = "";
+  if (!data.sessions.length && !sessionOffset) {
+    box.innerHTML = '<div class="muted">no sessions yet</div>';
+    $("load-more").style.display = "none";
+    return;
+  }
+  for (const s of data.sessions) {
+    const row = document.createElement("div");
+    row.className = "session-row" + (s.session_id === sessionId ? " current" : "");
+    const label = document.createElement("div");
+    label.className = "session-label";
+    const last = (s.last_message || "…").slice(0, 40);
+    label.textContent = s.created_at.slice(11, 16) + " · " + last + " · " + s.message_count + " msgs";
+    const del = document.createElement("button");
+    del.className = "session-del";
+    del.textContent = "×";
+    del.title = "delete session";
+    del.onclick = async (e) => {
+      e.stopPropagation();
+      await fetch("/sessions/" + s.session_id, { method: "DELETE" });
+      if (sessionId === s.session_id) { setSession(null); clearMessages(); renderWelcome(); }
+      sessionOffset = 0;
+      renderSessions();
+    };
+    row.onclick = async () => {
+      if (s.session_id !== sessionId) { setSession(s.session_id); await loadMessages(s.session_id); }
+    };
+    row.appendChild(label);
+    row.appendChild(del);
+    box.appendChild(row);
+  }
+  const hasMore = sessionOffset + data.sessions.length < data.total;
+  $("load-more").style.display = hasMore ? "block" : "none";
+}
+
+async function send() {
+  const q = $("input").value.trim();
+  if (!q || streaming) return;
+  $("input").value = "";
+  addMsg("user", q);
+  streaming = true;
+  $("send").disabled = true;
+
+  const bot = addMsg("bot", "");
+  const body = bot.querySelector(".body");
+  body.textContent = "thinking…";
+  bot.classList.add("cursor");
+
+  const queue = [];
+  let sources = [];
+  let timer = null;
+
+  function drain() {
+    if (!streaming) return;
+    let n = 5;
+    while (n-- > 0 && queue.length) body.textContent += queue.shift();
+    $("messages").scrollTop = $("messages").scrollHeight;
+    if (queue.length) timer = requestAnimationFrame(drain);
+  }
+  function pushDelta(chunk) {
+    if (body.textContent === "thinking…") body.textContent = "";
+    queue.push(chunk);
+    if (queue.length <= 8) { if (timer) cancelAnimationFrame(timer); timer = requestAnimationFrame(drain); }
+  }
+
+  try {
+    const res = await fetch("/chat/stream", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ question: q, session_id: sessionId }),
+    });
+    const sid = res.headers.get("X-Session-ID");
+    if (sid) setSession(sid);
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, idx).replace(/\r$/, "");
+        buf = buf.slice(idx + 1);
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        try {
+          const obj = JSON.parse(payload);
+          if (obj.delta) pushDelta(obj.delta);
+          else if (obj.sources) sources = obj.sources;
+        } catch {}
+      }
+    }
+    if (queue.length) await new Promise((r) => setTimeout(r, 30));
+    bot.classList.remove("cursor");
+    const remaining = queue.splice(0).join("");
+    if (remaining) body.textContent += remaining;
+    if (sources.length) addSources(bot, sources);
+    if (body.textContent === "thinking…") body.textContent = "(no response)";
+  } catch (e) {
+    bot.classList.remove("cursor");
+    body.textContent = "Error: " + e.message;
+  } finally {
+    if (timer) cancelAnimationFrame(timer);
+    streaming = false;
+    $("send").disabled = false;
+  }
+}
+
+async function doSearch() {
+  const q = $("search-q").value.trim();
+  if (!q) return;
+  const res = await fetch("/search", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ question: q, k: 5 }),
+  });
+  const data = await res.json();
+  const box = $("search-results");
+  box.innerHTML = "";
+  for (const hit of data.results || []) {
+    const div = document.createElement("div");
+    div.className = "hit";
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    meta.textContent = `${hit.source} #${hit.chunk_index} · sim ${hit.similarity}`;
+    const txt = document.createElement("div");
+    txt.textContent = hit.content.slice(0, 220);
+    div.appendChild(meta);
+    div.appendChild(txt);
+    box.appendChild(div);
+  }
+}
+
+async function doIngest() {
+  $("ingest").disabled = true;
+  $("ingest").textContent = "indexing…";
+  try {
+    const r = await fetch("/ingest", { method: "POST" });
+    const data = await r.json();
+    $("ingest-result").textContent =
+      `docs seen: ${data.documents_seen}\nre-indexed: ${data.documents_reindexed}\n` +
+      `chunks added: ${data.chunks_upserted}\nstale removed: ${data.stale_chunks_removed}`;
+  } finally {
+    $("ingest").disabled = false;
+    $("ingest").textContent = "Re-index data/";
+  }
+}
+
+$("send").addEventListener("click", send);
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+$("search-btn").addEventListener("click", doSearch);
+$("search-q").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+$("ingest").addEventListener("click", doIngest);
+$("load-more").addEventListener("click", () => { sessionOffset += SESSION_PAGE; renderSessions(); });
+$("new-session").addEventListener("click", () => {
+  setSession(null);
+  clearMessages();
+  renderWelcome();
+});
+
+setSession(sessionId);
+renderSessions();
+health();
+setInterval(health, 30000);
+</script>
+</body>
+</html>

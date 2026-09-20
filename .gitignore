@@ -1,0 +1,37 @@
+# Secrets / local configuration
+.env
+*.env
+!**/env_example.txt
+
+# Local workflow notes (never commit)
+doc/solution-workflow.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Build artifacts
+build/
+dist/
+
+# Virtual environment
+venv/
+.venv/
+
+# Downloaded ML models (re-downloadable from HuggingFace)
+models/
+*.h5
+*.safetensors
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Vector index database
+.index/
