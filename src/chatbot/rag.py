@@ -17,7 +17,8 @@ from chatbot.vector_store import SQLiteVecStore
 load_dotenv()
 
 DEFAULT_DATA_DIR = os.path.join(BASE_DIR, "data")
-DEFAULT_STORE_PATH = os.path.join(BASE_DIR, ".index", "vectors.sqlite3")
+DEFAULT_INDEX_DIR = os.environ.get("INDEX_DIR", os.path.join(BASE_DIR, ".index"))
+DEFAULT_STORE_PATH = os.path.join(DEFAULT_INDEX_DIR, "vectors.sqlite3")
 EMBEDDING_DIM = 384
 
 SYSTEM_PROMPT = (

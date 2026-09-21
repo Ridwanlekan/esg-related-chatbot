@@ -19,7 +19,8 @@ from chatbot.session_store import SessionStore
 logger = logging.getLogger("esg.api")
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DEFAULT_SESSIONS_PATH = os.path.join(PROJECT_ROOT, ".index", "sessions.sqlite3")
+INDEX_DIR = os.environ.get("INDEX_DIR", os.path.join(PROJECT_ROOT, ".index"))
+DEFAULT_SESSIONS_PATH = os.path.join(INDEX_DIR, "sessions.sqlite3")
 UI_FILE = Path(__file__).with_name("static") / "ui.html"
 
 
@@ -293,7 +294,9 @@ def create_app(
 app = create_app()
 
 
-def run(host="0.0.0.0", port=8000, reload=False):
+def run(host="0.0.0.0", port=None, reload=False):
     level = os.environ.get("LOG_LEVEL", "INFO").upper()
     telemetry.configure_logging(getattr(logging, level, logging.INFO))
+    if port is None:
+        port = int(os.environ.get("PORT", "8000"))
     uvicorn.run("chatbot.api:app", host=host, port=port, reload=reload)

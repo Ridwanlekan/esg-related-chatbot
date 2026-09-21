@@ -98,6 +98,37 @@ docker compose up --build     # bake models, then serve on :8000
 - `./data` and `./.index` are mounted, so docs and the vector index (plus sessions) persist across restarts; `POST /ingest` reindexes changed docs.
 - Bare usage: `docker build -t esg-chatbot . && docker run -p 8000:8000 --env-file .env esg-chatbot`.
 
+## Deployment (CI/CD)
+
+**Container publishing** — `.github/workflows/container.yml` builds the image on every PR (validation only) and, on `main`/version tags, pushes to GitHub Container Registry:
+
+```
+ghcr.io/<owner>/esg-related-chatbot:latest      # default branch
+ghcr.io/<owner>/esg-related-chatbot:sha-<sha>
+ghcr.io/<owner>/esg-related-chatbot:<version>   # from a v* tag
+```
+
+The image is public by default on GHCR; make it private under package settings if needed.
+
+**Self-host (compose, pulls the published image):**
+
+```bash
+ESG_IMAGE=ghcr.io/<owner>/esg-related-chatbot:latest \
+  docker compose -f compose.prod.yaml up -d
+```
+
+The vector index lives in a named volume (`esg-index`); `data/` is mounted for re-indexing.
+
+**Azure Web App for Containers** — `.github/workflows/deploy.yml` deploys the published image after the Container workflow succeeds on `main` (also runnable manually). It is inert until you configure the target, so it won't fail your pipeline:
+
+1. Create a Web App (Linux, Container) and note its name/resource group.
+2. Repo **Variables**: `AZURE_WEBAPP_NAME` (required to enable), `AZURE_RESOURCE_GROUP` (optional, sets `WEBSITES_PORT=8000`).
+3. Repo **Secrets** (OIDC federated login): `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID`.
+4. Give the Web App read access to GHCR (Registry settings → `https://ghcr.io`, user = GitHub username, password = PAT with `read:packages`), then set the app's Azure OpenAI/`API_KEY` env vars in Configuration.
+5. Enable a persistent path for `/app/.index` (App Service storage) so sessions and the index survive restarts.
+
+`PORT` is honored if the platform injects it; otherwise the app listens on `8000`. Set `INDEX_DIR` to a writable persistent path (e.g. `/home/esg-index` on App Service) to keep the vector index and sessions across restarts.
+
 ## Security
 
 Built-in controls (all env-driven, see `doc/env_example.txt`):
