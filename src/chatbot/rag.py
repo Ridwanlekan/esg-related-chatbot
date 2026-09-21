@@ -35,6 +35,15 @@ def _require_env(name):
     return value
 
 
+def env_or_local_model(model_name):
+    """Use the vendored model copy if present (models/<name>), else the
+    Hugging Face model id so sentence-transformers can download it."""
+    local = os.path.join(BASE_DIR, "models", model_name)
+    if os.path.isdir(local):
+        return local
+    return f"sentence-transformers/{model_name}"
+
+
 class RAGBot:
 
     def __init__(self, store_path=DEFAULT_STORE_PATH, data_dir=DEFAULT_DATA_DIR):
@@ -42,9 +51,9 @@ class RAGBot:
         self._llm_client = None
         self._llm_model = None
         self._llm_lock = threading.Lock()
-        model_path = os.path.join(BASE_DIR, "models/all-MiniLM-L6-v2")
-        self.sentence_transformer = SentenceTransformer(model_path)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        embedding_model = env_or_local_model("all-MiniLM-L6-v2")
+        self.sentence_transformer = SentenceTransformer(embedding_model)
+        self.tokenizer = AutoTokenizer.from_pretrained(embedding_model)
         self.store = SQLiteVecStore(db_path=store_path, dim=EMBEDDING_DIM)
         self.last_results = []
         self.max_generation_tokens = int(os.environ.get("MAX_GENERATION_TOKENS", "600"))
