@@ -81,6 +81,23 @@ TOKENIZERS_PARALLELISM=False
 
 Point Prometheus at `/metrics` to scrape; also works with a simple `curl`. `LOG_LEVEL` env controls verbosity.
 
+## Retrieval pipeline
+
+Query → **rewrite** (only with chat history) → **hybrid search** (dense + BM25 fused by reciprocal rank over `CANDIDATE_K` candidates, default 30) → **cross-encoder rerank** (local `cross-encoder/ms-marco-MiniLM-L-6-v2`, offloadable via `RERANKER_ENABLED=0`) → **MMR diversity** (`MMR_LAMBDA`, default 0.5; 0 disables) → final `k` chunks.
+
+The reranker and MMR are fully local (no API cost), so the whole pipeline still runs offline for eval and `/search`.
+
+## Docker
+
+```bash
+cp doc/env_example.txt .env   # fill in Azure + API_KEY
+docker compose up --build     # bake models, then serve on :8000
+```
+
+- The image **pre-bakes** the embedding + cross-encoder models at build time — the container runs fully offline (no runtime model downloads).
+- `./data` and `./.index` are mounted, so docs and the vector index (plus sessions) persist across restarts; `POST /ingest` reindexes changed docs.
+- Bare usage: `docker build -t esg-chatbot . && docker run -p 8000:8000 --env-file .env esg-chatbot`.
+
 ## Security
 
 Built-in controls (all env-driven, see `doc/env_example.txt`):

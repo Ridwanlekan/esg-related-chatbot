@@ -7,14 +7,15 @@ from openai import AzureOpenAI
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 
-from chatbot import telemetry
+from chatbot import model_utils, telemetry
 from chatbot.ingest import ingest_documents, recursive_split
+from chatbot.model_utils import BASE_DIR, env_or_local_model
+from chatbot.reranker import CrossEncoderReranker, mmr_lambda_value, mmr_select, reranker_enabled
 from chatbot.rewrite import rewrite_question
 from chatbot.vector_store import SQLiteVecStore
 
 load_dotenv()
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DEFAULT_DATA_DIR = os.path.join(BASE_DIR, "data")
 DEFAULT_STORE_PATH = os.path.join(BASE_DIR, ".index", "vectors.sqlite3")
 EMBEDDING_DIM = 384
@@ -38,12 +39,8 @@ def _require_env(name):
 
 
 def env_or_local_model(model_name):
-    """Use the vendored model copy if present (models/<name>), else the
-    Hugging Face model id so sentence-transformers can download it."""
-    local = os.path.join(BASE_DIR, "models", model_name)
-    if os.path.isdir(local):
-        return local
-    return f"sentence-transformers/{model_name}"
+    """Deprecated alias kept for back-compat; use model_utils instead."""
+    return model_utils.env_or_local_model(model_name)
 
 
 class RAGBot:
@@ -58,7 +55,14 @@ class RAGBot:
         self.tokenizer = AutoTokenizer.from_pretrained(embedding_model)
         self.store = SQLiteVecStore(db_path=store_path, dim=EMBEDDING_DIM)
         self.last_results = []
+        self._reranker = None
+        self.candidate_k = int(os.environ.get("CANDIDATE_K", "30"))
         self.max_generation_tokens = int(os.environ.get("MAX_GENERATION_TOKENS", "600"))
+
+    def _ensure_reranker(self):
+        if self._reranker is None:
+            self._reranker = CrossEncoderReranker()
+        return self._reranker
 
     def _ensure_llm(self):
         if self._llm_client is None:
@@ -175,9 +179,21 @@ class RAGBot:
         results = self.store.search_hybrid(
             query_text=rewritten,
             query_embedding=query_embedding,
-            k=k,
+            k=self.candidate_k,
+            candidate_k=self.candidate_k,
             source=source,
         )
+        if reranker_enabled():
+            results = self._ensure_reranker().rerank(rewritten, results, k)
+        elif len(results) > k:
+            results = results[:k]
+        if len(results) > k:
+            lambda_ = mmr_lambda_value()
+            if lambda_ > 0:
+                embeddings = self.store.fetch_embeddings([r.chunk_id for r in results])
+                results = mmr_select(results, query_embedding, embeddings, k, lambda_)
+            else:
+                results = results[:k]
         telemetry.record_retrieval(time.monotonic() - started)
         return results
 

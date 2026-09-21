@@ -11,4 +11,7 @@ TOKENIZERS_PARALLELISM = False
 # AZURE_OPENAI_TIMEOUT = 120      # seconds per Azure call
 # OPENAI_MAX_RETRIES = 3
 # MAX_GENERATION_TOKENS = 600     # answer length cap (bounds latency + cost)
+# CANDIDATE_K = 30                # candidates fed to reranker/MMR
+# RERANKER_ENABLED = 1            # 0 disables the cross-encoder rerank step
+# MMR_LAMBDA = 0.5                # 0 disables MMR (1 = relevance only)
 # LOG_LEVEL = INFO

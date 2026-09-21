@@ -56,6 +56,10 @@ class VectorStore(ABC):
         pass
 
     @abstractmethod
+    def fetch_embeddings(self, chunk_ids):
+        pass
+
+    @abstractmethod
     def count(self):
         pass
 
@@ -309,6 +313,21 @@ class SQLiteVecStore(VectorStore):
             )
             for entry in ranked
         ]
+
+    def fetch_embeddings(self, chunk_ids):
+        if not chunk_ids:
+            return {}
+        placeholders = ", ".join("?" for _ in chunk_ids)
+        rows = self.conn.execute(
+            f"SELECT c.id, v.embedding FROM chunks c "
+            f"JOIN vec_chunks v ON v.rowid = c.rowid "
+            f"WHERE c.id IN ({placeholders})",
+            list(chunk_ids),
+        ).fetchall()
+        return {
+            row["id"]: np.frombuffer(row["embedding"], dtype=np.float32)
+            for row in rows
+        }
 
     def count(self):
         return self.conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]

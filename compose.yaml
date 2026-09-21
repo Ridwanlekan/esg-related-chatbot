@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: esg-chatbot:latest
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      # Persist the vector index + sessions across container restarts.
+      - ./.index:/app/.index
+      # Live document loop: edits to data/ are picked up on /ingest.
+      - ./data:/app/data
+    restart: unless-stopped
