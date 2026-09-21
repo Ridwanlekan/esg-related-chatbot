@@ -3,4 +3,11 @@ AZURE_OPENAI_ENDPOINT = "<Azure OpenAI endpoint>"
 OPENAI_API_VERSION = "<Azure OpenAI API version>"
 MODEL_NAME = "<Azure OpenAI model name>"
 TOKENIZERS_PARALLELISM = False
-# MAX_RETAINED_SESSIONS = 500   # chat sessions kept (oldest auto-pruned)
+# MAX_RETAINED_SESSIONS = 500     # chat sessions kept (oldest auto-pruned)
+# API_KEY = ""                    # if set, all API endpoints (except /health, /ui) require `Authorization: Bearer <API_KEY>`
+# CORS_ORIGINS = ""               # comma-separated allowed browser origins (empty = no cross-origin access)
+# RATE_LIMIT_REQUESTS = 60        # max requests per window per IP
+# RATE_LIMIT_WINDOW_SECONDS = 60
+# AZURE_OPENAI_TIMEOUT = 120      # seconds per Azure call
+# OPENAI_MAX_RETRIES = 3
+# MAX_GENERATION_TOKENS = 600     # answer length cap (bounds latency + cost)

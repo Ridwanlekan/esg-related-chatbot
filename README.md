@@ -65,6 +65,17 @@ MODEL_NAME=<model deployment name>
 TOKENIZERS_PARALLELISM=False
 ```
 
+## Security
+
+Built-in controls (all env-driven, see `doc/env_example.txt`):
+
+- **API key auth**: set `API_KEY` to require `Authorization: Bearer <key>` on every endpoint except `/health` and `/ui`. If unset, the server logs a startup warning that authentication is disabled — do not expose it beyond localhost without a key.
+- **Rate limiting**: per-IP sliding window on `/chat`, `/chat/stream`, `/search` (`RATE_LIMIT_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS`, default 60/60).
+- **CORS**: `CORS_ORIGINS` restricts browser origins that can call the API (empty = same-origin only).
+- **Azure call hardening**: explicit timeouts (`AZURE_OPENAI_TIMEOUT`, default 120s) and retries (`OPENAI_MAX_RETRIES`, default 3); generation capped at `MAX_GENERATION_TOKENS`.
+- **Missing config fails fast**: startup raises a clear error if Azure credentials are absent.
+- **Graceful failures**: empty index / retrieval errors surface as HTTP 503 (or an SSE `error` event), not 500 crashes.
+
 ## Usage
 
 ### Chat
@@ -148,4 +159,28 @@ Chat history is stored per session in `.index/sessions.sqlite3`.
 pytest
 ```
 
-The suite covers chunking, ingestion idempotency, deleted-file pruning, vector-store round-trips, and retrieval — it uses a fake embedding function, so no model download or network is needed.
+The suite covers chunking, ingestion idempotency, deleted-file pruning, vector-store round-trips, retrieval, the security layer, and eval metrics — none of it needs a model download or network.
+
+## Evaluation (Step 5)
+
+Golden-set harness to measure retrieval and (optionally) answer quality. Questions live in `evals/eval_set.json` as `{"question", "expected_sources", "answer_hint?"}` — replace/augment them with ESG-specific Q&A as your real corpus lands.
+
+```bash
+# retrieval metrics only (no Azure credentials required — CI safe)
+esg-eval --k 3
+# with thresholds (non-zero exit gates the build)
+esg-eval --k 3 --min-hit-rate 0.8 --min-recall 0.8 --min-mrr 0.7
+# additionally score answer faithfulness with the LLM as judge (needs Azure setup)
+esg-eval --judge --min-faithfulness 0.8
+# write a machine-readable report
+esg-eval --k 3 --json eval-report.json
+```
+
+Metrics: **hit_rate@k** (≥1 expected source retrieved), **recall@k** (coverage of expected sources), **MRR** (rank quality), and optional **faithfulness** (answer fully supported by retrieved context). Every question is printed as OK/MISS so failures are actionable.
+
+## CI (GitHub Actions)
+
+`.github/workflows/ci.yml` runs on every push/PR to `main`:
+
+- **Unit tests** — installs from `requirements.txt` and runs `pytest`.
+- **Retrieval eval** — builds the index from `data/` (downloads the local embedding model) and gates on `hit_rate ≥ 0.8`, `recall ≥ 0.8`, `mrr ≥ 0.7`; uploads `eval-report.json` as an artifact. No LLM is used, so the gate has no network/secret dependency on Azure.

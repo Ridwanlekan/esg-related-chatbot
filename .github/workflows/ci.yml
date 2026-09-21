@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: |
+          pip install -r requirements.txt
+          pip install -e . --no-deps
+          pip install pytest
+      - name: Run tests
+        run: python -m pytest -q
+
+  retrieval-eval:
+    name: Retrieval eval (harness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: |
+          pip install -r requirements.txt
+          pip install -e . --no-deps
+      - name: Build index and run retrieval eval
+        run: >-
+          python -m chatbot.evaluate
+          --set evals/eval_set.json
+          --k 3
+          --min-hit-rate 0.8
+          --min-recall 0.8
+          --min-mrr 0.7
+          --json eval-report.json
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval-report.json

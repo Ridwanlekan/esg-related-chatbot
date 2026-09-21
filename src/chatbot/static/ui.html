@@ -108,6 +108,14 @@
       <button id="load-more" style="display:none; margin-top:8px;">Load more</button>
     </section>
     <section>
+      <h2>Security</h2>
+      <input id="api-key" type="password" placeholder="API key (only if server requires)" autocomplete="off">
+      <div class="search-row">
+        <button id="key-save">Save key</button>
+        <button id="key-clear">Clear</button>
+      </div>
+    </section>
+    <section>
       <h2>Search (no LLM)</h2>
       <div class="search-row">
         <input id="search-q" placeholder="retrieval query">
@@ -181,7 +189,8 @@ async function health() {
 
 async function loadMessages(id) {
   clearMessages();
-  const res = await fetch("/sessions/" + id);
+  const res = await fetch("/sessions/" + id, { headers: headers() });
+  if (await handle401(res)) return;
   const data = await res.json();
   if (!data.messages || !data.messages.length) { renderWelcome(); return; }
   for (const m of data.messages) {
@@ -190,13 +199,32 @@ async function loadMessages(id) {
   }
 }
 
+function headers(json) {
+  const h = { "content-type": "application/json" };
+  const key = localStorage.getItem("esg_api_key");
+  if (key) h["authorization"] = "Bearer " + key;
+  return h;
+}
+
+async function handle401(res) {
+  if (res.status === 401) {
+    alert("Missing or invalid API key. Set it in the Security panel.");
+    return true;
+  }
+  return false;
+}
+
+async function fetchSessions() {
+  const res = await fetch("/sessions?limit=" + SESSION_PAGE + "&offset=" + sessionOffset, { headers: headers() });
+  if (await handle401(res)) return { sessions: [], total: 0, authed: false };
+  return res.ok ? await res.json() : { sessions: [], total: 0 };
+}
+
 async function renderSessions() {
   const box = $("session-list");
   let data;
-  try {
-    const res = await fetch("/sessions?limit=" + SESSION_PAGE + "&offset=" + sessionOffset);
-    data = res.ok ? await res.json() : { sessions: [], total: 0 };
-  } catch { data = { sessions: [], total: 0 }; }
+  try { data = await fetchSessions(); }
+  catch { data = { sessions: [], total: 0 }; }
   if (!sessionOffset) box.innerHTML = "";
   if (!data.sessions.length && !sessionOffset) {
     box.innerHTML = '<div class="muted">no sessions yet</div>';
@@ -216,7 +244,7 @@ async function renderSessions() {
     del.title = "delete session";
     del.onclick = async (e) => {
       e.stopPropagation();
-      await fetch("/sessions/" + s.session_id, { method: "DELETE" });
+      await fetch("/sessions/" + s.session_id, { method: "DELETE", headers: headers() });
       if (sessionId === s.session_id) { setSession(null); clearMessages(); renderWelcome(); }
       sessionOffset = 0;
       renderSessions();
@@ -265,9 +293,13 @@ async function send() {
   try {
     const res = await fetch("/chat/stream", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: headers(),
       body: JSON.stringify({ question: q, session_id: sessionId }),
     });
+    if (await handle401(res)) {
+      body.textContent = "Unauthorized — add the API key in the Security panel.";
+      return;
+    }
     const sid = res.headers.get("X-Session-ID");
     if (sid) setSession(sid);
 
@@ -313,9 +345,10 @@ async function doSearch() {
   if (!q) return;
   const res = await fetch("/search", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: headers(),
     body: JSON.stringify({ question: q, k: 5 }),
   });
+  if (await handle401(res)) return;
   const data = await res.json();
   const box = $("search-results");
   box.innerHTML = "";
@@ -337,7 +370,8 @@ async function doIngest() {
   $("ingest").disabled = true;
   $("ingest").textContent = "indexing…";
   try {
-    const r = await fetch("/ingest", { method: "POST" });
+    const r = await fetch("/ingest", { method: "POST", headers: headers() });
+    if (await handle401(r)) return;
     const data = await r.json();
     $("ingest-result").textContent =
       `docs seen: ${data.documents_seen}\nre-indexed: ${data.documents_reindexed}\n` +
@@ -356,12 +390,25 @@ $("search-btn").addEventListener("click", doSearch);
 $("search-q").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
 $("ingest").addEventListener("click", doIngest);
 $("load-more").addEventListener("click", () => { sessionOffset += SESSION_PAGE; renderSessions(); });
+$("key-save").addEventListener("click", () => {
+  const v = $("api-key").value.trim();
+  if (v) localStorage.setItem("esg_api_key", v);
+  $("api-key").value = "";
+  renderSessions();
+});
+$("key-clear").addEventListener("click", () => {
+  localStorage.removeItem("esg_api_key");
+  $("api-key").value = "";
+  renderSessions();
+});
 $("new-session").addEventListener("click", () => {
   setSession(null);
   clearMessages();
   renderWelcome();
 });
 
+const storedKey = localStorage.getItem("esg_api_key");
+if (storedKey) $("api-key").placeholder = "API key saved";
 setSession(sessionId);
 renderSessions();
 health();

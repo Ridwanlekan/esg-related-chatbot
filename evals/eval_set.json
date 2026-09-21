@@ -1,0 +1,38 @@
+[
+  {
+    "question": "How many moons does Jupiter have?",
+    "expected_sources": ["jupiter.txt"]
+  },
+  {
+    "question": "Name the four Galilean moons of Jupiter.",
+    "expected_sources": ["jupiter.txt"]
+  },
+  {
+    "question": "Which is the largest Galilean moon of Jupiter?",
+    "expected_sources": ["jupiter.txt"]
+  },
+  {
+    "question": "What does the CRISPR-Cas9 system allow researchers to do?",
+    "expected_sources": ["crispr.txt"]
+  },
+  {
+    "question": "Who is often described as the first computer programmer?",
+    "expected_sources": ["adalovelace.txt"]
+  },
+  {
+    "question": "What machine did Ada Lovelace write programs for?",
+    "expected_sources": ["adalovelace.txt"]
+  },
+  {
+    "question": "What kind of molecule does the Cas9 protein cut when guided?",
+    "expected_sources": ["crispr.txt"]
+  },
+  {
+    "question": "Why did Jupiter's moons matter to Galileo?",
+    "expected_sources": ["jupiter.txt"]
+  },
+  {
+    "question": "List two editing applications of CRISPR technology.",
+    "expected_sources": ["crispr.txt"]
+  }
+]

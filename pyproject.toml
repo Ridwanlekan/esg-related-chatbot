@@ -28,6 +28,7 @@ dev = ["pytest"]
 esg-chatbot = "chatbot.cli:main"
 view-index = "chatbot.view_index:main"
 esg-api = "chatbot.api:run"
+esg-eval = "chatbot.evaluate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

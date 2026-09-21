@@ -1,4 +1,5 @@
 import os
+import threading
 
 from dotenv import load_dotenv
 from openai import AzureOpenAI
@@ -24,15 +25,51 @@ SYSTEM_PROMPT = (
 )
 
 
+def _require_env(name):
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable {name}. "
+            f"Copy doc/env_example.txt to .env and fill it in."
+        )
+    return value
+
+
 class RAGBot:
 
     def __init__(self, store_path=DEFAULT_STORE_PATH, data_dir=DEFAULT_DATA_DIR):
         self.data_dir = data_dir
-        self.openai_client = AzureOpenAI(
-            api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-            api_version=os.environ.get("OPENAI_API_VERSION"),
-            azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
-        )
+        self._llm_client = None
+        self._llm_model = None
+        self._llm_lock = threading.Lock()
+        model_path = os.path.join(BASE_DIR, "models/all-MiniLM-L6-v2")
+        self.sentence_transformer = SentenceTransformer(model_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.store = SQLiteVecStore(db_path=store_path, dim=EMBEDDING_DIM)
+        self.last_results = []
+        self.max_generation_tokens = int(os.environ.get("MAX_GENERATION_TOKENS", "600"))
+
+    def _ensure_llm(self):
+        if self._llm_client is None:
+            with self._llm_lock:
+                if self._llm_client is None:
+                    self._llm_client = AzureOpenAI(
+                        api_key=_require_env("AZURE_OPENAI_API_KEY"),
+                        api_version=_require_env("OPENAI_API_VERSION"),
+                        azure_endpoint=_require_env("AZURE_OPENAI_ENDPOINT"),
+                        timeout=float(os.environ.get("AZURE_OPENAI_TIMEOUT", "120")),
+                        max_retries=int(os.environ.get("OPENAI_MAX_RETRIES", "3")),
+                    )
+                    self._llm_model = _require_env("MODEL_NAME")
+        return self._llm_client, self._llm_model
+
+    @property
+    def openai_client(self):
+        return self._ensure_llm()[0]
+
+    @property
+    def model_name(self):
+        return self._ensure_llm()[1]
         model_path = os.path.join(BASE_DIR, "models/all-MiniLM-L6-v2")
         self.sentence_transformer = SentenceTransformer(model_path)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -65,8 +102,9 @@ class RAGBot:
             return question
 
     def _generate_rewrite(self, messages):
-        response = self.openai_client.chat.completions.create(
-            model=os.environ.get("MODEL_NAME"),
+        client, model = self._ensure_llm()
+        response = client.chat.completions.create(
+            model=model,
             messages=messages,
             temperature=0,
             max_tokens=80,
@@ -89,9 +127,13 @@ class RAGBot:
         context = "\n--\n".join(f"[{r.source}] {r.content}" for r in results)
         if not context:
             context = "No relevant documents were found."
+        context = context[:8000]
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         if history:
-            messages.extend(history)
+            for turn in history:
+                turn = dict(turn)
+                turn["content"] = turn["content"][:2000]
+                messages.append(turn)
         messages.append(
             {"role": "user", "content": f"content\n{context}\nQuestion{question}"}
         )
@@ -103,9 +145,11 @@ class RAGBot:
         if not results:
             return "I don't know. No relevant documents were found."
 
-        response = self.openai_client.chat.completions.create(
-            model=os.environ.get("MODEL_NAME"),
+        client, model = self._ensure_llm()
+        response = client.chat.completions.create(
+            model=model,
             messages=self._build_messages(question, results, history),
+            max_tokens=self.max_generation_tokens,
         )
         return response.choices[0].message.content
 
@@ -116,10 +160,12 @@ class RAGBot:
             yield "I don't know. No relevant documents were found."
             return
 
-        stream = self.openai_client.chat.completions.create(
-            model=os.environ.get("MODEL_NAME"),
+        client, model = self._ensure_llm()
+        stream = client.chat.completions.create(
+            model=model,
             messages=self._build_messages(question, results, history),
             stream=True,
+            max_tokens=self.max_generation_tokens,
         )
         for chunk in stream:
             if not chunk.choices:
