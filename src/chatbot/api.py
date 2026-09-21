@@ -1,15 +1,18 @@
 import json
 import logging
 import os
+import time
+import uuid
 from pathlib import Path
 
 import uvicorn
 from fastapi import Depends, HTTPException, FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from chatbot import telemetry
 from chatbot.security import RateLimiter, int_env, make_auth_check, make_rate_limit
 from chatbot.session_store import SessionStore
 
@@ -122,6 +125,34 @@ def create_app(
     guarded_deps = [Depends(d) for d in (auth, ratelimit) if d is not None]
     auth_deps = [Depends(d) for d in (auth,) if d is not None]
 
+    @app.middleware("http")
+    async def observability(request: Request, call_next):
+        rid = request.headers.get("X-Request-ID") or telemetry.new_request_id()
+        token = telemetry.set_request_id(rid)
+        started = time.monotonic()
+        route = getattr(request.scope.get("route", None), "path", request.url.path)
+        try:
+            response = await call_next(request)
+        except Exception:
+            telemetry.reset_request_id(token)
+            duration = (time.monotonic() - started) * 1000
+            telemetry.observe_http(request.method, route, 500, duration)
+            logger.exception("%s %s failed", request.method, route)
+            raise
+        telemetry.reset_request_id(token)
+        duration = (time.monotonic() - started) * 1000
+        telemetry.observe_http(request.method, route, response.status_code, duration)
+        response.headers["X-Request-ID"] = rid
+        logger.info(
+            "%s %s -> %s (%.1f ms, rid=%s)",
+            request.method,
+            route,
+            response.status_code,
+            duration,
+            rid,
+        )
+        return response
+
     def get_bot(request: Request):
         if request.app.state.bot is None:
             request.app.state.bot = _default_bot_factory()
@@ -133,6 +164,16 @@ def create_app(
     bot_dep = Depends(get_bot)
     store_dep = Depends(get_sessions)
 
+    @app.get("/metrics")
+    def metrics(store=store_dep):
+        telemetry.sessions.set(store.count())
+        if app.state.bot is not None:
+            telemetry.index_chunks.set(app.state.bot.store.count())
+        return Response(
+            telemetry.render_metrics(),
+            media_type=telemetry.METRICS_CONTENT_TYPE,
+        )
+
     @app.get("/")
     def root():
         return {
@@ -140,6 +181,7 @@ def create_app(
             "endpoints": [
                 "GET /ui",
                 "GET /health",
+                "GET /metrics",
                 "POST /chat",
                 "POST /chat/stream",
                 "POST /search",
@@ -227,6 +269,7 @@ def create_app(
     @app.post("/ingest", response_model=IngestResponse, dependencies=auth_deps)
     async def ingest(bot=bot_dep):
         stats = await run_in_threadpool(bot.read_and_embed_data)
+        telemetry.index_chunks.set(bot.store.count())
         return IngestResponse(**stats.__dict__)
 
     @app.get("/sessions", response_model=SessionList, dependencies=auth_deps)
@@ -251,4 +294,6 @@ app = create_app()
 
 
 def run(host="0.0.0.0", port=8000, reload=False):
+    level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    telemetry.configure_logging(getattr(logging, level, logging.INFO))
     uvicorn.run("chatbot.api:app", host=host, port=port, reload=reload)

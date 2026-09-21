@@ -25,6 +25,12 @@ class FakeBot:
             stale_chunks_removed=0,
         )
 
+    @property
+    def store(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(count=lambda: 350)
+
 
 def _build(api_key, **kw):
     app = create_app(

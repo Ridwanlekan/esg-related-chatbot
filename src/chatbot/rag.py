@@ -1,11 +1,13 @@
 import os
 import threading
+import time
 
 from dotenv import load_dotenv
 from openai import AzureOpenAI
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 
+from chatbot import telemetry
 from chatbot.ingest import ingest_documents, recursive_split
 from chatbot.rewrite import rewrite_question
 from chatbot.vector_store import SQLiteVecStore
@@ -79,6 +81,52 @@ class RAGBot:
     @property
     def model_name(self):
         return self._ensure_llm()[1]
+
+    def _complete(self, kind, messages, *, max_tokens, temperature=None, stream=False):
+        """LLM call with telemetry. Returns a response or (when streaming) a
+        generator that reports duration + token usage on exhaustion."""
+        client, model = self._ensure_llm()
+        kwargs = dict(model=model, messages=messages, max_tokens=max_tokens)
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if stream:
+            kwargs["stream"] = True
+            kwargs["stream_options"] = {"include_usage": True}
+
+        started = time.monotonic()
+        try:
+            raw = client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            telemetry.record_llm_error(kind, type(exc).__name__)
+            raise
+        first_seconds = time.monotonic() - started
+
+        if not stream:
+            usage = getattr(raw, "usage", None)
+            telemetry.record_llm(
+                kind,
+                first_seconds,
+                prompt_tokens=getattr(usage, "prompt_tokens", None),
+                completion_tokens=getattr(usage, "completion_tokens", None),
+            )
+            return raw
+
+        def track():
+            prompt = completion = None
+            for chunk in raw:
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    prompt = usage.prompt_tokens
+                    completion = usage.completion_tokens
+                yield chunk
+            telemetry.record_llm(
+                kind,
+                time.monotonic() - started,
+                prompt_tokens=prompt,
+                completion_tokens=completion,
+            )
+
+        return track()
         model_path = os.path.join(BASE_DIR, "models/all-MiniLM-L6-v2")
         self.sentence_transformer = SentenceTransformer(model_path)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -90,11 +138,13 @@ class RAGBot:
 
     def ingest(self, folder_path=None):
         folder = folder_path if folder_path is not None else self.data_dir
-        return ingest_documents(
+        stats = ingest_documents(
             data_dir=folder,
             store=self.store,
             embed_fn=self._embed,
         )
+        telemetry.index_chunks.set(self.store.count())
+        return stats
 
     def read_and_embed_data(self, folder_path=None):
         return self.ingest(folder_path=folder_path)
@@ -111,26 +161,25 @@ class RAGBot:
             return question
 
     def _generate_rewrite(self, messages):
-        client, model = self._ensure_llm()
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0,
-            max_tokens=80,
+        response = self._complete(
+            "rewrite", messages, max_tokens=80, temperature=0
         )
         return response.choices[0].message.content
 
     def retrieve(self, question, k=3, source=None, history=None):
         if self.store.count() == 0:
             raise RuntimeError("call ingest() before retrieve()")
+        started = time.monotonic()
         rewritten = self.rewrite_question_for_retrieval(question, history)
         query_embedding = self._embed([rewritten])[0]
-        return self.store.search_hybrid(
+        results = self.store.search_hybrid(
             query_text=rewritten,
             query_embedding=query_embedding,
             k=k,
             source=source,
         )
+        telemetry.record_retrieval(time.monotonic() - started)
+        return results
 
     def _build_messages(self, question, results, history=None):
         context = "\n--\n".join(f"[{r.source}] {r.content}" for r in results)
@@ -154,10 +203,8 @@ class RAGBot:
         if not results:
             return "I don't know. No relevant documents were found."
 
-        client, model = self._ensure_llm()
-        response = client.chat.completions.create(
-            model=model,
-            messages=self._build_messages(question, results, history),
+        response = self._complete(
+            "answer", self._build_messages(question, results, history),
             max_tokens=self.max_generation_tokens,
         )
         return response.choices[0].message.content
@@ -169,12 +216,10 @@ class RAGBot:
             yield "I don't know. No relevant documents were found."
             return
 
-        client, model = self._ensure_llm()
-        stream = client.chat.completions.create(
-            model=model,
-            messages=self._build_messages(question, results, history),
-            stream=True,
+        stream = self._complete(
+            "stream", self._build_messages(question, results, history),
             max_tokens=self.max_generation_tokens,
+            stream=True,
         )
         for chunk in stream:
             if not chunk.choices:

@@ -11,3 +11,4 @@ TOKENIZERS_PARALLELISM = False
 # AZURE_OPENAI_TIMEOUT = 120      # seconds per Azure call
 # OPENAI_MAX_RETRIES = 3
 # MAX_GENERATION_TOKENS = 600     # answer length cap (bounds latency + cost)
+# LOG_LEVEL = INFO

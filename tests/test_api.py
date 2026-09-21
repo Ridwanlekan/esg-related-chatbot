@@ -20,6 +20,7 @@ class FakeBot:
                 score=0.08,
             )
         ]
+        self.store = SimpleNamespace(count=lambda: 350)
         self.ask_calls = []
 
     def retrieve(self, question, k=3, source=None):

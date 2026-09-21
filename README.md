@@ -65,6 +65,22 @@ MODEL_NAME=<model deployment name>
 TOKENIZERS_PARALLELISM=False
 ```
 
+## Observability (Step 6)
+
+**Request tracing** — every response carries an `X-Request-ID` (the incoming one is honored, otherwise generated). All server logs include it, so a log line can be correlated to a specific request:
+
+```
+2026-09-21 15:39:01,989 INFO esg.api [d6344f706020] GET /health -> 200 (0.3 ms, rid=d6344f706020)
+```
+
+**Metrics** — `GET /metrics` exposes Prometheus-format metrics (`esg_*`):
+- `esg_http_requests_total` / `esg_http_request_duration_seconds` (by method + route + status)
+- `esg_llm_requests_total` / `esg_llm_duration_seconds` / `esg_llm_tokens_total` / `esg_llm_errors_total` (by kind: `rewrite`, `answer`, `stream`; token types prompt/completion)
+- `esg_retrieval_requests_total` / `esg_retrieval_duration_seconds` (embed + hybrid search)
+- `esg_index_chunks` / `esg_sessions` (state gauges)
+
+Point Prometheus at `/metrics` to scrape; also works with a simple `curl`. `LOG_LEVEL` env controls verbosity.
+
 ## Security
 
 Built-in controls (all env-driven, see `doc/env_example.txt`):

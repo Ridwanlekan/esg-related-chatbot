@@ -19,6 +19,7 @@ dependencies = [
     "httpx",
     "fastapi",
     "uvicorn",
+    "prometheus-client",
 ]
 
 [project.optional-dependencies]
