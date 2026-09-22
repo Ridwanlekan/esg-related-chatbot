@@ -38,3 +38,7 @@ models/
 
 # Docling vetting artifacts (raw/cleaned extractions, for eyeballing before ingest)
 .docling_vet/
+
+# Data directories (keep demo/ tracked, ignore real data)
+data/*
+!data/demo/
