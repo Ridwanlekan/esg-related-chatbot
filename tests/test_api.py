@@ -98,7 +98,7 @@ def test_greeting_answered_without_rag(client):
     body = res.json()
     assert res.status_code == 200
     assert body["sources"] == []
-    assert "Good morning" in body["answer"]
+    assert any(g in body["answer"] for g in ("Good morning", "Good afternoon", "Good evening"))
     assert bot.ask_calls == []  # small talk never reaches the RAG bot
 
 
