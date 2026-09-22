@@ -367,18 +367,38 @@ async function doSearch() {
 }
 
 async function doIngest() {
-  $("ingest").disabled = true;
-  $("ingest").textContent = "indexing…";
+  const btn = $("ingest");
+  btn.disabled = true;
+  btn.textContent = "indexing…";
+  const poll = setInterval(async () => {
+    try {
+      const r = await fetch("/ingest/status", { headers: headers() });
+      if (!r.ok) return;
+      const s = await r.json();
+      if (!s.running) { clearInterval(poll); return; }
+      const pct = s.total_files ? Math.round(100 * s.processed_files / s.total_files) : 0;
+      const name = s.current_file ? s.current_file.replace(/^.*[\\/]/, "") : "";
+      btn.textContent = `indexing… ${s.processed_files}/${s.total_files} (${pct}%)` + (name ? ` · ${name}` : "");
+    } catch { /* transient */ }
+  }, 1000);
   try {
     const r = await fetch("/ingest", { method: "POST", headers: headers() });
+    clearInterval(poll);
     if (await handle401(r)) return;
+    if (!r.ok) {
+      $("ingest-result").textContent = `error ${r.status}: ${(await r.text()).slice(0, 300)}`;
+      return;
+    }
     const data = await r.json();
+    const dur = data.duration_seconds !== undefined ? `\nduration: ${data.duration_seconds}s` : "";
     $("ingest-result").textContent =
       `docs seen: ${data.documents_seen}\nre-indexed: ${data.documents_reindexed}\n` +
-      `chunks added: ${data.chunks_upserted}\nstale removed: ${data.stale_chunks_removed}`;
+      `chunks added: ${data.chunks_upserted}\nstale removed: ${data.stale_chunks_removed}` +
+      `\nfailed: ${data.documents_failed || 0}${dur}`;
   } finally {
-    $("ingest").disabled = false;
-    $("ingest").textContent = "Re-index data/";
+    clearInterval(poll);
+    btn.disabled = false;
+    btn.textContent = "Re-index data/";
   }
 }
 

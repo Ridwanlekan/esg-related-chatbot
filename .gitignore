@@ -35,3 +35,6 @@ models/
 
 # Vector index database
 .index/
+
+# Docling vetting artifacts (raw/cleaned extractions, for eyeballing before ingest)
+.docling_vet/

@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from chatbot import telemetry
+from chatbot.ingest import INGEST_PROGRESS
 from chatbot.security import RateLimiter, int_env, make_auth_check, make_rate_limit
 from chatbot.session_store import SessionStore
 
@@ -74,6 +75,8 @@ class IngestResponse(BaseModel):
     documents_reindexed: int
     chunks_upserted: int
     stale_chunks_removed: int
+    documents_failed: int = 0
+    duration_seconds: float | None = None
 
 
 class SessionMessages(BaseModel):
@@ -269,9 +272,16 @@ def create_app(
 
     @app.post("/ingest", response_model=IngestResponse, dependencies=auth_deps)
     async def ingest(bot=bot_dep):
+        started = time.time()
         stats = await run_in_threadpool(bot.read_and_embed_data)
         telemetry.index_chunks.set(bot.store.count())
-        return IngestResponse(**stats.__dict__)
+        return IngestResponse(
+            **stats.__dict__, duration_seconds=round(time.time() - started, 1)
+        )
+
+    @app.get("/ingest/status", dependencies=auth_deps)
+    def ingest_status():
+        return INGEST_PROGRESS.snapshot()
 
     @app.get("/sessions", response_model=SessionList, dependencies=auth_deps)
     def list_sessions(limit: int = 20, offset: int = 0, store=store_dep):

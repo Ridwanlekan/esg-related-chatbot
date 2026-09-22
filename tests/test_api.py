@@ -187,7 +187,19 @@ def test_ingest_reports_stats(client):
         "documents_reindexed": 1,
         "chunks_upserted": 42,
         "stale_chunks_removed": 0,
+        "documents_failed": 0,
+        "duration_seconds": body["duration_seconds"],
     }
+    assert body["duration_seconds"] >= 0
+
+
+def test_ingest_status_reports_progress(client):
+    c, _, _ = client
+    res = c.get("/ingest/status")
+    assert res.status_code == 200
+    body = res.json()
+    assert set(body) >= {"running", "total_files", "processed_files", "current_file"}
+    assert body["running"] is False
 
 
 def test_delete_session(client):

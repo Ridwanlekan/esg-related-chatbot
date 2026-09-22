@@ -13,6 +13,16 @@ COPY data ./data
 RUN pip install -r requirements.txt \
  && pip install . --no-deps
 
+# Optional: audio/video transcription. Requires the ffmpeg binary and the
+# `docling[asr]` extra: docker build --build-arg INSTALL_ASR=true .
+ARG INSTALL_ASR=false
+RUN if [ "$INSTALL_ASR" = "true" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends ffmpeg \
+      && rm -rf /var/lib/apt/lists/* \
+      && pip install "docling[asr]"; \
+    fi
+
 # Bake the embedding + cross-encoder models in at build time so the
 # container runs fully offline (no runtime downloads).
 RUN python -c "\

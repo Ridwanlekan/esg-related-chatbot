@@ -8,6 +8,7 @@ A retrieval-augmented generation (RAG) chatbot that answers questions grounded i
 
 - **Persistent vector index** (SQLite + sqlite-vec): embeddings are stored on disk, so startup is instant and the LLM/embedding models aren't re-run on every launch.
 - **Incremental ingestion**: unchanged documents are skipped (content-hash based); edited files are re-indexed; deleted files are pruned from the index automatically.
+- **Multi-format ingestion**: Docling parses PDF, Office, HTML, Markdown, AsciiDoc, CSV, images (OCR), audio/video (ASR), and more into clean Markdown before chunking.
 - **Metadata-aware**: each chunk tracks its source file, chunk index, and document hash, with source-filtered retrieval.
 - **Hybrid retrieval**: dense semantic search fused with lexical BM25 matches (SQLite FTS5) via reciprocal rank fusion — catches exact names and phrases the embedding model would miss.
 - **Offline retrieval**: semantic search uses a local sentence-transformer model — the OpenAI API is only called to generate the final answer.
@@ -21,6 +22,7 @@ esg-chatbot/
 ├── src/chatbot/          # Python package
 │   ├── rag.py            # RAGBot: orchestration, embedding, LLM answering
 │   ├── ingest.py         # chunking + incremental ingestion pipeline
+│   ├── docling_loader.py # multi-format parsing via Docling (docs/images/ASR)
 │   ├── vector_store.py   # persistent vector store (SQLite + sqlite-vec)
 │   ├── rewrite.py        # query rewriting from chat history (python module)
 │   ├── api.py            # FastAPI HTTP service (esg-api command)
@@ -162,13 +164,51 @@ view-index --search "moons of jupiter" --k 3 # semantic search
 
 ### Ingest a new corpus
 
-Either drop new `.txt` files into `data/` and run `esg-chatbot`, or from Python:
+Drop any supported file into `data/` and run `esg-chatbot`, or from Python:
 
 ```python
 from chatbot.rag import RAGBot
 rag = RAGBot()
 rag.read_and_embed_data()   # incremental: only new/changed files are embedded
 ```
+
+### Supported file types (Docling)
+
+Ingestion runs files through [Docling](https://github.com/docling-project/docling), which parses them into clean Markdown (layout, reading order, and tables preserved) before chunking and embedding:
+
+| Category  | Extensions |
+| --------- | ---------- |
+| Documents | `pdf`, `docx`, `doc`, `pptx`, `ppt`, `odt`, `ods`, `odp`, `rtf`, `epub`, `pages`, `boxnote`, `dclx` |
+| Markup    | `md`, `adoc`/`asciidoc`, `tex`/`latex`, `html`/`xhtml`, `xml` (JATS/USPTO/XBRL/DocLang), `json` |
+| Data      | `csv`, `xlsx`, `xls` |
+| Images    | `png`, `jpg`/`jpeg`, `tiff`, `bmp`, `webp` (OCR) |
+| Audio     | `wav`, `mp3`, `m4a`, `aac`, `ogg`, `flac` (ASR) |
+| Video     | `mp4`, `avi`, `mov`, `mkv`, `webm` (audio track transcribed) |
+| Captions / mail | `vtt`, `eml`, `msg` |
+| Plain text | `txt`, `log` |
+
+Legacy Office formats (`doc`, `xls`, `ppt`) and Apple Pages need LibreOffice / an extra — see Docling's docs.
+
+**Audio & video (ASR)** uses Whisper. Enable it with the extra and the `ffmpeg` binary:
+
+```bash
+pip install "docling[asr]"   # or: pip install -e ".[ingest-asr]"
+brew install ffmpeg          # apt-get install ffmpeg on Debian/Ubuntu
+```
+
+In Docker: `docker build --build-arg INSTALL_ASR=true .`
+
+Environment knobs (all optional, see `doc/env_example.txt`): `DOCLING_ENABLED=0` disables Docling (plain-text only), `DOCLING_OCR=0` disables OCR for scanned PDFs/images, `DOCLING_ASR=0` disables transcription, `DOCLING_ASR_MODEL` picks a Whisper spec (default `WHISPER_TURBO`).
+
+**Vetting Docling before it enters the index.** Before chunking/embedding, every Docling-converted document is cleaned (right-trimmed lines, collapse of repeated blank lines) and the cleaned Markdown is saved so you can eyeball extraction quality — this is exactly the text that gets chunked:
+
+```
+.docling_vet/overview_of_esg.md      # cleaned extraction, exactly what's chunked
+```
+
+The folder sits at the project root (alongside the generated `.index/`), is gitignored, and is excluded from ingestion (it is never re-ingested). Point `DOCLING_VET_DIR` elsewhere or set it to `0` to disable.
+
+If Docling isn't installed or a conversion fails, the loader logs a warning and falls back to plain-text decoding for text-like formats; binary files that can't be parsed are skipped (reported as `documents_failed` in the ingest response).
 
 ## API
 
@@ -223,7 +263,7 @@ Chat history is stored per session in `.index/sessions.sqlite3`.
 pytest
 ```
 
-The suite covers chunking, ingestion idempotency, deleted-file pruning, vector-store round-trips, retrieval, the security layer, and eval metrics — none of it needs a model download or network.
+The suite covers chunking, ingestion idempotency, deleted-file pruning, Docling format routing/fallbacks, vector-store round-trips, retrieval, the security layer, and eval metrics — none of it needs a model download or network.
 
 ## Evaluation (Step 5)
 

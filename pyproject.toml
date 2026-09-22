@@ -24,6 +24,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
+# Multi-format ingestion (PDF, Office, HTML, AsciiDoc, images, ...).
+ingest = ["docling==2.129.0"]
+# Adds audio/video transcription (Whisper). Also needs the ffmpeg binary.
+ingest-asr = ["docling[asr]==2.129.0"]
 
 [project.scripts]
 esg-chatbot = "chatbot.cli:main"

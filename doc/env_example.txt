@@ -15,5 +15,10 @@ TOKENIZERS_PARALLELISM = False
 # RERANKER_ENABLED = 1            # 0 disables the cross-encoder rerank step
 # MMR_LAMBDA = 0.5                # 0 disables MMR (1 = relevance only)
 # INDEX_DIR = .index              # where the vector store + sessions live (use a persistent path on PaaS)
+# DOCLING_ENABLED = 1             # 0 disables Docling (plain-text only)
+# DOCLING_OCR = 1                 # 0 disables OCR for scanned PDFs/images
+# DOCLING_ASR = 1                 # 0 disables audio/video transcription
+# DOCLING_ASR_MODEL = WHISPER_TURBO   # any docling asr_model_specs name
+# DOCLING_VET_DIR = .docling_vet  # cleaned Markdown saved before ingest (gitignored; 0/false disables)
 # PORT = 8000                     # uvicorn port (platforms like App Service inject this)
 # LOG_LEVEL = INFO
