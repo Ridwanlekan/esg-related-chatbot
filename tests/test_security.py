@@ -1,8 +1,10 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from chatbot.api import create_app
 from chatbot.security import RateLimiter
 from chatbot.session_store import SessionStore
+from chatbot.users import UserStore
 
 
 class FakeBot:
@@ -32,11 +34,12 @@ class FakeBot:
         return SimpleNamespace(count=lambda: 350)
 
 
-def _build(api_key, **kw):
+def _build(api_key=None, open_users=True, secret="test-secret", **kw):
     app = create_app(
         bot=FakeBot(),
         session_store=SessionStore(db_path=":memory:"),
         api_key=api_key,
+        user_store=None if open_users else UserStore(db_path=":memory:", secret=secret),
         rate_limit=kw.pop("rate_limit", 0),
         rate_window=60,
         **kw,
@@ -44,59 +47,82 @@ def _build(api_key, **kw):
     return TestClient(app)
 
 
-class TestAuth:
-    def test_protected_endpoint_rejects_without_key(self):
-        c = _build("sekret")
+def _token(client):
+    res = client.post(
+        "/auth/signup",
+        json={"email": "u@corp.com", "password": "password123", "name": "U", "category": "finance"},
+    )
+    assert res.status_code == 200
+    return res.json()["token"]
+
+
+class TestUserAuth:
+    def test_user_endpoints_require_token(self):
+        c = _build(open_users=False)
         assert c.post("/chat", json={"question": "hi"}).status_code == 401
         assert c.get("/sessions").status_code == 401
 
-    def test_protected_endpoint_rejects_wrong_key(self):
-        c = _build("sekret")
-        h = {"authorization": "Bearer wrong"}
+    def test_invalid_token_rejected(self):
+        c = _build(open_users=False)
+        h = {"authorization": "Bearer not-a-jwt"}
         assert c.post("/chat", json={"question": "hi"}, headers=h).status_code == 401
 
-    def test_protected_endpoint_accepts_valid_key(self):
-        c = _build("sekret")
-        h = {"authorization": "Bearer sekret"}
-        res = c.post("/chat", json={"question": "hi"}, headers=h)
+    def test_valid_token_accepted(self):
+        c = _build(open_users=False)
+        h = {"authorization": "Bearer " + _token(c)}
+        res = c.post("/chat", json={"question": "moons?"}, headers=h)
         assert res.status_code == 200
-        assert res.json()["answer"] == "answer to: hi"
+        assert res.json()["answer"] == "answer to: moons?"
 
-    def test_public_endpoints_need_no_key(self):
-        c = _build("sekret")
+    def test_public_endpoints_need_no_token(self):
+        c = _build(open_users=False)
         assert c.get("/health").status_code == 200
         assert c.get("/ui").status_code == 200
 
-    def test_no_key_configured_means_open(self):
-        c = _build(None)
-        assert c.post("/chat", json={"question": "hi"}).status_code == 200
+    def test_open_dev_mode_when_no_user_store(self):
+        c = _build(open_users=True)
+        assert c.post("/chat", json={"question": "moons?"}).status_code == 200
+
+
+class TestAdminApiKey:
+    def test_ingest_protected_with_key_set(self):
+        c = _build(api_key="sekret")
+        assert c.post("/ingest").status_code == 401
+        assert c.get("/ingest/status").status_code == 401
+        h = {"authorization": "Bearer sekret"}
+        assert c.post("/ingest", headers=h).status_code == 200
+        assert c.get("/ingest/status", headers=h).status_code == 200
+
+    def test_ingest_open_when_no_key_configured(self):
+        c = _build()
+        assert c.post("/ingest").status_code == 200
 
 
 class TestRateLimit:
     def test_blocks_after_cap(self):
-        c = _build(None, rate_limit=2)
+        c = _build(rate_limit=2)
         for _ in range(2):
             assert c.post("/chat", json={"question": "hi"}).status_code == 200
         assert c.post("/chat", json={"question": "hi"}).status_code == 429
 
     def test_search_is_limited_too(self):
-        c = _build(None, rate_limit=1)
+        c = _build(rate_limit=1)
         assert c.post("/search", json={"question": "jupiter"}).status_code == 200
         assert c.post("/search", json={"question": "jupiter"}).status_code == 429
 
     def test_ingest_not_rate_limited(self):
-        c = _build(None, rate_limit=0)
+        c = _build(rate_limit=0)
         assert c.post("/ingest").status_code == 200
 
 
 class TestCors:
     def test_origin_blocked_by_default(self):
-        c = _build(None)
+        c = _build()
         res = c.get("/health", headers={"origin": "https://evil.example"})
         assert "access-control-allow-origin" not in res.headers
 
     def test_configured_origin_allowed(self):
-        c = _build(None, cors_origins=["https://app.example"])
+        c = _build(cors_origins=["https://app.example"])
         res = c.get("/health", headers={"origin": "https://app.example"})
         assert res.headers["access-control-allow-origin"] == "https://app.example"
 
@@ -126,19 +152,20 @@ class TestGracefulErrors:
         app = create_app(
             bot=EmptyBot(),
             session_store=SessionStore(db_path=":memory:"),
+            user_store=None,
             rate_limit=0,
         )
         return TestClient(app)
 
     def test_chat_returns_503_without_crash(self):
         c = self._client()
-        res = c.post("/chat", json={"question": "hi"})
+        res = c.post("/chat", json={"question": "moons?"})
         assert res.status_code == 503
         assert "ingest" in res.json()["detail"]
 
     def test_stream_emits_error_event_without_crash(self):
         c = self._client()
-        res = c.post("/chat/stream", json={"question": "hi"})
+        res = c.post("/chat/stream", json={"question": "moons?"})
         assert res.status_code == 200
         assert '"error"' in res.text
         assert "data: [DONE]" in res.text

@@ -46,8 +46,9 @@ def env_or_local_model(model_name):
 
 class RAGBot:
 
-    def __init__(self, store_path=DEFAULT_STORE_PATH, data_dir=DEFAULT_DATA_DIR):
+    def __init__(self, store_path=DEFAULT_STORE_PATH, data_dir=DEFAULT_DATA_DIR, system_prompt=None):
         self.data_dir = data_dir
+        self.system_prompt = system_prompt or SYSTEM_PROMPT
         self._llm_client = None
         self._llm_model = None
         self._llm_lock = threading.Lock()
@@ -132,11 +133,6 @@ class RAGBot:
             )
 
         return track()
-        model_path = os.path.join(BASE_DIR, "models/all-MiniLM-L6-v2")
-        self.sentence_transformer = SentenceTransformer(model_path)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.store = SQLiteVecStore(db_path=store_path, dim=EMBEDDING_DIM)
-        self.last_results = []
 
     def _embed(self, texts):
         return self.sentence_transformer.encode(list(texts), normalize_embeddings=True)
@@ -203,7 +199,7 @@ class RAGBot:
         if not context:
             context = "No relevant documents were found."
         context = context[:8000]
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": self.system_prompt}]
         if history:
             for turn in history:
                 turn = dict(turn)

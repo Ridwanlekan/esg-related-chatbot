@@ -13,7 +13,10 @@ def main():
         f"{stats.stale_chunks_removed} stale chunks removed\n"
     )
 
-    print("Hi, I'm your RAGBot. Ask me anything about Jupiter, Ada Lovelace, or CRISPR")
+    print(
+        "Hi, I'm your RAGBot. I answer from the documents under data/. "
+        "Workspace folders (finance/, hr/, ...) are indexed together here."
+    )
     print("Type 'exit' to quit.\n")
 
     while True:

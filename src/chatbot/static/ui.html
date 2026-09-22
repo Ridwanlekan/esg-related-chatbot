@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ESG RAG Chatbot</title>
+<title>ESG Workspace Chatbot</title>
 <style>
   :root {
     --bg: #0f1520; --panel: #17202f; --panel-2: #1e293b; --border: #2b3a52;
@@ -26,6 +26,7 @@
   }
   .badge.ok { color: #4ade80; border-color: rgba(74,222,128,.4); }
   .badge.err { color: #f87171; border-color: rgba(248,113,113,.4); }
+  .badge.theme { color: var(--accent); border-color: rgba(56,189,248,.4); }
   .spacer { flex: 1; }
   button {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
@@ -33,11 +34,9 @@
   }
   button:hover { border-color: var(--accent); }
   button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent-2); color: #062033; border-color: transparent; font-weight: 600; }
   main { flex: 1; display: grid; grid-template-columns: 1fr 320px; min-height: 0; }
-  #chat {
-    display: flex; flex-direction: column; min-width: 0;
-    border-right: 1px solid var(--border);
-  }
+  #chat { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--border); }
   #messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 14px; }
   .msg { max-width: 78%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
   .msg.user { align-self: flex-end; background: var(--accent-2); color: #062033; }
@@ -65,7 +64,6 @@
   #search-results { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
   #search-results .hit { border: 1px solid var(--border); border-radius: 8px; padding: 8px; background: var(--panel-2); }
   #search-results .hit .meta { color: var(--muted); margin-bottom: 4px; }
-  #ingest-result { margin-top: 10px; font-size: 12px; color: var(--muted); white-space: pre-wrap; }
   aside button { width: 100%; }
   aside .muted { color: var(--muted); font-size: 12px; }
   #session-list { display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
@@ -75,45 +73,100 @@
   }
   .session-row:hover { border-color: var(--accent); }
   .session-row.current { border-color: var(--accent); }
-  .session-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+  .session-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .session-del { width: auto; flex: none; padding: 2px 8px; color: var(--muted); }
   .session-del:hover { color: var(--text); border-color: var(--border); }
+
+  #auth-view { display: flex; align-items: center; justify-content: center; flex: 1; }
+  .auth-card { width: 380px; max-width: 92vw; background: var(--panel); border: 1px solid var(--border); border-radius: 16px; padding: 26px; }
+  .auth-card h1 { font-size: 18px; margin: 0 0 4px; }
+  .auth-card .sub { color: var(--muted); font-size: 12px; margin: 0 0 18px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 16px; }
+  .tab {
+    flex: 1; text-align: center; padding: 8px; border-radius: 8px; font-size: 13px;
+    border: 1px solid var(--border); color: var(--muted); cursor: pointer; background: var(--panel-2);
+  }
+  .tab.active { color: var(--text); border-color: var(--accent); background: rgba(56,189,248,.12); }
+  .auth-card label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  .auth-card input {
+    width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 10px; font-size: 14px;
+  }
+  .auth-card input:focus { outline: none; border-color: var(--accent); }
+  .cats { display: flex; gap: 8px; margin: 4px 0 2px; }
+  .cat {
+    flex: 1; text-align: center; padding: 9px; border-radius: 8px; font-size: 13px;
+    border: 1px solid var(--border); color: var(--muted); cursor: pointer; background: var(--panel-2);
+  }
+  .cat.active { color: var(--text); border-color: var(--accent); background: rgba(56,189,248,.12); }
+  .auth-card .primary { width: 100%; margin-top: 16px; padding: 10px; font-size: 14px; }
+  .auth-err { margin-top: 12px; font-size: 12px; color: #f87171; min-height: 16px; white-space: pre-wrap; }
+  .hidden { display: none !important; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { border-top: 1px solid var(--border); } }
 </style>
 </head>
 <body>
+
+<div id="auth-view">
+  <div class="auth-card">
+    <h1>ESG Workspace Chatbot</h1>
+    <p class="sub">Sign in to your Finance or HR workspace. Every user is bound to one workspace.</p>
+    <div class="tabs">
+      <div id="tab-login" class="tab active">Sign in</div>
+      <div id="tab-signup" class="tab">Create account</div>
+    </div>
+
+    <div id="login-form">
+      <label for="login-email">Email</label>
+      <input id="login-email" type="email" autocomplete="email" placeholder="you@company.com">
+      <label for="login-password">Password</label>
+      <input id="login-password" type="password" autocomplete="current-password" placeholder="••••••••">
+      <button id="login-btn" class="primary">Sign in</button>
+    </div>
+
+    <div id="signup-form" class="hidden">
+      <label for="signup-name">Full name</label>
+      <input id="signup-name" type="text" autocomplete="name" placeholder="Jane Smith">
+      <label for="signup-email">Email</label>
+      <input id="signup-email" type="email" autocomplete="email" placeholder="you@company.com">
+      <label>Workspace (category)</label>
+      <div class="cats" id="cat-pills">
+        <div class="muted">Loading workspaces…</div>
+      </div>
+      <label for="signup-password">Password</label>
+      <input id="signup-password" type="password" autocomplete="new-password" placeholder="8+ characters">
+      <button id="signup-btn" class="primary">Create account</button>
+    </div>
+
+    <div id="auth-err" class="auth-err"></div>
+  </div>
+</div>
+
+<div id="chat-view" class="hidden">
 <header>
-  <h1>ESG RAG Chatbot</h1>
+  <h1 id="workspace-title">ESG Assistant</h1>
   <span id="health" class="badge">checking…</span>
+  <span id="user-badge" class="badge theme"></span>
   <span class="spacer"></span>
   <span id="session-label" class="badge">session: —</span>
   <button id="new-session">New session</button>
+  <button id="logout">Log out</button>
 </header>
 
 <main>
-<section id="chat">
-      <div id="messages">
-        <div class="msg bot">Hello! Ask me anything about the documents in the index (current: Jupiter, Ada Lovelace, CRISPR). Follow-up questions are auto-expanded from history. Type below. Press Enter to send, Shift+Enter for a new line.</div>
-      </div>
-      <div id="composer">
-        <textarea id="input" rows="1" placeholder="Ask about the documents…"></textarea>
-        <button id="send">Send</button>
-      </div>
-    </section>
+  <section id="chat">
+    <div id="messages"></div>
+    <div id="composer">
+      <textarea id="input" rows="1" placeholder="Ask about your workspace documents…"></textarea>
+      <button id="send">Send</button>
+    </div>
+  </section>
 
   <aside>
     <section>
       <h2>Sessions</h2>
       <div id="session-list"><div class="muted">no sessions yet</div></div>
       <button id="load-more" style="display:none; margin-top:8px;">Load more</button>
-    </section>
-    <section>
-      <h2>Security</h2>
-      <input id="api-key" type="password" placeholder="API key (only if server requires)" autocomplete="off">
-      <div class="search-row">
-        <button id="key-save">Save key</button>
-        <button id="key-clear">Clear</button>
-      </div>
     </section>
     <section>
       <h2>Search (no LLM)</h2>
@@ -123,26 +176,160 @@
       </div>
       <div id="search-results"></div>
     </section>
-    <section>
-      <h2>Tools</h2>
-      <button id="ingest">Re-index data/</button>
-      <div id="ingest-result"></div>
-    </section>
   </aside>
 </main>
+</div>
 
 <script>
 const $ = (id) => document.getElementById(id);
 const SESSION_PAGE = 12;
-let sessionId = localStorage.getItem("esg_session") || null;
+const TOKEN_KEY = "esg_token";
+let token = localStorage.getItem(TOKEN_KEY) || null;
+let me = null;
+let sessionId = null;
 let streaming = false;
 let sessionOffset = 0;
+let activeTab = "login";
+let selectedCat = "finance";
+let inviteToken = "";
+let inviteCategory = "";
+
+function tzOffset() { return -new Date().getTimezoneOffset(); }
+function authHeaders(json) {
+  const h = { "x-timezone-offset": String(tzOffset()) };
+  if (json) h["content-type"] = "application/json";
+  if (token) h["authorization"] = "Bearer " + token;
+  return h;
+}
+
+function showAuth() { $("chat-view").classList.add("hidden"); $("auth-view").classList.remove("hidden"); }
+function showChat() { $("auth-view").classList.add("hidden"); $("chat-view").classList.remove("hidden"); }
 
 function setSession(id) {
   sessionId = id;
-  if (id) localStorage.setItem("esg_session", id);
-  else localStorage.removeItem("esg_session");
   $("session-label").textContent = "session: " + (id ? id.slice(0, 8) : "—");
+}
+
+function setAuthError(msg) { $("auth-err").textContent = msg || ""; }
+function setBusy(btn, busy, label) { btn.disabled = busy; btn.textContent = busy ? label : (btn.dataset.label || btn.textContent); }
+
+function setActiveTab(tab) {
+  activeTab = tab;
+  $("tab-login").classList.toggle("active", tab === "login");
+  $("tab-signup").classList.toggle("active", tab === "signup");
+  $("login-form").classList.toggle("hidden", tab !== "login");
+  $("signup-form").classList.toggle("hidden", tab !== "signup");
+  setAuthError("");
+}
+
+function selectCat(cat) {
+  selectedCat = cat;
+  document.querySelectorAll(".cat").forEach((el) => el.classList.toggle("active", el.dataset.cat === cat));
+}
+
+function escHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+async function loadWorkspaces() {
+  try {
+    const res = await fetch("/workspaces");
+    const data = await res.json();
+    const pills = $("cat-pills");
+    if (!data.length) {
+      pills.innerHTML = '<div class="muted">No workspaces available.</div>';
+      return;
+    }
+    let cats = data.map((w) => w.category);
+    if (inviteCategory) {
+      cats = [inviteCategory];
+    }
+    if (!cats.includes(selectedCat)) selectedCat = cats[0];
+    pills.innerHTML = data
+      .filter((w) => cats.includes(w.category))
+      .map((w) =>
+        '<div class="cat' + (w.category === selectedCat ? " active" : "") + '" data-cat="' +
+        escHtml(w.category) + '">' + escHtml(w.emoji || "📄") + " " + escHtml(w.label || w.category) +
+        "</div>"
+      ).join("");
+    if (inviteCategory) {
+      const badge = document.createElement("div");
+      badge.className = "muted";
+      badge.style.marginTop = "8px";
+      badge.textContent = "🔒 Invite-only signup for " + inviteCategory;
+      pills.appendChild(badge);
+    }
+    pills.querySelectorAll(".cat").forEach((el) =>
+      el.addEventListener("click", () => selectCat(el.dataset.cat)));
+  } catch (e) { /* keep pills inert on failure */ }
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, opts);
+  if (res.status === 401 && opts.auth === true) {
+    token = null;
+    localStorage.removeItem(TOKEN_KEY);
+    showAuth();
+    throw new Error("session expired");
+  }
+  return res;
+}
+
+async function submitAuth(endpoint) {
+  const isLogin = endpoint === "login";
+  const btn = isLogin ? $("login-btn") : $("signup-btn");
+  const email = (isLogin ? $("login-email") : $("signup-email")).value.trim();
+  const password = (isLogin ? $("login-password") : $("signup-password")).value;
+  const body = isLogin
+    ? { email, password }
+    : { email, password, name: $("signup-name").value.trim(), category: selectedCat, invite: inviteToken || undefined };
+  setAuthError(""); setBusy(btn, true, "…");
+  try {
+    const res = await fetch("/auth/" + endpoint, {
+      method: "POST", headers: authHeaders(true), body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { setAuthError(data.detail || "Request failed"); return; }
+    token = data.token;
+    localStorage.setItem(TOKEN_KEY, token);
+    me = data;
+    enterChat();
+  } catch (e) { setAuthError(e.message); }
+  finally { setBusy(btn, false); }
+}
+
+async function enterChat() {
+  try {
+    const res = await api("/me", { headers: authHeaders(), auth: true });
+    if (!res.ok) throw new Error("failed to load profile");
+    me = await res.json();
+    $("workspace-title").textContent = (me.workspace.emoji || "🤖") + " " + me.workspace.label;
+    $("user-badge").textContent = me.user.name + " · " + me.workspace.category.toUpperCase();
+    showChat();
+    setSession(null);
+    clearMessages();
+    addMsg("bot", welcome());
+    renderSessions();
+  } catch (e) { setAuthError(e.message); }
+}
+
+function welcome() {
+  const now = new Date();
+  const hour = now.getHours();
+  const sal = hour < 12 ? "Good morning" : (hour < 18 ? "Good afternoon" : "Good evening");
+  const first = (me.user.name || "there").split(" ")[0];
+  const date = now.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+  return `${sal}, ${first}! ${me.workspace.emoji || ""} It's ${date}. I'm your ${me.workspace.label} assistant — I help with ${me.workspace.blurb}. What would you like to know?`;
+}
+
+function logout() {
+  token = null; me = null; sessionId = null;
+  localStorage.removeItem(TOKEN_KEY);
+  setSession(null); clearMessages();
+  $("session-list").innerHTML = "";
+  showAuth();
 }
 
 function addMsg(role, text) {
@@ -151,9 +338,7 @@ function addMsg(role, text) {
   if (role === "bot") {
     div.innerHTML = '<span class="body"></span>';
     div.querySelector(".body").textContent = text;
-  } else {
-    div.textContent = text;
-  }
+  } else { div.textContent = text; }
   $("messages").appendChild(div);
   $("messages").scrollTop = $("messages").scrollHeight;
   return div;
@@ -171,60 +356,39 @@ function addSources(botEl, sources) {
 }
 
 function clearMessages() { $("messages").innerHTML = ""; }
-function renderWelcome() { addMsg("bot", "Hello! Ask me anything about the documents in the index. Follow-ups auto-expand from history."); }
 
 async function health() {
   try {
     const r = await fetch("/health");
-    const ok = r.ok;
     const b = $("health");
-    b.className = "badge " + (ok ? "ok" : "err");
-    b.textContent = ok ? "server online" : "error";
-  } catch {
-    const b = $("health");
-    b.className = "badge err";
-    b.textContent = "offline";
-  }
+    b.className = "badge " + (r.ok ? "ok" : "err");
+    b.textContent = r.ok ? "server online" : "error";
+  } catch { const b = $("health"); b.className = "badge err"; b.textContent = "offline"; }
 }
 
 async function loadMessages(id) {
   clearMessages();
-  const res = await fetch("/sessions/" + id, { headers: headers() });
-  if (await handle401(res)) return;
+  const res = await api("/sessions/" + id, { headers: authHeaders(), auth: true });
+  if (res.status === 404) { setSession(null); renderWelcomeMsg(); return; }
   const data = await res.json();
-  if (!data.messages || !data.messages.length) { renderWelcome(); return; }
+  if (!data.messages || !data.messages.length) { renderWelcomeMsg(); return; }
   for (const m of data.messages) {
     if (m.role === "user") addMsg("user", m.content);
     else addMsg("bot", m.content);
   }
 }
 
-function headers(json) {
-  const h = { "content-type": "application/json" };
-  const key = localStorage.getItem("esg_api_key");
-  if (key) h["authorization"] = "Bearer " + key;
-  return h;
-}
-
-async function handle401(res) {
-  if (res.status === 401) {
-    alert("Missing or invalid API key. Set it in the Security panel.");
-    return true;
-  }
-  return false;
-}
+function renderWelcomeMsg() { addMsg("bot", "New session. Ask me anything about your workspace documents."); }
 
 async function fetchSessions() {
-  const res = await fetch("/sessions?limit=" + SESSION_PAGE + "&offset=" + sessionOffset, { headers: headers() });
-  if (await handle401(res)) return { sessions: [], total: 0, authed: false };
+  const res = await api("/sessions?limit=" + SESSION_PAGE + "&offset=" + sessionOffset, { headers: authHeaders(), auth: true });
   return res.ok ? await res.json() : { sessions: [], total: 0 };
 }
 
 async function renderSessions() {
   const box = $("session-list");
   let data;
-  try { data = await fetchSessions(); }
-  catch { data = { sessions: [], total: 0 }; }
+  try { data = await fetchSessions(); } catch { data = { sessions: [], total: 0 }; }
   if (!sessionOffset) box.innerHTML = "";
   if (!data.sessions.length && !sessionOffset) {
     box.innerHTML = '<div class="muted">no sessions yet</div>';
@@ -239,21 +403,15 @@ async function renderSessions() {
     const last = (s.last_message || "…").slice(0, 40);
     label.textContent = s.created_at.slice(11, 16) + " · " + last + " · " + s.message_count + " msgs";
     const del = document.createElement("button");
-    del.className = "session-del";
-    del.textContent = "×";
-    del.title = "delete session";
+    del.className = "session-del"; del.textContent = "×"; del.title = "delete session";
     del.onclick = async (e) => {
       e.stopPropagation();
-      await fetch("/sessions/" + s.session_id, { method: "DELETE", headers: headers() });
-      if (sessionId === s.session_id) { setSession(null); clearMessages(); renderWelcome(); }
-      sessionOffset = 0;
-      renderSessions();
+      await api("/sessions/" + s.session_id, { method: "DELETE", headers: authHeaders(), auth: true });
+      if (sessionId === s.session_id) { setSession(null); clearMessages(); renderWelcomeMsg(); }
+      sessionOffset = 0; renderSessions();
     };
-    row.onclick = async () => {
-      if (s.session_id !== sessionId) { setSession(s.session_id); await loadMessages(s.session_id); }
-    };
-    row.appendChild(label);
-    row.appendChild(del);
+    row.onclick = async () => { if (s.session_id !== sessionId) { setSession(s.session_id); await loadMessages(s.session_id); } };
+    row.appendChild(label); row.appendChild(del);
     box.appendChild(row);
   }
   const hasMore = sessionOffset + data.sessions.length < data.total;
@@ -272,7 +430,6 @@ async function send() {
   const body = bot.querySelector(".body");
   body.textContent = "thinking…";
   bot.classList.add("cursor");
-
   const queue = [];
   let sources = [];
   let timer = null;
@@ -291,13 +448,15 @@ async function send() {
   }
 
   try {
-    const res = await fetch("/chat/stream", {
+    const res = await api("/chat/stream", {
       method: "POST",
-      headers: headers(),
+      headers: authHeaders(true),
       body: JSON.stringify({ question: q, session_id: sessionId }),
+      auth: true,
     });
-    if (await handle401(res)) {
-      body.textContent = "Unauthorized — add the API key in the Security panel.";
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      body.textContent = data.detail || "Request failed (" + res.status + ")";
       return;
     }
     const sid = res.headers.get("X-Session-ID");
@@ -337,18 +496,18 @@ async function send() {
     if (timer) cancelAnimationFrame(timer);
     streaming = false;
     $("send").disabled = false;
+    sessionOffset = 0;
+    renderSessions();
   }
 }
 
 async function doSearch() {
   const q = $("search-q").value.trim();
   if (!q) return;
-  const res = await fetch("/search", {
-    method: "POST",
-    headers: headers(),
-    body: JSON.stringify({ question: q, k: 5 }),
+  const res = await api("/search", {
+    method: "POST", headers: authHeaders(true), body: JSON.stringify({ question: q, k: 5 }), auth: true,
   });
-  if (await handle401(res)) return;
+  if (!res.ok) return;
   const data = await res.json();
   const box = $("search-results");
   box.innerHTML = "";
@@ -360,45 +519,8 @@ async function doSearch() {
     meta.textContent = `${hit.source} #${hit.chunk_index} · sim ${hit.similarity}`;
     const txt = document.createElement("div");
     txt.textContent = hit.content.slice(0, 220);
-    div.appendChild(meta);
-    div.appendChild(txt);
+    div.appendChild(meta); div.appendChild(txt);
     box.appendChild(div);
-  }
-}
-
-async function doIngest() {
-  const btn = $("ingest");
-  btn.disabled = true;
-  btn.textContent = "indexing…";
-  const poll = setInterval(async () => {
-    try {
-      const r = await fetch("/ingest/status", { headers: headers() });
-      if (!r.ok) return;
-      const s = await r.json();
-      if (!s.running) { clearInterval(poll); return; }
-      const pct = s.total_files ? Math.round(100 * s.processed_files / s.total_files) : 0;
-      const name = s.current_file ? s.current_file.replace(/^.*[\\/]/, "") : "";
-      btn.textContent = `indexing… ${s.processed_files}/${s.total_files} (${pct}%)` + (name ? ` · ${name}` : "");
-    } catch { /* transient */ }
-  }, 1000);
-  try {
-    const r = await fetch("/ingest", { method: "POST", headers: headers() });
-    clearInterval(poll);
-    if (await handle401(r)) return;
-    if (!r.ok) {
-      $("ingest-result").textContent = `error ${r.status}: ${(await r.text()).slice(0, 300)}`;
-      return;
-    }
-    const data = await r.json();
-    const dur = data.duration_seconds !== undefined ? `\nduration: ${data.duration_seconds}s` : "";
-    $("ingest-result").textContent =
-      `docs seen: ${data.documents_seen}\nre-indexed: ${data.documents_reindexed}\n` +
-      `chunks added: ${data.chunks_upserted}\nstale removed: ${data.stale_chunks_removed}` +
-      `\nfailed: ${data.documents_failed || 0}${dur}`;
-  } finally {
-    clearInterval(poll);
-    btn.disabled = false;
-    btn.textContent = "Re-index data/";
   }
 }
 
@@ -408,31 +530,43 @@ $("input").addEventListener("keydown", (e) => {
 });
 $("search-btn").addEventListener("click", doSearch);
 $("search-q").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
-$("ingest").addEventListener("click", doIngest);
 $("load-more").addEventListener("click", () => { sessionOffset += SESSION_PAGE; renderSessions(); });
-$("key-save").addEventListener("click", () => {
-  const v = $("api-key").value.trim();
-  if (v) localStorage.setItem("esg_api_key", v);
-  $("api-key").value = "";
-  renderSessions();
-});
-$("key-clear").addEventListener("click", () => {
-  localStorage.removeItem("esg_api_key");
-  $("api-key").value = "";
-  renderSessions();
-});
-$("new-session").addEventListener("click", () => {
-  setSession(null);
-  clearMessages();
-  renderWelcome();
-});
+$("new-session").addEventListener("click", () => { setSession(null); clearMessages(); renderWelcomeMsg(); });
+$("logout").addEventListener("click", logout);
+$("tab-login").addEventListener("click", () => setActiveTab("login"));
+$("tab-signup").addEventListener("click", () => setActiveTab("signup"));
+$("login-btn").addEventListener("click", () => submitAuth("login"));
+$("signup-btn").addEventListener("click", () => submitAuth("signup"));
+["login-email", "login-password"].forEach((id) =>
+  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") submitAuth("login"); }));
+["signup-name", "signup-email", "signup-password"].forEach((id) =>
+  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") submitAuth("signup"); }));
 
-const storedKey = localStorage.getItem("esg_api_key");
-if (storedKey) $("api-key").placeholder = "API key saved";
-setSession(sessionId);
-renderSessions();
-health();
-setInterval(health, 30000);
+(async function init() {
+  const params = new URLSearchParams(location.search);
+  const inviteParam = params.get("invite");
+  if (inviteParam) {
+    inviteToken = inviteParam;
+    try {
+      const res = await fetch("/invites/" + encodeURIComponent(inviteToken));
+      if (res.ok) {
+        const data = await res.json();
+        inviteCategory = data.category;
+      } else {
+        inviteToken = "";
+      }
+    } catch (e) {
+      inviteToken = "";
+    }
+  }
+  if (token) {
+    try { await enterChat(); return; } catch {}
+  }
+  showAuth();
+  loadWorkspaces();
+  health();
+  setInterval(health, 30000);
+})();
 </script>
 </body>
 </html>

@@ -2,6 +2,7 @@
 # Transitive dependencies are resolved by pip at install time.
 openai==1.97.0
 python-dotenv==1.1.1
+python-multipart==0.0.20
 sentence-transformers==5.0.0
 transformers==4.53.2
 scikit-learn==1.7.1

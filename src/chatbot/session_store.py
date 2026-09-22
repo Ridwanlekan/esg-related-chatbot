@@ -19,8 +19,10 @@ class SessionStore:
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS sessions ("
             "id TEXT PRIMARY KEY, "
-            "created_at TEXT NOT NULL)"
+            "created_at TEXT NOT NULL, "
+            "user_id TEXT)"
         )
+        self._migrate_user_id()
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS messages ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
@@ -31,14 +33,36 @@ class SessionStore:
         )
         self.conn.commit()
 
-    def create(self, session_id):
+    def _migrate_user_id(self):
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "user_id" not in cols:
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT")
+            self.conn.commit()
+
+    def create(self, session_id, user_id=None):
         self.conn.execute(
-            "INSERT OR IGNORE INTO sessions (id, created_at) VALUES (?, ?)",
-            (session_id, _now()),
+            "INSERT OR IGNORE INTO sessions (id, created_at, user_id) VALUES (?, ?, ?)",
+            (session_id, _now(), user_id),
         )
         self.conn.commit()
         if self.retention and self.count() > self.retention:
             self.prune(self.retention)
+        return self.owner_of(session_id) == user_id or user_id is None
+
+    def owner_of(self, session_id):
+        row = self.conn.execute(
+            "SELECT user_id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return row["user_id"] if row else None
+
+    def exists(self, session_id):
+        row = self.conn.execute(
+            "SELECT id FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        return row is not None
 
     def append(self, session_id, role, content):
         self.create(session_id)
@@ -67,16 +91,22 @@ class SessionStore:
         ).fetchall()
         return [{"role": row["role"], "content": row["content"]} for row in rows]
 
-    def list_sessions(self, limit=20, offset=0):
-        total = self.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    def list_sessions(self, limit=20, offset=0, user_id=None):
+        where, params = "", []
+        if user_id:
+            where, params = "WHERE s.user_id = ?", [user_id]
+        total = self.conn.execute(
+            f"SELECT COUNT(*) FROM sessions s {where}", params
+        ).fetchone()[0]
         rows = self.conn.execute(
-            "SELECT s.id, s.created_at, "
-            "COUNT(m.id) AS message_count, "
-            "(SELECT content FROM messages m2 WHERE m2.session_id = s.id "
-            " ORDER BY m2.id DESC LIMIT 1) AS last_message "
-            "FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
-            "GROUP BY s.id ORDER BY MAX(m.id) DESC, s.created_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
+            f"SELECT s.id, s.created_at, "
+            f"COUNT(m.id) AS message_count, "
+            f"(SELECT content FROM messages m2 WHERE m2.session_id = s.id "
+            f" ORDER BY m2.id DESC LIMIT 1) AS last_message "
+            f"FROM sessions s LEFT JOIN messages m ON m.session_id = s.id "
+            f"{where} GROUP BY s.id ORDER BY MAX(m.id) DESC, s.created_at DESC "
+            f"LIMIT ? OFFSET ?",
+            params + [limit, offset],
         ).fetchall()
         return {
             "total": total,
@@ -91,12 +121,19 @@ class SessionStore:
             ],
         }
 
-    def delete(self, session_id):
+    def delete(self, session_id, user_id=None):
+        if user_id is not None and self.owner_of(session_id) != user_id:
+            return False
         self.conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
         self.conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         self.conn.commit()
+        return True
 
-    def count(self):
+    def count(self, user_id=None):
+        if user_id:
+            return self.conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE user_id = ?", (user_id,)
+            ).fetchone()[0]
         return self.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
 
     def prune(self, keep=500):

@@ -47,13 +47,15 @@ class FakeBot:
 def client(tmp_path):
     bot = FakeBot()
     store = SessionStore(db_path=str(tmp_path / "sessions.sqlite3"))
-    app = create_app(bot=bot, session_store=store)
+    app = create_app(bot=bot, session_store=store, user_store=None)
     yield TestClient(app), bot, store
 
 
 def test_health(client):
     c, _, _ = client
-    assert c.get("/health").json() == {"status": "ok"}
+    body = c.get("/health").json()
+    assert body["status"] == "ok"
+    assert "finance" in body["workspaces"]
 
 
 def test_chat_creates_session_and_returns_answer(client):
@@ -72,6 +74,7 @@ def test_chat_creates_session_and_returns_answer(client):
 def test_chat_reuses_session_history(client):
     c, bot, store = client
     sid = store.new_id()
+    store.create(sid, user_id="dev")
     store.append(sid, "user", "Moons?")
     store.append(sid, "assistant", "There are many.")
     res = c.post("/chat", json={"session_id": sid, "question": "name one"})
@@ -89,6 +92,33 @@ def test_chat_validates_question(client):
     assert res.status_code == 422
 
 
+def test_greeting_answered_without_rag(client):
+    c, bot, _ = client
+    res = c.post("/chat", json={"question": "good morning"})
+    body = res.json()
+    assert res.status_code == 200
+    assert body["sources"] == []
+    assert "Good morning" in body["answer"]
+    assert bot.ask_calls == []  # small talk never reaches the RAG bot
+
+
+def test_regular_question_reaches_rag(client):
+    c, bot, _ = client
+    c.post("/chat", json={"question": "what are the moons?"})
+    assert len(bot.ask_calls) == 1
+
+
+def test_stream_greeting_emits_delta_and_done(client):
+    c, _, store = client
+    res = c.post("/chat/stream", json={"question": "hi"})
+    assert res.status_code == 200
+    assert "Good morning" in res.text or "Good afternoon" in res.text or "Good evening" in res.text
+    assert "data: [DONE]" in res.text
+    body = store.history(res.headers["X-Session-ID"])
+    assert body[0] == {"role": "user", "content": "hi"}
+    assert body[-1]["role"] == "assistant"
+
+
 def test_stream_returns_sse_deltas(client):
     c, _, store = client
     res = c.post("/chat/stream", json={"question": "moons?"})
@@ -102,7 +132,7 @@ def test_stream_returns_sse_deltas(client):
 def test_stream_persists_messages(client):
     c, _, store = client
     sid = store.new_id()
-    store.create(sid)
+    store.create(sid, user_id="dev")
     c.post("/chat/stream", json={"session_id": sid, "question": "moons?"})
     history = store.history(sid)
     assert history[0] == {"role": "user", "content": "moons?"}
@@ -125,7 +155,7 @@ def test_stream_emits_sources_event(client):
 def test_list_and_load_sessions(client):
     c, _, store = client
     sid = store.new_id()
-    store.create(sid)
+    store.create(sid, user_id="dev")
     store.append(sid, "user", "hello")
     store.append(sid, "assistant", "hi there")
     listing = c.get("/sessions").json()
@@ -143,7 +173,9 @@ def test_list_and_load_sessions(client):
 def test_list_sessions_paginates(client):
     c, _, store = client
     for i in range(5):
-        store.append(store.new_id(), "user", str(i))
+        sid = store.new_id()
+        store.create(sid, user_id="dev")
+        store.append(sid, "user", str(i))
     full = c.get("/sessions?limit=100").json()["total"]
     page = c.get("/sessions?limit=2&offset=1").json()
     assert page["total"] == full
@@ -165,8 +197,9 @@ def test_ui_page_served(client):
     res = c.get("/ui")
     assert res.status_code == 200
     assert res.headers["content-type"].startswith("text/html")
-    assert "ESG RAG Chatbot" in res.text
+    assert "ESG Workspace Chatbot" in res.text
     assert "/chat/stream" in res.text
+    assert "Create account" in res.text
 
 
 def test_search_returns_items(client):
@@ -205,7 +238,7 @@ def test_ingest_status_reports_progress(client):
 def test_delete_session(client):
     c, _, store = client
     sid = store.new_id()
-    store.create(sid)
+    store.create(sid, user_id="dev")
     store.append(sid, "user", "hi")
     c.delete(f"/sessions/{sid}")
     assert store.history(sid) == []

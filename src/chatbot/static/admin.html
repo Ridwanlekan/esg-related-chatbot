@@ -1,0 +1,1316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Console · ESG Workspace Chatbot</title>
+<style>
+  :root {
+    --bg: #0f1520; --panel: #17202f; --panel-2: #1e293b; --border: #2b3a52;
+    --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; --accent-2: #0ea5e9;
+    --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); min-height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .spacer { flex: 1; }
+  .badge {
+    font-size: 11px; padding: 3px 10px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+  }
+  .badge.ok { color: var(--ok); border-color: rgba(74,222,128,.4); }
+  .badge.warn { color: var(--warn); border-color: rgba(251,191,36,.4); }
+  .badge.err { color: var(--err); border-color: rgba(248,113,113,.4); }
+  .badge.accent { color: var(--accent); border-color: rgba(56,189,248,.4); }
+  .badge.muted-badge { color: var(--muted); }
+  main { max-width: 980px; margin: 0 auto; padding: 22px 20px 60px; }
+  a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent-2); color: #062033; border-color: transparent; font-weight: 600; }
+  button.danger { color: var(--err); border-color: rgba(248,113,113,.4); }
+  button.small { padding: 5px 10px; font-size: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .key-row { display: flex; gap: 8px; align-items: center; }
+  .key-foot { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+  .inline-actions { display: flex; gap: 8px; align-items: center; }
+  input, select {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 10px; font-size: 14px;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  input[type=file] { display: none; }
+  .muted { color: var(--muted); font-size: 12px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
+  .tabs button {
+    border-radius: 8px 8px 0 0; border: 1px solid transparent; border-bottom: none;
+    background: transparent; color: var(--muted); padding: 10px 16px; font-weight: 600;
+  }
+  .tabs button.active { background: var(--panel); border-color: var(--border); color: var(--text); }
+  .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .total { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .total .num { font-size: 26px; font-weight: 700; }
+  .total .lbl { color: var(--muted); font-size: 12px; margin-top: 2px; text-transform: uppercase; letter-spacing: .04em; }
+  .workspace {
+    display: flex; align-items: center; gap: 14px; padding: 12px 14px;
+    border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); margin-bottom: 10px;
+  }
+  .ws-emoji { font-size: 22px; }
+  .ws-meta { flex: 1; min-width: 0; }
+  .ws-meta .title { font-weight: 600; font-size: 14px; }
+  .ws-meta .stats { color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
+  .ws-meta .stats b { color: var(--text); }
+  .ws-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .actions { display: flex; gap: 10px; margin: 14px 0; flex-wrap: wrap; }
+  .table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .table th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 8px; border-bottom: 1px solid var(--border); }
+  .table td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .table tr:last-child td { border-bottom: none; }
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+  .tag.custom { color: var(--accent); border-color: rgba(56,189,248,.4); }
+  .tag.ok { color: var(--ok); border-color: rgba(74,222,128,.4); }
+  .tag.warn { color: var(--warn); border-color: rgba(251,191,36,.4); }
+  .row-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; }
+  .row-form .field label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
+  .doc-group { margin-bottom: 14px; }
+  .doc-group h3 { font-size: 13px; margin: 0 0 8px; font-weight: 600; }
+  .doc-group h3 .count { color: var(--muted); font-weight: 400; font-size: 12px; }
+  .file-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; }
+  .file-row .name { flex: 1; overflow-wrap: anywhere; }
+  .edit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 8px; }
+  .dropzone {
+    border: 2px dashed var(--border); border-radius: 12px; padding: 26px 20px; text-align: center;
+    color: var(--muted); font-size: 13px; cursor: pointer; transition: border-color .15s, background .15s; margin-bottom: 12px;
+  }
+  .dropzone.drag { border-color: var(--accent); background: rgba(56,189,248,.06); color: var(--text); }
+  .dropzone .dz-title { font-size: 14px; color: var(--text); margin-bottom: 4px; }
+  .dropzone small { display: block; margin-top: 4px; }
+  .prog { background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; height: 10px; overflow: hidden; margin-top: 10px; }
+  .prog .bar { height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent-2), var(--accent)); transition: width .3s; }
+  #log {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; color: var(--muted); white-space: pre-wrap;
+    background: #0d1520; border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px; max-height: 170px; overflow-y: auto; margin-top: 12px;
+  }
+  .hidden { display: none !important; }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .toolbar input { flex: 1; min-width: 180px; }
+  .footer { text-align: center; color: var(--muted); font-size: 11px; margin-top: 30px; }
+  #toasts { position: fixed; bottom: 18px; right: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 100; max-width: 380px; }
+  .toast {
+    background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 12px 14px; font-size: 13px; box-shadow: 0 6px 20px rgba(0,0,0,.4);
+    animation: slidein .18s ease;
+  }
+  .toast.ok { border-left-color: var(--ok); }
+  .toast.err { border-left-color: var(--err); }
+  .toast.warn { border-left-color: var(--warn); }
+  @keyframes slidein { from { opacity: 0; transform: translateX(10px); } to { opacity: 1; transform: none; } }
+  .pillcount { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🛠️ Admin Console</h1>
+  <span id="health" class="badge">checking…</span>
+  <span id="key-status" class="badge warn hidden">key not set</span>
+  <span class="spacer"></span>
+  <span id="clock" class="badge muted-badge"></span>
+  <a href="/ui">← Chat app</a>
+</header>
+
+<main>
+  <div class="card" id="key-card">
+    <h2>Admin access</h2>
+    <div id="key-editor">
+      <div style="display:grid;gap:10px">
+        <div class="field"><label>API key (value of API_KEY in .env)</label>
+          <input id="admin-key" type="password" placeholder="API_KEY" autocomplete="off">
+        </div>
+        <div class="field"><label id="basic-user-label" class="hidden">Basic username</label>
+          <input id="admin-basic-user" type="text" placeholder="Basic username (ADMIN_BASIC_USER)" autocomplete="off" class="hidden">
+        </div>
+        <div class="field"><label id="basic-pass-label" class="hidden">Basic password</label>
+          <input id="admin-basic-pass" type="password" placeholder="Basic password (ADMIN_BASIC_PASS)" autocomplete="off" class="hidden">
+        </div>
+        <div class="field"><label id="totp-label" class="hidden">Authenticator code</label>
+          <input id="admin-totp" type="text" inputmode="numeric" placeholder="6-digit authenticator code" autocomplete="one-time-code" class="hidden">
+        </div>
+      </div>
+      <div class="key-row" style="margin-top:10px">
+        <button id="key-save" class="primary">Save</button>
+        <button id="key-cancel">Cancel</button>
+      </div>
+      <div class="hint">API key + Basic credentials are stored in this browser (localStorage); the authenticator code is kept only for this tab (sessionStorage). Sent with admin requests while the console is open.</div>
+    </div>
+    <div id="key-actions" class="key-foot hidden">
+      <span class="badge ok">Connected</span>
+      <span class="muted" id="key-summary">Unlocks all admin actions.</span>
+      <span class="spacer"></span>
+      <button id="key-change" class="small">Change</button>
+      <button id="key-clear" class="small danger">Clear</button>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button id="tab-overview" class="active">Overview</button>
+    <button id="tab-documents">Documents</button>
+    <button id="tab-workspaces">Workspaces</button>
+    <button id="tab-users">Users</button>
+    <button id="tab-audit">Audit</button>
+  </div>
+
+  <section id="view-overview">
+    <div class="totals" id="totals">
+      <div class="total"><div class="num">—</div><div class="lbl">Workspaces</div></div>
+      <div class="total"><div class="num">—</div><div class="lbl">Chunks indexed</div></div>
+      <div class="total"><div class="num">—</div><div class="lbl">Users</div></div>
+      <div class="total"><div class="num">—</div><div class="lbl">Sessions</div></div>
+    </div>
+    <div class="card">
+      <h2>Workspaces</h2>
+      <div class="actions">
+        <button id="btn-refresh" class="primary">Refresh status</button>
+        <button id="btn-reindex-all">Re-index all</button>
+      </div>
+      <div class="prog hidden" id="prog-wrap"><div class="bar" id="prog-bar"></div></div>
+      <div id="ingest-state" class="muted hidden"></div>
+      <div id="workspaces"><div class="muted">Enter the admin API key and refresh to see workspace status.</div></div>
+      <div class="err-text" id="err" style="color:var(--err);font-size:13px;margin-top:10px;min-height:16px"></div>
+      <div id="log" class="hidden"></div>
+    </div>
+  </section>
+
+  <section id="view-documents" class="hidden">
+    <div class="card">
+      <h2>Upload files</h2>
+      <div class="toolbar">
+        <select id="up-cat" style="flex:0 0 200px"></select>
+        <button id="btn-upload" class="primary" style="flex:0 0 auto">Upload &amp; index</button>
+      </div>
+      <div class="dropzone" id="dropzone">
+        <div class="dz-title">Drag &amp; drop files here</div>
+        <div>— or click to browse —</div>
+        <small id="dz-files">No files chosen yet.</small>
+      </div>
+      <input id="file-input" type="file" multiple>
+    </div>
+    <div class="card">
+      <h2>Documents by workspace</h2>
+      <div class="toolbar">
+        <input id="doc-search" placeholder="Filter by file name…">
+        <button id="btn-refresh-docs" class="small">Refresh</button>
+      </div>
+      <div id="documents"><div class="muted">Loading…</div></div>
+    </div>
+  </section>
+
+  <section id="view-workspaces" class="hidden">
+    <div class="card">
+      <h2>Create workspace</h2>
+      <div class="row-form">
+        <div class="field"><label>Category</label><input id="ws-cat" placeholder="e.g. netzero"></div>
+        <div class="field"><label>Label</label><input id="ws-label" placeholder="e.g. Net Zero"></div>
+        <div class="field"><label>Emoji</label><input id="ws-emoji" placeholder="e.g. 🌍"></div>
+        <div class="field"><label>Blurb</label><input id="ws-blurb" placeholder="Short description shown on signup"></div>
+        <div class="field"><button id="btn-create-ws" class="primary">Create</button></div>
+      </div>
+      <div class="hint">Only lowercase letters, numbers, <code>-</code> and <code>_</code> (2–30 chars). The category names a folder in <code>data/</code> and its own vector index.</div>
+    </div>
+    <div class="card">
+      <h2>All workspaces</h2>
+      <div class="toolbar">
+        <input id="ws-search" placeholder="Filter by name or category…">
+        <button id="btn-refresh-ws" class="small">Refresh</button>
+        <a id="dl-workspaces-csv" class="small" style="font-size:12px" download>⬇ Export CSV</a>
+      </div>
+      <div id="ws-list"><div class="muted">Loading…</div></div>
+    </div>
+    <div class="card">
+      <h2>Invite links <span class="muted">(invite-only signup)</span></h2>
+      <div class="row-form">
+        <div class="field"><label>Category</label><select id="invite-cat"></select></div>
+        <div class="field"><label>Uses allowed</label><input id="invite-uses" type="number" min="1" max="1000" value="1"></div>
+        <div class="field"><label>Expires in (h)</label><input id="invite-ttl" type="number" min="1" max="8760" value="168"></div>
+        <div class="field"><label>Note (optional)</label><input id="invite-label" placeholder="e.g. audit team"></div>
+        <div class="field"><button id="btn-create-invite" class="primary">Create invite</button></div>
+      </div>
+      <div class="hint">Anyone with the one-time link can create an account in that workspace without opening signup for everyone. The full link is shown only once, at creation time.</div>
+      <div id="invite-list"><div class="muted" id="invite-empty">No active invites. Create one above — the full link is shown once (copy it immediately).</div></div>
+    </div>
+  </section>
+
+  <section id="view-users" class="hidden">
+    <div class="card">
+      <h2>Create user</h2>
+      <div class="row-form">
+        <div class="field"><label>Email</label><input id="user-email" type="email"></div>
+        <div class="field"><label>Password (min 8)</label><input id="user-pass" type="password"></div>
+        <div class="field"><label>Name</label><input id="user-name"></div>
+        <div class="field"><label>Category</label><select id="user-cat"></select></div>
+        <div class="field"><button id="btn-create-user" class="primary">Create</button></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Users <span class="muted" id="user-total"></span></h2>
+      <div class="toolbar">
+        <input id="user-search" placeholder="Filter by name or email…">
+        <button id="btn-refresh-users" class="small">Refresh</button>
+        <a id="dl-users-csv" class="small" style="font-size:12px" download>⬇ Export CSV</a>
+      </div>
+      <div id="user-list"><div class="muted">Loading…</div></div>
+      <div class="actions">
+        <button id="btn-more-users" class="hidden">Load more</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-audit" class="hidden">
+    <div class="card">
+      <h2>Audit log</h2>
+      <div class="toolbar">
+        <input id="audit-search" placeholder="Filter event, actor or object…">
+        <button id="btn-refresh-audit" class="small">Refresh</button>
+      </div>
+      <div id="audit-list"><div class="muted">Loading…</div></div>
+      <div class="actions">
+        <button id="btn-more-audit" class="hidden">Load more</button>
+        <span class="muted" id="audit-total"></span>
+      </div>
+    </div>
+  </section>
+
+  <div class="footer">Admin Console · all actions are gated by the API key · logs and docs in <code>README.md</code></div>
+</main>
+
+<div id="toasts"></div>
+
+<div id="modal-bg" class="hidden" style="position:fixed;inset:0;background:rgba(6,10,18,.7);z-index:50;display:flex;align-items:flex-start;justify-content:center;padding:40px 16px;">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:12px;width:100%;max-width:860px;max-height:82vh;display:flex;flex-direction:column;">
+    <div style="display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--border)">
+      <h2 id="modal-title" style="font-size:14px;margin:0;flex:1">Sessions</h2>
+      <button id="modal-close" class="small">Close</button>
+    </div>
+    <div id="modal-body" style="overflow-y:auto;padding:16px"></div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const KEY = "esg_admin_key";
+const BASIC_USER_KEY = "esg_admin_basic_user";
+const BASIC_PASS_KEY = "esg_admin_basic_pass";
+const TOTP_KEY = "esg_admin_totp";
+let adminKey = localStorage.getItem(KEY) || "";
+let basicUser = localStorage.getItem(BASIC_USER_KEY) || "";
+let basicPass = localStorage.getItem(BASIC_PASS_KEY) || "";
+let totpCode = sessionStorage.getItem(TOTP_KEY) || "";
+let authCfg = { basic: false, totp: false };
+let refreshTimer = null;
+let tokens = {};
+let docOffsets = {};
+
+const tabs = [
+  ["tab-overview", "view-overview"],
+  ["tab-documents", "view-documents"],
+  ["tab-workspaces", "view-workspaces"],
+  ["tab-users", "view-users"],
+  ["tab-audit", "view-audit"],
+];
+
+function notify(msg, kind = "ok") {
+  const box = $("toasts");
+  const t = document.createElement("div");
+  t.className = "toast " + kind;
+  t.textContent = msg;
+  box.appendChild(t);
+  setTimeout(() => { t.style.opacity = "0"; t.style.transition = "opacity .3s"; }, 3200);
+  setTimeout(() => t.remove(), 3550);
+}
+
+function showTab(name) {
+  for (const [btn, view] of tabs) {
+    $(btn).classList.toggle("active", btn === name);
+    $(view).classList.toggle("hidden", btn !== name);
+  }
+  if (name === "tab-documents") loadDocuments();
+  if (name === "tab-workspaces") { loadWorkspaces(); loadInvites(); loadCategories(); }
+  if (name === "tab-users") loadUsers();
+  if (name === "tab-audit") loadAudit();
+  if (name === "tab-overview") refreshStatus();
+}
+
+function authHeaders(json = true) {
+  const h = json ? { "content-type": "application/json" } : {};
+  if (adminKey) h["authorization"] = "Bearer " + adminKey;
+  else if (basicUser && basicPass) h["authorization"] = "Basic " + btoa(basicUser + ":" + basicPass);
+  if (totpCode) h["x-admin-totp"] = totpCode;
+  return h;
+}
+
+async function applyAuditConfig() {
+  try {
+    const res = await fetch("/admin/config");
+    authCfg = await res.json();
+  } catch (e) { authCfg = { basic: false, totp: false }; }
+  const nur = ["admin-basic-user", "admin-basic-pass", "basic-user-label", "basic-pass-label"];
+  nur.forEach((id) => $(id).classList.toggle("hidden", !authCfg.basic));
+  ["totp", "totp-label"].forEach((id) => $(id).classList.toggle("hidden", !authCfg.totp));
+}
+
+function gateHintNeedsTotp(res) {
+  return res.status === 401 && res.headers.get("content-type")?.includes("json");
+}
+
+function setBusy(btn, busy, label) {
+  btn.disabled = busy;
+  btn.textContent = busy ? (label || "working…") : (btn.dataset.label || btn.textContent);
+}
+
+function log(msg) {
+  const el = $("log");
+  el.classList.remove("hidden");
+  el.textContent += msg + "\n";
+  el.scrollTop = el.scrollHeight;
+}
+
+async function api(path, opts = {}, _retried = false) {
+  const res = await fetch(path, opts);
+  if (res.status === 401 && authCfg.totp && !_retried) {
+    let needCode = false;
+    try { const d = await res.clone().json(); needCode = /authenticator|code/i.test(d.detail || ""); } catch (e) {}
+    if (needCode) {
+      const code = prompt("Your authenticator code expired or is missing — enter the current code:");
+      if (code) {
+        sessionStorage.setItem(TOTP_KEY, totpCode = code.trim());
+        const retryHeaders = { ...(opts.headers || {}), "x-admin-totp": totpCode };
+        return api(path, { ...opts, headers: retryHeaders }, true);
+      }
+    }
+    notify("Admin auth failed.", "err");
+    throw new Error("unauthorized");
+  }
+  if (res.status === 401) {
+    notify("Admin auth failed.", "err");
+    throw new Error("unauthorized");
+  }
+  if (res.status === 503) {
+    const d = await res.json().catch(() => ({}));
+    notify(d.detail || "Feature disabled — set API_KEY to enable.", "err");
+    throw new Error("disabled");
+  }
+  if (!res.ok) {
+    let detail = res.status + " " + res.statusText;
+    try { const d = await res.json(); if (d.detail) detail = d.detail; }
+    catch (e) { /* keep status text */ }
+    const e = new Error(detail);
+    e.status = res.status;
+    throw e;
+  }
+  return res;
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+function elm(tag, cls, text) {
+  const el = document.createElement(tag);
+  if (cls) el.className = cls;
+  if (text != null) el.textContent = text;
+  return el;
+}
+
+function fmtSize(n) {
+  if (n == null) return "—";
+  if (n < 1024) return n + " B";
+  return (n / 1024).toFixed(1) + " KB";
+}
+
+function relTime(iso) {
+  if (!iso) return "never";
+  const t = new Date(iso).getTime();
+  if (isNaN(t)) return iso;
+  const s = Math.max(0, (Date.now() - t) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  if (s < 86400 * 30) return Math.floor(s / 86400) + "d ago";
+  return new Date(iso).toISOString().slice(0, 10);
+}
+
+function tickClock() {
+  const d = new Date();
+  $("clock").textContent = d.toUTCString().slice(17, 25) + " UTC";
+}
+tickClock();
+setInterval(tickClock, 1000);
+
+/* ---------------- key card ---------------- */
+
+function renderKeyUi() {
+  const set = !!(adminKey || (basicUser && basicPass));
+  $("key-editor").classList.toggle("hidden", set && !$("key-editor").dataset.open);
+  $("key-actions").classList.toggle("hidden", !set);
+  const badge = $("key-status");
+  badge.classList.toggle("hidden", set);
+  badge.classList.toggle("warn", !set);
+  if (!set) $("key-editor").dataset.open = "1";
+}
+
+$("key-save").addEventListener("click", () => {
+  const v = $("admin-key").value.trim();
+  adminKey = v;
+  if (v) localStorage.setItem(KEY, adminKey); else localStorage.removeItem(KEY);
+  const bu = $("admin-basic-user").value.trim();
+  const bp = $("admin-basic-pass").value;
+  basicUser = bu; basicPass = bp;
+  if (bu && bp) { localStorage.setItem(BASIC_USER_KEY, bu); localStorage.setItem(BASIC_PASS_KEY, bp); }
+  else { localStorage.removeItem(BASIC_USER_KEY); localStorage.removeItem(BASIC_PASS_KEY); }
+  const tc = $("admin-totp").value.trim();
+  if (tc) { sessionStorage.setItem(TOTP_KEY, totpCode = tc); }
+  delete $("key-editor").dataset.open;
+  $("admin-key").value = $("admin-basic-user").value = $("admin-basic-pass").value = $("admin-totp").value = "";
+  renderKeyUi();
+  notify("Saved — admin console unlocked.");
+  const e = $("err"); if (e) e.textContent = "";
+  refreshStatus();
+});
+$("key-change").addEventListener("click", () => {
+  $("key-editor").dataset.open = "1";
+  renderKeyUi();
+  $("admin-key").focus();
+});
+$("key-cancel").addEventListener("click", () => {
+  delete $("key-editor").dataset.open;
+  $("admin-key").value = $("admin-basic-user").value = $("admin-basic-pass").value = $("admin-totp").value = "";
+  renderKeyUi();
+});
+$("key-clear").addEventListener("click", () => {
+  if (!confirm("Clear the stored admin credentials?")) return;
+  adminKey = ""; basicUser = ""; basicPass = ""; totpCode = "";
+  localStorage.removeItem(KEY); localStorage.removeItem(BASIC_USER_KEY); localStorage.removeItem(BASIC_PASS_KEY);
+  sessionStorage.removeItem(TOTP_KEY);
+  delete $("key-editor").dataset.open;
+  $("admin-key").value = $("admin-basic-user").value = $("admin-basic-pass").value = $("admin-totp").value = "";
+  renderKeyUi();
+  notify("Admin credentials cleared.", "warn");
+});
+$("admin-key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("key-save").click(); });
+
+/* ---------------- overview ---------------- */
+
+async function refreshStatus() {
+  const err = $("err");
+  err.textContent = "";
+  try {
+    const res = await api("/admin/status", { headers: authHeaders() });
+    const data = await res.json();
+    renderOverview(data);
+  } catch (e) { if (e.message !== "unauthorized" && e.message !== "disabled") err.textContent = e.message; }
+}
+
+function renderOverview(data) {
+  const t = data.totals || {};
+  const nums = [t.workspaces, t.chunks, t.users, t.sessions].map((v) => v == null ? "—" : v);
+  const labels = ["Workspaces", "Chunks indexed", "Users", "Sessions"];
+  $("totals").innerHTML = nums.map((n, i) =>
+    '<div class="total"><div class="num">' + n + '</div><div class="lbl">' + labels[i] + '</div></div>'
+  ).join("");
+
+  const box = $("workspaces");
+  box.innerHTML = "";
+  for (const ws of data.workspaces || []) {
+    const row = document.createElement("div");
+    row.className = "workspace";
+
+    const emoji = document.createElement("div");
+    emoji.className = "ws-emoji";
+    emoji.textContent = ws.emoji || "📄";
+
+    const meta = document.createElement("div");
+    meta.className = "ws-meta";
+    const title = document.createElement("div");
+    title.className = "title";
+    title.innerHTML = ws.label + ' <span class="muted">(' + ws.category + ')</span>';
+    const stats = document.createElement("div");
+    stats.className = "stats";
+    stats.innerHTML = ws.indexed
+      ? "<b>" + ws.chunks + "</b> chunks · <b>" + ws.sources + "</b> sources · " + ws.data_file_count + " file(s) in data/"
+      : '<span style="color:var(--err)">not indexed yet</span> · ' + ws.data_file_count + " file(s) in data/";
+    meta.appendChild(title);
+    meta.appendChild(stats);
+
+    const actions = document.createElement("div");
+    actions.className = "ws-actions";
+    const up = document.createElement("button");
+    up.dataset.label = "Upload";
+    up.textContent = "↑ Upload";
+    up.onclick = () => { $("up-cat").value = ws.category; showTab("tab-documents"); };
+    actions.appendChild(up);
+
+    const btn = document.createElement("button");
+    btn.dataset.label = "Re-index " + ws.category;
+    btn.textContent = "Re-index";
+    btn.onclick = () => reindex(ws.category, btn);
+    actions.appendChild(btn);
+
+    row.appendChild(emoji); row.appendChild(meta); row.appendChild(actions);
+    box.appendChild(row);
+  }
+  renderProgress(data.progress);
+}
+
+function renderProgress(p) {
+  const wrap = $("prog-wrap"), bar = $("prog-bar"), state = $("ingest-state");
+  if (!p || !p.total_files) { wrap.classList.add("hidden"); state.classList.add("hidden"); return; }
+  wrap.classList.remove("hidden");
+  const pct = Math.min(100, Math.round(((p.processed_files || 0) / p.total_files) * 100));
+  bar.style.width = pct + "%";
+  state.classList.remove("hidden");
+  state.textContent = p.running
+    ? "Indexing " + (p.processed_files || 0) + "/" + p.total_files + " — " + (p.current_file || "…")
+    : "Last run: " + (p.processed_files || 0) + "/" + p.total_files + " in " + (p.elapsed_seconds || "—") + "s";
+}
+
+async function reindex(category, btn) {
+  const err = $("err");
+  err.textContent = "";
+  log((category ? "[" + category + "] " : "") + "re-index started…");
+  setBusy(btn, true, "indexing…");
+  try {
+    const path = category ? "/ingest/" + encodeURIComponent(category) : "/ingest";
+    const res = await api(path, { method: "POST", headers: authHeaders() });
+    const s = await res.json();
+    log("done in " + s.duration_seconds + "s → docs seen: " + s.documents_seen +
+        ", re-indexed: " + s.documents_reindexed + ", chunks: " + s.chunks_upserted +
+        ", failed: " + (s.documents_failed || 0));
+    notify(category + " re-indexed — " + s.chunks_upserted + " chunks upserted.");
+  } catch (e) {
+    log("error: " + e.message);
+    notify("Re-index failed: " + e.message, "err");
+  } finally {
+    setBusy(btn, false);
+    refreshStatus();
+    checkProgress();
+  }
+}
+
+async function checkProgress() {
+  try {
+    const res = await api("/ingest/status", { headers: authHeaders() });
+    const p = await res.json();
+    renderProgress(p);
+    if (p && p.running) {
+      clearTimeout(tokens.prog);
+      tokens.prog = setTimeout(checkProgress, 1500);
+    }
+  } catch (e) { /* not authed or disabled */ }
+}
+
+async function loadCategories() {
+  try {
+    const res = await fetch("/workspaces");
+    if (!res.ok) throw new Error(res.status + " " + res.statusText);
+    const ws = await res.json();
+    const opts = ws.map((w) => '<option value="' + esc(w.category) + '">' + esc(w.label || w.category) + "</option>").join("");
+    $("up-cat").innerHTML = opts;
+    $("user-cat").innerHTML = opts;
+    $("invite-cat").innerHTML = opts;
+  } catch (e) {
+    console.error("loadCategories failed:", e);
+    // leave selects empty so the user can see something's wrong
+  }
+}
+
+/* ---------------- documents ---------------- */
+
+const DOC_PAGE = 100;
+let docCache = {};   // category -> { files, total_files, offset }
+
+async function loadDocuments() {
+  const box = $("documents");
+  try {
+    await fetchDocPage(null, 0);
+  } catch (e) {
+    box.innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+    return;
+  }
+  renderDocuments($("doc-search").value.trim().toLowerCase());
+}
+
+async function fetchDocPage(category, offset) {
+  const q = "limit=" + DOC_PAGE + "&offset=" + offset;
+  const url = category
+    ? "/admin/documents?" + q + "&category=" + encodeURIComponent(category)
+    : "/admin/documents?" + q;
+  const res = await api(url, { headers: authHeaders() });
+  const data = await res.json();
+  for (const g of data.documents || []) {
+    const prev = docCache[g.category] || { files: [], total_files: 0 };
+    docCache[g.category] = {
+      files: offset === 0 ? g.files : prev.files.concat(g.files),
+      total_files: g.total_files,
+      offset: offset + g.files.length,
+    };
+  }
+}
+
+function renderDocuments(q) {
+  const box = $("documents");
+  box.innerHTML = "";
+  const cats = Object.keys(docCache);
+  if (!cats.length) { box.appendChild(elm("div", "muted", "No workspaces.")); return; }
+  for (const cat of cats) {
+    const g = docCache[cat];
+    const files = (g.files || []).filter((f) => !q || f.name.toLowerCase().includes(q));
+    const group = document.createElement("div");
+    group.className = "doc-group";
+    const h = elm("h3", "", cat + " ");
+    h.appendChild(elm("span", "count", (g.total_files || 0) + " file(s)"));
+    group.appendChild(h);
+    if (!files.length) {
+      group.appendChild(elm("div", "muted", q ? "No files match." : "No files in data/" + cat));
+    } else {
+      for (const f of files) {
+        const row = document.createElement("div");
+        row.className = "file-row";
+        const tag = elm("span", "tag " + (f.indexed ? "ok" : "warn"),
+          f.indexed ? "indexed" : "not indexed");
+        row.appendChild(tag);
+        row.appendChild(elm("span", "name", f.name));
+        row.appendChild(elm("span", "muted", fmtSize(f.size)));
+        const del = elm("button", "small danger", "Delete");
+        del.onclick = () => deleteDoc(cat, f.name);
+        row.appendChild(del);
+        group.appendChild(row);
+      }
+    }
+    if (!q && g.offset < (g.total_files || 0)) {
+      const more = elm("button", "small", "Load more (" + (g.total_files - g.offset) + " more)");
+      more.onclick = async () => {
+        more.disabled = true;
+        try { await fetchDocPage(cat, g.offset); renderDocuments(q); }
+        catch (e) { notify(e.message, "err"); more.disabled = false; }
+      };
+      group.appendChild(more);
+    }
+    box.appendChild(group);
+  }
+}
+
+async function deleteDoc(category, name) {
+  if (!confirm('Delete "' + name + '" from ' + category + ' and rebuild its index?')) return;
+  try {
+    await api("/admin/documents/delete", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({ category, filename: name }),
+    });
+    notify("Deleted " + name + " — index rebuilt.");
+    await loadDocuments();
+    refreshStatus();
+  } catch (e) { notify("Delete failed: " + e.message, "err"); }
+}
+
+function chosenFiles() {
+  const input = $("file-input");
+  return input.files.length ? Array.from(input.files) : (window._dropFiles || []);
+}
+
+async function uploadFiles() {
+  const files = chosenFiles();
+  if (!files.length) { notify("Choose or drop at least one file first.", "warn"); return; }
+  const cat = $("up-cat").value;
+  const fd = new FormData();
+  fd.append("category", cat);
+  for (const f of files) fd.append("files", f, f.name);
+
+  const btn = $("btn-upload");
+  setBusy(btn, true, "uploading & indexing…");
+  log("[" + cat + "] upload started (" + files.length + " file(s); re-reading all data dir files)…");
+  try {
+    const res = await api("/admin/upload", { method: "POST", headers: authHeaders(false), body: fd });
+    const d = await res.json();
+    log("[" + cat + "] done — docs seen: " + d.documents_seen + ", chunks: " + d.chunks_upserted + ", stale removed: " + d.stale_chunks_removed);
+    notify("Uploaded " + d.saved_files.length + " file(s) — " + d.chunks_upserted + " chunks upserted.");
+    $("file-input").value = "";
+    window._dropFiles = null;
+    $("dz-files").textContent = "No files chosen yet.";
+    await loadDocuments();
+    refreshStatus();
+  } catch (e) { notify("Upload failed: " + e.message, "err"); }
+  finally { setBusy(btn, false); }
+}
+
+/* ---- drag & drop ---- */
+const dz = $("dropzone");
+const hiddenInput = $("file-input");
+dz.addEventListener("click", () => hiddenInput.click());
+["dragenter", "dragover"].forEach((ev) =>
+  dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
+["dragleave", "drop"].forEach((ev) =>
+  dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
+dz.addEventListener("drop", (e) => {
+  const files = Array.from(e.dataTransfer.files || []);
+  if (!files.length) return;
+  window._dropFiles = files;
+  hiddenInput.value = "";
+  $("dz-files").textContent = files.map((f) => f.name).join(", ") + " (" + files.map(fmtFileSize).join(", ") + ")";
+});
+hiddenInput.addEventListener("change", () => {
+  window._dropFiles = null;
+  const f = hiddenInput.files;
+  $("dz-files").textContent = f.length ? Array.from(f).map((x) => x.name).join(", ") : "No files chosen yet.";
+});
+function fmtFileSize(f) { return fmtSize(f.size); }
+
+/* ---------------- workspaces ---------------- */
+
+let wsCache = [];
+
+async function loadWorkspaces() {
+  try {
+    const res = await api("/admin/workspaces", { headers: authHeaders() });
+    wsCache = (await res.json()).workspaces || [];
+  } catch (e) {
+    $("ws-list").innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+    return;
+  }
+  renderWorkspaces($("ws-search").value.trim().toLowerCase());
+}
+
+function renderWorkspaces(q) {
+  const box = $("ws-list");
+  box.innerHTML = "";
+  const list = wsCache.filter((w) =>
+    !q || (w.category + " " + (w.label || "") + " " + (w.blurb || "")).toLowerCase().includes(q));
+  if (!list.length) { box.appendChild(elm("div", "muted", q ? "No workspaces match." : "No workspaces yet.")); return; }
+  for (const ws of list) box.appendChild(workspaceCard(ws));
+}
+
+function workspaceCard(ws) {
+  const row = document.createElement("div");
+  row.className = "workspace";
+  row.appendChild(elm("div", "ws-emoji", ws.emoji || "📄"));
+
+  const meta = document.createElement("div");
+  meta.className = "ws-meta";
+
+  const view = document.createElement("div");
+  const title = elm("div", "title",
+    (ws.label || ws.category) + "  (" + ws.category + ") ");
+  title.appendChild(elm("span", "tag" + (ws.custom ? " custom" : ""), ws.custom ? "custom" : "built-in"));
+  view.appendChild(title);
+  const stats = elm("div", "stats", ws.blurb || "");
+  stats.appendChild(elm("span", " stats", "  ·  " + (ws.data_file_count || 0) + " file(s) · " +
+    (ws.chunks == null ? "—" : ws.chunks) + " chunks"));
+  view.appendChild(stats);
+  meta.appendChild(view);
+
+  const edit = document.createElement("div");
+  edit.className = "edit-grid hidden";
+  edit.innerHTML =
+    '<input class="e-label" placeholder="Label" value="' + esc(ws.label || "") + '">' +
+    '<input class="e-blurb" placeholder="Blurb" value="' + esc(ws.blurb || "") + '">' +
+    '<input class="e-emoji" placeholder="Emoji" value="' + esc(ws.emoji || "") + '">';
+  meta.appendChild(edit);
+
+  const actions = document.createElement("div");
+  actions.className = "ws-actions";
+
+  const upBtn = elm("button", "small", "↑ Upload");
+  upBtn.title = "Upload files to " + ws.category;
+  upBtn.onclick = () => { $("up-cat").value = ws.category; showTab("tab-documents"); };
+  actions.appendChild(upBtn);
+
+  const editBtn = elm("button", "small", "Edit");
+  editBtn.onclick = () => {
+    const editing = !edit.classList.contains("hidden");
+    view.classList.toggle("hidden", !editing);
+    edit.classList.toggle("hidden", editing);
+    saveBtn.classList.toggle("hidden", editing);
+    editBtn.textContent = editing ? "Edit" : "Cancel";
+  };
+  actions.appendChild(editBtn);
+
+  const saveBtn = elm("button", "small primary btn-save hidden", "Save");
+  saveBtn.onclick = () => saveWorkspace(ws.category, edit);
+  actions.appendChild(saveBtn);
+
+  if (ws.custom) {
+    const del = elm("button", "small danger", "Delete");
+    del.onclick = () => deleteWorkspace(ws.category);
+    actions.appendChild(del);
+  }
+
+  row.appendChild(meta);
+  row.appendChild(actions);
+  return row;
+}
+
+async function saveWorkspace(category, editView) {
+  try {
+    await api("/admin/workspaces/" + encodeURIComponent(category), {
+      method: "PATCH", headers: authHeaders(),
+      body: JSON.stringify({
+        label: editView.querySelector(".e-label").value,
+        blurb: editView.querySelector(".e-blurb").value,
+        emoji: editView.querySelector(".e-emoji").value,
+      }),
+    });
+    notify("Saved " + category);
+    await loadCategories();
+    loadWorkspaces();
+    refreshStatus();
+  } catch (e) { notify("Save failed: " + e.message, "err"); }
+}
+
+async function deleteWorkspace(category) {
+  if (!confirm('Delete workspace "' + category + '"? Its folder and index are left in place; it just stops appearing for signups.')) return;
+  try {
+    await api("/admin/workspaces/" + encodeURIComponent(category), {
+      method: "DELETE", headers: authHeaders(),
+    });
+    notify("Deleted " + category);
+    await loadCategories();
+    loadWorkspaces();
+    refreshStatus();
+  } catch (e) { notify("Delete failed: " + e.message, "err"); }
+}
+
+async function createWorkspace() {
+  const payload = {
+    category: $("ws-cat").value.trim(),
+    label: $("ws-label").value.trim(),
+    blurb: $("ws-blurb").value.trim(),
+    emoji: $("ws-emoji").value.trim(),
+  };
+  try {
+    const res = await api("/admin/workspaces", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify(payload),
+    });
+    const d = await res.json();
+    notify("Created " + d.category + " — it now appears in the chat signup page.");
+    $("ws-cat").value = $("ws-label").value = $("ws-blurb").value = $("ws-emoji").value = "";
+    await loadCategories();
+    loadWorkspaces();
+    refreshStatus();
+  } catch (e) { notify("Create failed: " + e.message, "err"); }
+}
+
+/* ---------------- invites ---------------- */
+
+async function loadInvites() {
+  try {
+    const res = await api("/admin/invites", { headers: authHeaders() });
+    renderInvites((await res.json()).invites || []);
+  } catch (e) {
+    $("invite-list").innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+  }
+}
+
+function renderInvites(invites) {
+  const box = $("invite-list");
+  box.innerHTML = "";
+  if (!invites.length) {
+    box.appendChild(elm("div", "muted", "No invites yet. Create one above — the shareable link is shown once."));
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "table";
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr><th>Workspace</th><th>Note</th><th>Uses</th><th>Created</th><th>Expires</th><th>Status</th><th></th></tr>";
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  for (const inv of invites) {
+    const tr = document.createElement("tr");
+    tr.appendChild(elm("td", "", inv.category + (inv.label ? " · " + inv.label : "")));
+    tr.appendChild(elm("td", "", inv.label || "—"));
+    tr.appendChild(elm("td", "pillcount", inv.uses + "/" + inv.max_uses));
+    tr.appendChild(elm("td", "muted", relTime(inv.created_at)));
+    tr.appendChild(elm("td", "muted", relTime(inv.expires_at)));
+    const tdStatus = document.createElement("td");
+    const tag = elm("span", "tag " + (inv.valid ? "ok" : "warn"), inv.valid ? "valid" : (inv.reason || "expired"));
+    tdStatus.appendChild(tag);
+    tr.appendChild(tdStatus);
+    const tdAct = document.createElement("td");
+    const revoke = elm("button", "small danger", "Revoke");
+    revoke.onclick = () => revokeInvite(inv);
+    tdAct.appendChild(revoke);
+    tr.appendChild(tdAct);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  box.appendChild(table);
+}
+
+async function revokeInvite(inv) {
+  const key = prompt("Revoking " + inv.category + " invite requires its token. Paste the invite token (the part after /invites/):");
+  if (!key) return;
+  try {
+    await api("/admin/invites/" + encodeURIComponent(key), { method: "DELETE", headers: authHeaders() });
+    notify("Invite revoked.");
+    loadInvites();
+  } catch (e) { notify("Revoke failed: " + e.message, "err"); }
+}
+
+async function createInvite() {
+  const payload = {
+    category: $("invite-cat").value,
+    max_uses: Math.max(1, parseInt($("invite-uses").value, 10) || 1),
+    ttl_hours: Math.max(1, parseInt($("invite-ttl").value, 10) || 168),
+    label: $("invite-label").value.trim() || null,
+  };
+  try {
+    const res = await api("/admin/invites", {
+      method: "POST", headers: authHeaders(), body: JSON.stringify(payload),
+    });
+    const d = await res.json();
+    const link = location.origin + "/ui?invite=" + d.token;
+    notify("Invite created. Copy the link now — it won’t be shown again.");
+    prompt("Shareable invite link (one-time, shown only now):", link);
+    loadInvites();
+    await loadCategories();
+  } catch (e) { notify("Create failed: " + e.message, "err"); }
+}
+
+/* ---------------- CSV exports ---------------- */
+
+function downloadCsv(path, name) {
+  api(path, { headers: authHeaders() }).then((res) => res.blob()).then((blob) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }).catch((e) => notify(e.message, "err"));
+}
+
+/* ---------------- users ---------------- */
+
+let userCache = [];
+let userTotal = 0;
+const USER_PAGE = 50;
+
+async function loadUsers(more = false) {
+  const offset = more ? userCache.length : 0;
+  try {
+    const res = await api("/admin/users?limit=" + USER_PAGE + "&offset=" + offset, { headers: authHeaders() });
+    const data = await res.json();
+    userTotal = data.total;
+    if (more) userCache = userCache.concat(data.users);
+    else userCache = data.users;
+  } catch (e) {
+    $("user-list").innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+    return;
+  }
+  renderUsers($("user-search").value.trim().toLowerCase());
+  renderUserTotal();
+  $("btn-more-users").classList.toggle("hidden", userCache.length >= userTotal);
+}
+
+function renderUserTotal() {
+  $("user-total").textContent = userTotal ? "· " + userTotal + " total" : "";
+  $("btn-more-users").classList.toggle("hidden", userCache.length >= userTotal);
+}
+
+function renderUsers(q) {
+  const box = $("user-list");
+  box.innerHTML = "";
+  const users = userCache.filter((u) =>
+    !q || ((u.name || "") + " " + u.email).toLowerCase().includes(q));
+  if (!users.length) {
+    box.appendChild(elm("div", "muted", q ? "No users match." : (userTotal ? "Loading…" : "No users yet — create one above.")));
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "table";
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr><th>Name</th><th>Email</th><th>Category</th><th>Sessions</th><th>Last login</th><th>Created</th><th></th></tr>";
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  for (const u of users) tbody.appendChild(userRow(u));
+  table.appendChild(tbody);
+  box.appendChild(table);
+}
+
+function userRow(u) {
+  const tr = document.createElement("tr");
+  const tdName = document.createElement("td");
+  tdName.innerHTML = esc(u.name) + '<div class="muted">' + u.id.slice(0, 8) + "</div>";
+  tr.appendChild(tdName);
+  tr.appendChild(elm("td", "", u.email));
+  tr.appendChild(elm("td", "", u.category));
+  tr.appendChild(elm("td", "pillcount", String(u.session_count)));
+
+  const tdLast = document.createElement("td");
+  const ll = u.last_login;
+  tdLast.appendChild(elm("span", "", ll ? relTime(ll) : "never"));
+  if (ll) tdLast.appendChild(elm("div", "muted", ll.slice(0, 19).replace("T", " ")));
+  tr.appendChild(tdLast);
+
+  tr.appendChild(elm("td", "muted", (u.created_at || "").slice(0, 10)));
+
+  const tdAct = document.createElement("td");
+  const upd = elm("button", "small", "Edit / Reset");
+  upd.onclick = () => editUser(u);
+  tdAct.appendChild(upd);
+  const del = elm("button", "small danger", "Delete");
+  del.onclick = () => deleteUser(u);
+  tdAct.appendChild(del);
+  tr.appendChild(tdAct);
+  return tr;
+}
+
+function editUser(u) {
+  const cat = prompt("New category for " + u.email + " (empty = keep " + u.category + "):", u.category);
+  if (cat === null) return;
+  const name = prompt("New name (empty = keep):", u.name);
+  if (name === null) return;
+  const resetPass = confirm("Reset " + u.email + "'s password to a random one?");
+  let newPass = null;
+  if (resetPass) { newPass = randomPassword(); prompt("Copy the new password for " + u.email + ":", newPass); }
+  const body = {
+    category: (cat || "").trim() || undefined,
+    name: (name || "").trim() || undefined,
+    password: newPass || undefined,
+  };
+  api("/admin/users/" + encodeURIComponent(u.id), {
+    method: "PATCH", headers: authHeaders(),
+    body: JSON.stringify(body),
+  }).then((res) => res.json()).then((d) => {
+    notify("Updated " + d.name + " (" + d.category + ")" + (newPass ? " · new password set" : "") + ".");
+    loadUsers();
+  }).catch((e) => { notify("Update failed: " + e.message, "err"); });
+}
+
+function randomPassword() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@#$%";
+  let out = "";
+  const arr = new Uint32Array(12);
+  crypto.getRandomValues(arr);
+  for (const n of arr) out += chars[n % chars.length];
+  return out;
+}
+
+async function deleteUser(u) {
+  if (!confirm('Delete user ' + u.email + "? Irreversible.")) return;
+  try {
+    await api("/admin/users/" + encodeURIComponent(u.id), { method: "DELETE", headers: authHeaders() });
+    notify("Deleted " + u.email);
+    loadUsers();
+    refreshStatus();
+  } catch (e) { notify("Delete failed: " + e.message, "err"); }
+}
+
+async function createUser() {
+  const payload = {
+    email: $("user-email").value.trim(),
+    password: $("user-pass").value,
+    name: $("user-name").value.trim(),
+    category: $("user-cat").value,
+  };
+  if (!payload.email || !payload.password || !payload.name) { notify("Email, password and name are required.", "err"); return; }
+  try {
+    const res = await api("/admin/users", {
+      method: "POST", headers: authHeaders(), body: JSON.stringify(payload),
+    });
+    const d = await res.json();
+    notify("Created " + d.email + " (" + d.category + ").");
+    $("user-email").value = $("user-pass").value = $("user-name").value = "";
+    loadUsers();
+    refreshStatus();
+  } catch (e) { notify("Create failed: " + e.message, "err"); }
+}
+
+/* ---------------- audit ---------------- */
+
+let auditCache = [];
+let auditTotal = 0;
+const AUDIT_PAGE = 100;
+
+async function loadAudit(more = false) {
+  const offset = more ? auditCache.length : 0;
+  try {
+    const res = await api("/admin/audit?limit=" + AUDIT_PAGE + "&offset=" + offset, { headers: authHeaders() });
+    const data = await res.json();
+    auditTotal = data.total;
+    auditCache = more ? auditCache.concat(data.events) : data.events;
+  } catch (e) {
+    $("audit-list").innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+    return;
+  }
+  renderAudit($("audit-search").value.trim().toLowerCase());
+  $("audit-total").textContent = auditTotal ? auditTotal + " event(s)" : "";
+  $("btn-more-audit").classList.toggle("hidden", auditCache.length >= auditTotal);
+}
+
+function renderAudit(q) {
+  const box = $("audit-list");
+  box.innerHTML = "";
+  const evts = auditCache.filter((e) =>
+    !q || (e.event + " " + (e.actor || "") + " " + (e.object_type || "") + " " + (e.object_id || "") + " " + (e.detail || "")).toLowerCase().includes(q));
+  if (!evts.length) {
+    box.appendChild(elm("div", "muted", q ? "No events match." : "No admin actions logged yet."));
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "table";
+  const thead = document.createElement("thead");
+  thead.innerHTML = "<tr><th>When (UTC)</th><th>Actor</th><th>Event</th><th>Object</th><th>Detail</th></tr>";
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  for (const e of evts) {
+    const tr = document.createElement("tr");
+    tr.appendChild(elm("td", "muted", (e.at || "").slice(0, 19).replace("T", " ") || "—"));
+    tr.appendChild(elm("td", "", e.actor || "—"));
+    const tdE = document.createElement("td");
+    tdE.appendChild(elm("span", "tag", e.event));
+    tr.appendChild(tdE);
+    tr.appendChild(elm("td", "", (e.object_type || "") + (e.object_id ? ":" + e.object_id : "") || "—"));
+    tr.appendChild(elm("td", "muted", esc(e.detail).length > 90 ? e.detail.slice(0, 90) + "…" : (e.detail || "—")));
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  box.appendChild(table);
+}
+
+/* ---------------- sessions / transcripts ---------------- */
+
+const modal = $("modal-bg");
+
+function openModal(title) {
+  $("modal-title").textContent = title;
+  $("modal-body").innerHTML = '<div class="muted">Loading…</div>';
+  modal.classList.remove("hidden");
+}
+$("modal-close").addEventListener("click", () => modal.classList.add("hidden"));
+modal.addEventListener("click", (e) => { if (e.target === modal) modal.classList.add("hidden"); });
+
+async function showSessions(u) {
+  openModal("Sessions · " + u.email);
+  const body = $("modal-body");
+  let sessions;
+  try {
+    const res = await api("/admin/users/" + encodeURIComponent(u.id) + "/sessions?limit=200", { headers: authHeaders() });
+    sessions = (await res.json()).sessions || [];
+  } catch (e) { body.innerHTML = '<div class="muted">' + esc(e.message) + "</div>"; return; }
+  if (!sessions.length) { body.innerHTML = '<div class="muted">No chat sessions for this user yet.</div>'; return; }
+  const ul = document.createElement("div");
+  for (const s of sessions) {
+    const row = document.createElement("div");
+    row.className = "workspace";
+    const meta = document.createElement("div");
+    meta.className = "ws-meta";
+    meta.appendChild(elm("div", "title", "Session " + s.session_id.slice(0, 8) + " · " + (s.message_count || 0) + " message(s)"));
+    meta.appendChild(elm("div", "stats", (s.last_message || "no messages yet")));
+    row.appendChild(meta);
+    const viewBtn = elm("button", "small primary", "View transcript");
+    viewBtn.onclick = () => viewTranscript(s.session_id);
+    row.appendChild(viewBtn);
+    ul.appendChild(row);
+  }
+  body.innerHTML = "";
+  body.appendChild(ul);
+}
+
+async function viewTranscript(sid) {
+  openModal("Transcript · " + sid);
+  const body = $("modal-body");
+  let msgs;
+  try {
+    const res = await api("/admin/sessions/" + encodeURIComponent(sid), { headers: authHeaders() });
+    msgs = (await res.json()).messages || [];
+  } catch (e) { body.innerHTML = '<div class="muted">' + esc(e.message) + "</div>"; return; }
+  if (!msgs.length) { body.innerHTML = '<div class="muted">Empty session.</div>'; return; }
+  const wrap = document.createElement("div");
+  wrap.style.display = "flex"; wrap.style.flexDirection = "column"; wrap.style.gap = "10px";
+  for (const m of msgs) {
+    const bubble = document.createElement("div");
+    bubble.className = "workspace";
+    bubble.style.flexDirection = "column"; bubble.style.alignItems = "flex-start";
+    bubble.appendChild(elm("span", "tag " + (m.role === "user" ? "accent" : "ok"), m.role === "user" ? "user" : "assistant"));
+    const txt = document.createElement("div");
+    txt.style.fontSize = "13px"; txt.style.whiteSpace = "pre-wrap"; txt.style.marginTop = "6px"; txt.style.width = "100%";
+    txt.textContent = m.content || "";
+    bubble.appendChild(txt);
+    wrap.appendChild(bubble);
+  }
+  body.innerHTML = "";
+  body.appendChild(wrap);
+}
+
+/* ---------------- wiring ---------------- */
+
+$("btn-refresh").addEventListener("click", refreshStatus);
+$("btn-reindex-all").addEventListener("click", () => reindex(null, $("btn-reindex-all")));
+$("btn-upload").addEventListener("click", uploadFiles);
+$("btn-create-ws").addEventListener("click", createWorkspace);
+$("btn-create-user").addEventListener("click", createUser);
+$("btn-refresh-docs").addEventListener("click", loadDocuments);
+$("btn-refresh-ws").addEventListener("click", loadWorkspaces);
+$("btn-refresh-users").addEventListener("click", () => loadUsers(false));
+$("btn-more-users").addEventListener("click", () => loadUsers(true));
+$("btn-create-invite").addEventListener("click", createInvite);
+$("btn-refresh-audit").addEventListener("click", () => loadAudit(false));
+$("btn-more-audit").addEventListener("click", () => loadAudit(true));
+$("dl-users-csv").addEventListener("click", (e) => { e.preventDefault(); downloadCsv("/admin/users/export.csv", "users.csv"); });
+$("dl-workspaces-csv").addEventListener("click", (e) => { e.preventDefault(); downloadCsv("/admin/workspaces/export.csv", "workspaces.csv"); });
+
+let searchTimer = null;
+$("doc-search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => renderDocuments($("doc-search").value.trim().toLowerCase()), 150);
+});
+$("ws-search").addEventListener("input", () => {
+  renderWorkspaces($("ws-search").value.trim().toLowerCase());
+});
+$("user-search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => renderUsers($("user-search").value.trim().toLowerCase()), 150);
+});
+$("audit-search").addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => renderAudit($("audit-search").value.trim().toLowerCase()), 150);
+});
+
+$("tab-overview").addEventListener("click", () => showTab("tab-overview"));
+$("tab-documents").addEventListener("click", () => showTab("tab-documents"));
+$("tab-workspaces").addEventListener("click", () => showTab("tab-workspaces"));
+$("tab-users").addEventListener("click", () => showTab("tab-users"));
+$("tab-audit").addEventListener("click", () => showTab("tab-audit"));
+
+(async function init() {
+  await applyAuditConfig();
+  renderKeyUi();
+  if (adminKey || (basicUser && basicPass)) { $("admin-key").value = ""; refreshStatus(); checkProgress(); }
+  await loadCategories();
+  const params = new URLSearchParams(location.search);
+  if (params.get("tab") === "audit") showTab("tab-audit");
+  const r = await fetch("/health").catch(() => null);
+  const b = $("health");
+  if (r && r.ok) { b.className = "badge ok"; b.textContent = "server online"; }
+  else { b.className = "badge err"; b.textContent = "offline"; }
+  refreshTimer = setInterval(refreshStatus, 20000);
+})();
+</script>
+</body>
+</html>
