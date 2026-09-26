@@ -42,3 +42,11 @@ models/
 # Data directories (keep demo/ tracked, ignore real data)
 data/*
 !data/demo/
+
+# Exported/pitch slide artifacts (generated PPTX/PDF/HTML exports and assets)
+ppt/
+
+# Pitch deck deliverables (generated exports + working .md source of truth)
+ESG Workspace Chatbot.docx
+ESG Workspace Chatbot.pdf
+esg_chatbot_pitch_deck.md

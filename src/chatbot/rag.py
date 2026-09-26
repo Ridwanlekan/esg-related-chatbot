@@ -3,7 +3,7 @@ import threading
 import time
 
 from dotenv import load_dotenv
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 
@@ -70,13 +70,29 @@ class RAGBot:
         if self._llm_client is None:
             with self._llm_lock:
                 if self._llm_client is None:
-                    self._llm_client = AzureOpenAI(
-                        api_key=_require_env("AZURE_OPENAI_API_KEY"),
-                        api_version=_require_env("OPENAI_API_VERSION"),
-                        azure_endpoint=_require_env("AZURE_OPENAI_ENDPOINT"),
-                        timeout=float(os.environ.get("AZURE_OPENAI_TIMEOUT", "120")),
-                        max_retries=int(os.environ.get("OPENAI_MAX_RETRIES", "3")),
-                    )
+                    endpoint = _require_env("AZURE_OPENAI_ENDPOINT").strip()
+                    api_key = _require_env("AZURE_OPENAI_API_KEY")
+                    timeout = float(os.environ.get("AZURE_OPENAI_TIMEOUT", "120"))
+                    max_retries = int(os.environ.get("OPENAI_MAX_RETRIES", "3"))
+                    if "/api/projects/" in endpoint:
+                        base_url = endpoint.rstrip("/")
+                        if base_url.endswith("/responses"):
+                            base_url = base_url[: -len("/responses")]
+                        base_url = base_url.rstrip("/") + "/"
+                        self._llm_client = OpenAI(
+                            base_url=base_url,
+                            api_key=api_key,
+                            timeout=timeout,
+                            max_retries=max_retries,
+                        )
+                    else:
+                        self._llm_client = AzureOpenAI(
+                            api_key=api_key,
+                            api_version=_require_env("OPENAI_API_VERSION"),
+                            azure_endpoint=endpoint,
+                            timeout=timeout,
+                            max_retries=max_retries,
+                        )
                     self._llm_model = _require_env("MODEL_NAME")
         return self._llm_client, self._llm_model
 
