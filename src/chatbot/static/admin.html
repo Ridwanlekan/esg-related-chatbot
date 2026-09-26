@@ -110,6 +110,15 @@
   .hidden { display: none !important; }
   .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
   .toolbar input { flex: 1; min-width: 180px; }
+  .bar-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; }
+  .bar-row .bl { flex: 0 0 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  .bar-track { flex: 1; background: var(--panel-2); border-radius: 6px; height: 12px; overflow: hidden; }
+  .bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent-2), var(--accent)); }
+  .bar-row .bv { flex: 0 0 130px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .legend { display: flex; gap: 16px; font-size: 11px; color: var(--muted); margin: 6px 0 10px; flex-wrap: wrap; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: middle; }
+  .usage-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 760px) { .usage-grid { grid-template-columns: 1fr; } }
   .footer { text-align: center; color: var(--muted); font-size: 11px; margin-top: 30px; }
   #toasts { position: fixed; bottom: 18px; right: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 100; max-width: 380px; }
   .toast {
@@ -174,6 +183,7 @@
     <button id="tab-workspaces">Workspaces</button>
     <button id="tab-users">Users</button>
     <button id="tab-audit">Audit</button>
+    <button id="tab-usage">Usage &amp; Cost</button>
   </div>
 
   <section id="view-overview">
@@ -296,6 +306,46 @@
     </div>
   </section>
 
+  <section id="view-usage" class="hidden">
+    <div class="card">
+      <h2>Cost rates <span class="muted">($ per 1M tokens used to estimate spend)</span></h2>
+      <div class="row-form">
+        <div class="field"><label>Input $ / 1M</label><input id="rate-in" type="number" step="0.01" min="0" placeholder="0.40"></div>
+        <div class="field"><label>Output $ / 1M</label><input id="rate-out" type="number" step="0.01" min="0" placeholder="1.60"></div>
+        <div class="field"><label>&nbsp;</label><button id="btn-save-rates" class="primary">Save rates</button></div>
+      </div>
+      <div class="hint">Defaults: gpt-4.1-mini (~$0.40 input / $1.60 output). Edit to match your Foundry billing, then totals below recompute on refresh.</div>
+    </div>
+    <div class="card">
+      <h2>Token usage &amp; cost</h2>
+      <div class="toolbar">
+        <select id="usage-range">
+          <option value="24h">Last 24 hours</option>
+          <option value="7d" selected>Last 7 days</option>
+          <option value="30d">Last 30 days</option>
+          <option value="all">All time</option>
+        </select>
+        <button id="btn-refresh-usage" class="primary">Refresh</button>
+        <a id="dl-usage-csv" class="small" style="font-size:12px" href="#" download>⬇ Export CSV</a>
+        <span class="muted" id="usage-note"></span>
+      </div>
+      <div class="totals" id="usage-totals">
+        <div class="total"><div class="num">—</div><div class="lbl">LLM calls</div></div>
+        <div class="total"><div class="num">—</div><div class="lbl">Tokens in</div></div>
+        <div class="total"><div class="num">—</div><div class="lbl">Tokens out</div></div>
+        <div class="total"><div class="num">—</div><div class="lbl">Est. cost</div></div>
+        <div class="total"><div class="num">—</div><div class="lbl">Avg $ / call</div></div>
+      </div>
+      <div id="usage-chart"><div class="muted">Loading…</div></div>
+    </div>
+    <div class="usage-grid">
+      <div class="card"><h2>By workspace</h2><div id="usage-by-category"><div class="muted">Loading…</div></div></div>
+      <div class="card"><h2>By call type</h2><div id="usage-by-kind"><div class="muted">Loading…</div></div></div>
+      <div class="card"><h2>Top users</h2><div id="usage-by-user"><div class="muted">Loading…</div></div></div>
+      <div class="card"><h2>Cost math</h2><div id="usage-math"><div class="muted">Loading…</div></div></div>
+    </div>
+  </section>
+
   <div class="footer">Admin Console · all actions are gated by the API key · logs and docs in <code>README.md</code></div>
 </main>
 
@@ -332,6 +382,7 @@ const tabs = [
   ["tab-workspaces", "view-workspaces"],
   ["tab-users", "view-users"],
   ["tab-audit", "view-audit"],
+  ["tab-usage", "view-usage"],
 ];
 
 function notify(msg, kind = "ok") {
@@ -353,6 +404,7 @@ function showTab(name) {
   if (name === "tab-workspaces") { loadWorkspaces(); loadInvites(); loadCategories(); }
   if (name === "tab-users") loadUsers();
   if (name === "tab-audit") loadAudit();
+  if (name === "tab-usage") loadUsage();
   if (name === "tab-overview") refreshStatus();
 }
 
@@ -1297,6 +1349,152 @@ $("tab-documents").addEventListener("click", () => showTab("tab-documents"));
 $("tab-workspaces").addEventListener("click", () => showTab("tab-workspaces"));
 $("tab-users").addEventListener("click", () => showTab("tab-users"));
 $("tab-audit").addEventListener("click", () => showTab("tab-audit"));
+$("tab-usage").addEventListener("click", () => showTab("tab-usage"));
+
+/* ---------------- usage & cost ---------------- */
+
+let usageRange = "7d";
+
+function fmtTokens(n) {
+  if (n == null || isNaN(n)) return "—";
+  if (n < 1000) return String(Math.round(n));
+  if (n < 1e6) return (n / 1e3).toFixed(1) + "K";
+  return (n / 1e6).toFixed(2) + "M";
+}
+
+function fmtUsd(n) {
+  if (n == null || isNaN(n)) return "—";
+  if (n === 0) return "$0.00";
+  const a = Math.abs(n);
+  if (a < 0.001) return "$" + n.toExponential(1);
+  if (a < 0.01) return "$" + n.toFixed(4);
+  if (a < 1) return "$" + n.toFixed(3);
+  return "$" + n.toFixed(2);
+}
+
+function usageBarRow(label, value, max, display) {
+  const pct = max > 0 ? Math.max(1.5, (value / max) * 100) : 0;
+  return `<div class="bar-row"><span class="bl">${esc(label)}</span>` +
+    `<div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>` +
+    `<span class="bv">${display}</span></div>`;
+}
+
+function usageChartSVG(series) {
+  if (!series || !series.length) return '<div class="muted">No usage in this period yet.</div>';
+  const W = 840, H = 240, padL = 46, padR = 10, padT = 14, padB = 26;
+  const n = series.length;
+  const maxVal = Math.max(...series.map((s) => s.prompt_tokens + s.completion_tokens), 1);
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const spacing = plotW / n;
+  const bw = Math.max(6, spacing - 5);
+  const hourly = series[0].bucket.length > 10;
+  let s = '<div class="legend">' +
+    '<span><span class="swatch" style="background:#0ea5e9"></span>input tokens</span>' +
+    '<span><span class="swatch" style="background:#4ade80"></span>output tokens</span>' +
+    `<span class="muted">per ${hourly ? "hour" : "day"}</span></div>`;
+  s += `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto" role="img">`;
+  s += `<line x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke="#2b3a52"/>`;
+  s += `<text x="${padL - 6}" y="${H - padB + 4}" text-anchor="end" fill="#94a3b8" font-size="10">0</text>`;
+  s += `<text x="${padL - 6}" y="${padT - 2}" text-anchor="end" fill="#94a3b8" font-size="10">${fmtTokens(maxVal)}</text>`;
+  series.forEach((p, i) => {
+    const cx = padL + i * spacing;
+    const x = cx + (spacing - bw) / 2;
+    const hIn = plotH * p.prompt_tokens / maxVal;
+    const hOut = plotH * p.completion_tokens / maxVal;
+    const yIn = H - padB - hIn - hOut;
+    const yOut = yIn + hIn;
+    s += `<rect x="${x}" y="${yIn}" width="${bw}" height="${hIn}" fill="#0ea5e9">` +
+      `<title>${fmtTokens(p.prompt_tokens)} in · ${p.bucket}</title></rect>`;
+    s += `<rect x="${x}" y="${yOut}" width="${bw}" height="${hOut}" fill="#4ade80" opacity="0.9">` +
+      `<title>${fmtTokens(p.completion_tokens)} out · ${p.bucket}</title></rect>`;
+    if (spacing > 28) {
+      const label = hourly ? p.bucket.slice(11, 16) : p.bucket.slice(5);
+      s += `<text x="${cx + spacing / 2}" y="${H - padB + 14}" text-anchor="middle" fill="#94a3b8" font-size="9">${label}</text>`;
+    }
+  });
+  s += "</svg>";
+  return s;
+}
+
+function renderUsageTotals(t) {
+  $("usage-totals").innerHTML =
+    `<div class="total"><div class="num">${t.calls}</div><div class="lbl">LLM calls</div></div>` +
+    `<div class="total"><div class="num">${fmtTokens(t.prompt_tokens)}</div><div class="lbl">Tokens in</div></div>` +
+    `<div class="total"><div class="num">${fmtTokens(t.completion_tokens)}</div><div class="lbl">Tokens out</div></div>` +
+    `<div class="total"><div class="num">${fmtUsd(t.cost)}</div><div class="lbl">Est. cost</div></div>` +
+    `<div class="total"><div class="num">${fmtUsd(t.avg_cost_per_call)}</div><div class="lbl">Avg $ / call</div></div>`;
+}
+
+function renderUsageBars(list, el, showUser) {
+  if (!list.length) { el.innerHTML = '<div class="muted">No usage yet.</div>'; return; }
+  const max = Math.max(...list.map((d) => d.cost), 0.000001);
+  el.innerHTML = list.map((d) => {
+    const label = showUser ? (d.key.length > 18 ? d.key.slice(0, 18) + "…" : d.key) : d.key;
+    const tokens = d.prompt_tokens + d.completion_tokens;
+    return usageBarRow(label, d.cost, max, `${fmtTokens(tokens)} tokens · ${fmtUsd(d.cost)}`);
+  }).join("");
+}
+
+function renderUsageCostMath(data) {
+  const t = data.totals, r = data.rates;
+  $("usage-math").innerHTML =
+    '<div class="muted" style="margin-bottom:8px">Estimated spend = input tokens × $/1M + output tokens × $/1M</div>' +
+    '<table class="table">' +
+    `<tr><th>Component</th><th>Tokens</th><th>Rate</th><th>Cost</th></tr>` +
+    `<tr><td>Input</td><td>${fmtTokens(t.prompt_tokens)}</td><td>$${r.price_input_per_m}/1M</td><td>${fmtUsd(t.input_cost)}</td></tr>` +
+    `<tr><td>Output</td><td>${fmtTokens(t.completion_tokens)}</td><td>$${r.price_output_per_m}/1M</td><td>${fmtUsd(t.output_cost)}</td></tr>` +
+    `<tr><td>Avg tokens / call</td><td>${fmtTokens(t.avg_tokens_per_call)}</td><td></td><td></td></tr>` +
+    `<tr><td colspan="3"><b>Total</b></td><td><b>${fmtUsd(t.cost)}</b></td></tr>` +
+    "</table>";
+}
+
+async function loadUsage() {
+  const range = usageRange;
+  try {
+    const res = await api("/admin/usage?range=" + encodeURIComponent(range), { headers: authHeaders() });
+    const data = await res.json();
+    renderUsageTotals(data.totals);
+    $("usage-chart").innerHTML = usageChartSVG(data.series);
+    renderUsageBars(data.by_category, $("usage-by-category"), false);
+    renderUsageBars(data.by_kind, $("usage-by-kind"), false);
+    const users = data.by_user && data.by_user.length ? data.by_user : [];
+    if (!users.length) {
+      $("usage-by-user").innerHTML = '<div class="muted">No attributed users yet — usage shows once logged-in users ask questions.</div>';
+    } else {
+      renderUsageBars(users, $("usage-by-user"), true);
+    }
+    renderUsageCostMath(data);
+    $("usage-note").textContent = "range: " + range;
+    $("rate-in").value = data.rates.price_input_per_m;
+    $("rate-out").value = data.rates.price_output_per_m;
+  } catch (e) {
+    $("usage-chart").innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+  }
+}
+
+async function saveRates() {
+  const si = parseFloat($("rate-in").value);
+  const so = parseFloat($("rate-out").value);
+  if (isNaN(si) || isNaN(so) || si < 0 || so < 0) { notify("Enter valid non-negative rates.", "err"); return; }
+  try {
+    await api("/admin/settings/cost", {
+      method: "PUT",
+      headers: authHeaders(),
+      body: JSON.stringify({ price_input_per_m: si, price_output_per_m: so }),
+    });
+    notify("Cost rates saved.");
+    loadUsage();
+  } catch (e) { notify(e.message, "err"); }
+}
+
+$("usage-range").addEventListener("change", () => { usageRange = $("usage-range").value; loadUsage(); });
+$("btn-refresh-usage").addEventListener("click", () => loadUsage());
+$("btn-save-rates").addEventListener("click", () => saveRates());
+$("dl-usage-csv").addEventListener("click", (e) => {
+  e.preventDefault();
+  downloadCsv("/admin/usage/export.csv?range=" + encodeURIComponent(usageRange), "usage.csv");
+});
 
 (async function init() {
   await applyAuditConfig();
@@ -1305,6 +1503,7 @@ $("tab-audit").addEventListener("click", () => showTab("tab-audit"));
   await loadCategories();
   const params = new URLSearchParams(location.search);
   if (params.get("tab") === "audit") showTab("tab-audit");
+  if (params.get("tab") === "usage") showTab("tab-usage");
   const r = await fetch("/health").catch(() => null);
   const b = $("health");
   if (r && r.ok) { b.className = "badge ok"; b.textContent = "server online"; }

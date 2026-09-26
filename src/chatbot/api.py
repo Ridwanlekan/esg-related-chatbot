@@ -189,6 +189,11 @@ class DocumentDeleteRequest(BaseModel):
     filename: str
 
 
+class CostRatesRequest(BaseModel):
+    price_input_per_m: float = Field(ge=0)
+    price_output_per_m: float = Field(ge=0)
+
+
 def tz_offset_minutes(request: Request) -> int:
     try:
         return int(request.headers.get("X-Timezone-Offset", "0"))
@@ -309,6 +314,33 @@ def create_app(
             store.log_event(actor, event, object_type, object_id, detail[:2000])
         except Exception:
             logger.exception("audit log write failed (%s)", event)
+
+    def record_usage_events(request, usage_events, *, category, user_id, session_id):
+        """Persist per-request LLM usage rows (best-effort, never raises).
+
+        Shared chatbot instances make request-scoped attribution impossible on
+        the bot, so the api layer owns the attribution context. `usage_events`
+        are collected by passing a usage_sink list through the bot's call path.
+        """
+        store = app.state.admin_store
+        if store is None or not usage_events:
+            return
+        rid = telemetry.get_request_id()
+        try:
+            for ev in usage_events:
+                store.record_usage(
+                    kind=ev.get("kind") or "llm",
+                    model=ev.get("model"),
+                    prompt_tokens=ev.get("prompt_tokens"),
+                    completion_tokens=ev.get("completion_tokens"),
+                    duration_s=ev.get("duration_s"),
+                    category=category,
+                    user_id=user_id,
+                    session_id=session_id,
+                    request_id=rid,
+                )
+        except Exception:
+            logger.exception("usage log write failed")
 
     @app.middleware("http")
     async def observability(request: Request, call_next):
@@ -897,6 +929,59 @@ def create_app(
             },
         )
 
+    @app.get("/admin/usage", dependencies=admin_gate_deps)
+    def admin_usage(range: str = "7d", category: str | None = None,
+                    store: AdminStore = admin_store_dep):
+        range_days = {"24h": 1, "7d": 7, "30d": 30}.get(range)
+        if range != "all" and range_days is None:
+            raise HTTPException(status_code=422, detail="range must be 24h, 7d, 30d or all")
+        return store.usage_stats(range_days=range_days, category=category or None)
+
+    @app.get("/admin/settings/cost", dependencies=admin_gate_deps)
+    def admin_cost_rates(store: AdminStore = admin_store_dep):
+        return store.get_rates()
+
+    @app.put("/admin/settings/cost", dependencies=admin_gate_deps)
+    def admin_set_cost_rates(req: CostRatesRequest, request: Request,
+                             store: AdminStore = admin_store_dep):
+        rates = store.set_rates(req.price_input_per_m, req.price_output_per_m)
+        log_audit(
+            request, "cost.update", "settings", None,
+            f"input=${req.price_input_per_m:.6f}/1M output=${req.price_output_per_m:.6f}/1M",
+        )
+        return rates
+
+    @app.get("/admin/usage/export.csv", dependencies=admin_gate_deps)
+    def admin_usage_csv(range: str = "7d", category: str | None = None,
+                        store: AdminStore = admin_store_dep):
+        range_days = {"24h": 1, "7d": 7, "30d": 30}.get(range)
+        if range != "all" and range_days is None:
+            raise HTTPException(status_code=422, detail="range must be 24h, 7d, 30d or all")
+        rows = store.usage_export_rows(range_days=range_days, category=category or None)
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(
+            ["at", "kind", "model", "prompt_tokens", "completion_tokens",
+             "duration_s", "category", "user_id", "session_id", "request_id"]
+        )
+        for r in rows:
+            writer.writerow(
+                [
+                    r["at"], r["kind"], r["model"] or "", r["prompt_tokens"],
+                    r["completion_tokens"], r["duration_s"] or "",
+                    r["category"] or "", r["user_id"] or "", r["session_id"] or "",
+                    r["request_id"] or "",
+                ]
+            )
+        return Response(
+            content=buf.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="usage.csv"',
+                "Access-Control-Expose-Headers": "Content-Disposition",
+            },
+        )
+
     @app.post("/admin/invites", dependencies=admin_gate_deps)
     def admin_create_invite(req: InviteCreateRequest, request: Request):
         store = app.state.admin_store
@@ -1010,6 +1095,7 @@ def create_app(
         reply = smalltalk.handle(req.question, user["name"], user["category"], tz)
         sources = []
         if reply is None:
+            usage_events = []
             try:
                 reply = await run_in_threadpool(
                     bot.ask,
@@ -1017,9 +1103,14 @@ def create_app(
                     k=req.k,
                     source=req.source,
                     history=history,
+                    usage_sink=usage_events,
                 )
             except RuntimeError as e:
                 raise HTTPException(status_code=503, detail=str(e))
+            record_usage_events(
+                request, usage_events,
+                category=user["category"], user_id=user["id"], session_id=session_id,
+            )
             sources = [r.source for r in getattr(bot, "last_results", []) or []]
         store.append(session_id, "user", req.question)
         store.append(session_id, "assistant", reply)
@@ -1040,6 +1131,7 @@ def create_app(
 
         def event_stream():
             chunks = []
+            usage_events = []
             try:
                 if reply is not None:
                     chunks.append(reply)
@@ -1050,12 +1142,17 @@ def create_app(
                         k=req.k,
                         source=req.source,
                         history=history,
+                        usage_sink=usage_events,
                     ):
                         chunks.append(piece)
                         yield f"data: {json.dumps({'delta': piece})}\n\n"
             except RuntimeError as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
             finally:
+                record_usage_events(
+                    request, usage_events,
+                    category=user["category"], user_id=user["id"], session_id=session_id,
+                )
                 store.append(session_id, "user", req.question)
                 store.append(session_id, "assistant", "".join(chunks))
             if reply is not None:

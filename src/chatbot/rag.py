@@ -104,9 +104,11 @@ class RAGBot:
     def model_name(self):
         return self._ensure_llm()[1]
 
-    def _complete(self, kind, messages, *, max_tokens, temperature=None, stream=False):
+    def _complete(self, kind, messages, *, max_tokens, temperature=None, stream=False, usage_sink=None):
         """LLM call with telemetry. Returns a response or (when streaming) a
-        generator that reports duration + token usage on exhaustion."""
+        generator that reports duration + token usage on exhaustion.
+        When `usage_sink` (a list) is given, one event dict is appended per LLM
+        call so callers can record per-request token/cost attribution."""
         client, model = self._ensure_llm()
         kwargs = dict(model=model, messages=messages, max_tokens=max_tokens)
         if temperature is not None:
@@ -114,6 +116,18 @@ class RAGBot:
         if stream:
             kwargs["stream"] = True
             kwargs["stream_options"] = {"include_usage": True}
+
+        def _event(prompt, completion, duration):
+            if usage_sink is not None:
+                usage_sink.append(
+                    {
+                        "kind": kind,
+                        "model": model,
+                        "prompt_tokens": prompt,
+                        "completion_tokens": completion,
+                        "duration_s": duration,
+                    }
+                )
 
         started = time.monotonic()
         try:
@@ -131,6 +145,11 @@ class RAGBot:
                 prompt_tokens=getattr(usage, "prompt_tokens", None),
                 completion_tokens=getattr(usage, "completion_tokens", None),
             )
+            _event(
+                getattr(usage, "prompt_tokens", None),
+                getattr(usage, "completion_tokens", None),
+                first_seconds,
+            )
             return raw
 
         def track():
@@ -147,6 +166,7 @@ class RAGBot:
                 prompt_tokens=prompt,
                 completion_tokens=completion,
             )
+            _event(prompt, completion, time.monotonic() - started)
 
         return track()
 
@@ -169,25 +189,25 @@ class RAGBot:
     def _chunk_text(self, text, size=500, overlap=50):
         return recursive_split(text, chunk_size=size, overlap=overlap)
 
-    def rewrite_question_for_retrieval(self, question, history=None):
+    def rewrite_question_for_retrieval(self, question, history=None, usage_sink=None):
         if not history:
             return question
         try:
-            return rewrite_question(question, history, self._generate_rewrite)
+            return rewrite_question(question, history, self._generate_rewrite, usage_sink)
         except Exception:
             return question
 
-    def _generate_rewrite(self, messages):
+    def _generate_rewrite(self, messages, usage_sink=None):
         response = self._complete(
-            "rewrite", messages, max_tokens=80, temperature=0
+            "rewrite", messages, max_tokens=80, temperature=0, usage_sink=usage_sink
         )
         return response.choices[0].message.content
 
-    def retrieve(self, question, k=3, source=None, history=None):
+    def retrieve(self, question, k=3, source=None, history=None, usage_sink=None):
         if self.store.count() == 0:
             raise RuntimeError("call ingest() before retrieve()")
         started = time.monotonic()
-        rewritten = self.rewrite_question_for_retrieval(question, history)
+        rewritten = self.rewrite_question_for_retrieval(question, history, usage_sink)
         query_embedding = self._embed([rewritten])[0]
         results = self.store.search_hybrid(
             query_text=rewritten,
@@ -226,8 +246,8 @@ class RAGBot:
         )
         return messages
 
-    def ask(self, question, k=3, source=None, history=None):
-        results = self.retrieve(question, k=k, source=source, history=history)
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
+        results = self.retrieve(question, k=k, source=source, history=history, usage_sink=usage_sink)
         self.last_results = results
         if not results:
             return "I don't know. No relevant documents were found."
@@ -235,11 +255,12 @@ class RAGBot:
         response = self._complete(
             "answer", self._build_messages(question, results, history),
             max_tokens=self.max_generation_tokens,
+            usage_sink=usage_sink,
         )
         return response.choices[0].message.content
 
-    def ask_stream(self, question, k=3, source=None, history=None):
-        results = self.retrieve(question, k=k, source=source, history=history)
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
+        results = self.retrieve(question, k=k, source=source, history=history, usage_sink=usage_sink)
         self.last_results = results
         if not results:
             yield "I don't know. No relevant documents were found."
@@ -249,6 +270,7 @@ class RAGBot:
             "stream", self._build_messages(question, results, history),
             max_tokens=self.max_generation_tokens,
             stream=True,
+            usage_sink=usage_sink,
         )
         for chunk in stream:
             if not chunk.choices:

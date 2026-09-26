@@ -26,11 +26,11 @@ class FakeBot:
     def retrieve(self, question, k=3, source=None):
         return self.last_results
 
-    def ask(self, question, k=3, source=None, history=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
         self.ask_calls.append({"history": history})
         return f"answer to: {question}"
 
-    def ask_stream(self, question, k=3, source=None, history=None):
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
         yield "chunk one "
         yield "chunk two"
 

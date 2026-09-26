@@ -8,7 +8,7 @@ from chatbot.session_store import SessionStore
 
 
 class FakeBot:
-    def ask(self, question, k=3, source=None, history=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
         return f"answer to: {question}"
 
     def retrieve(self, question, k=3, source=None):

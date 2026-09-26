@@ -9,7 +9,7 @@ REWRITE_SYSTEM_PROMPT = (
 MAX_HISTORY_TURNS = 6
 
 
-def rewrite_question(question, history, generate_fn):
+def rewrite_question(question, history, generate_fn, usage_sink=None):
     if not history:
         return question
 
@@ -17,5 +17,8 @@ def rewrite_question(question, history, generate_fn):
     messages.extend(history[-MAX_HISTORY_TURNS:])
     messages.append({"role": "user", "content": question})
 
-    rewritten = (generate_fn(messages) or "").strip().strip('"'.strip())
+    if usage_sink is None:
+        rewritten = (generate_fn(messages) or "").strip().strip('"'.strip())
+    else:
+        rewritten = (generate_fn(messages, usage_sink) or "").strip().strip('"'.strip())
     return rewritten or question

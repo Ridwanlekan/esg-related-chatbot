@@ -3,9 +3,15 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 CATEGORY_RE = re.compile(r"^[a-z][a-z0-9_-]{1,29}$")
+
+DEFAULT_PRICE_INPUT_PER_M = 0.40
+DEFAULT_PRICE_OUTPUT_PER_M = 1.60
+DEFAULT_USAGE_TOP_USERS = 20
 
 
 def _now():
@@ -36,6 +42,7 @@ class AdminStore:
         self.db_path = db_path
         if db_path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        self._lock = threading.Lock()
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute(
@@ -67,7 +74,30 @@ class AdminStore:
             "expires_at TEXT NOT NULL, "
             "actor TEXT)"
         )
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS usage ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "at TEXT NOT NULL, "
+            "kind TEXT NOT NULL, "
+            "model TEXT, "
+            "prompt_tokens INTEGER NOT NULL DEFAULT 0, "
+            "completion_tokens INTEGER NOT NULL DEFAULT 0, "
+            "duration_s REAL, "
+            "category TEXT, "
+            "user_id TEXT, "
+            "session_id TEXT, "
+            "request_id TEXT)"
+        )
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS settings ("
+            "key TEXT PRIMARY KEY, "
+            "value TEXT)"
+        )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_at ON usage(at)")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_category ON usage(category)"
+        )
         self.conn.commit()
 
     def list_workspaces(self):
@@ -219,6 +249,191 @@ class AdminStore:
         )
         self.conn.commit()
         return cur.rowcount > 0
+
+    # ---- token usage & cost ------------------------------------------------
+
+    def record_usage(
+        self,
+        *,
+        kind,
+        model=None,
+        prompt_tokens=0,
+        completion_tokens=0,
+        duration_s=None,
+        category=None,
+        user_id=None,
+        session_id=None,
+        request_id=None,
+    ):
+        """Append one LLM-call usage row. Best-effort, never raises."""
+        try:
+            with self._lock:
+                self.conn.execute(
+                    "INSERT INTO usage (at, kind, model, prompt_tokens, "
+                    "completion_tokens, duration_s, category, user_id, "
+                    "session_id, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        _now(),
+                        kind,
+                        model,
+                        int(prompt_tokens or 0),
+                        int(completion_tokens or 0),
+                        duration_s,
+                        category,
+                        user_id,
+                        session_id,
+                        request_id,
+                    ),
+                )
+                self.conn.commit()
+        except sqlite3.Error:
+            pass
+
+    def get_rates(self):
+        rows = self.conn.execute("SELECT key, value FROM settings").fetchall()
+        settings = {r["key"]: r["value"] for r in rows}
+        try:
+            price_in = float(settings.get("price_input_per_m", ""))
+            if price_in < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            price_in = DEFAULT_PRICE_INPUT_PER_M
+        try:
+            price_out = float(settings.get("price_output_per_m", ""))
+            if price_out < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            price_out = DEFAULT_PRICE_OUTPUT_PER_M
+        return {
+            "price_input_per_m": price_in,
+            "price_output_per_m": price_out,
+        }
+
+    def set_rates(self, price_input_per_m, price_output_per_m):
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("price_input_per_m", str(float(price_input_per_m))),
+            )
+            self.conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("price_output_per_m", str(float(price_output_per_m))),
+            )
+            self.conn.commit()
+        return self.get_rates()
+
+    @staticmethod
+    def _usage_cost(rates, prompt_tokens, completion_tokens):
+        return (
+            prompt_tokens / 1_000_000 * rates["price_input_per_m"]
+            + completion_tokens / 1_000_000 * rates["price_output_per_m"]
+        )
+
+    def _usage_rows(self, range_days=None, category=None):
+        where, params = [], []
+        if range_days:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=range_days)).isoformat()
+            where.append("at >= ?")
+            params.append(cutoff)
+        if category:
+            where.append("category = ?")
+            params.append(category)
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        return self.conn.execute(
+            f"SELECT * FROM usage{clause} ORDER BY id", params
+        ).fetchall()
+
+    def usage_stats(self, range_days=None, category=None, top_users=DEFAULT_USAGE_TOP_USERS):
+        """Aggregate token usage and estimate cost. All aggregation in Python to
+        stay robust against ISO-8601/offset variants in the stored timestamps."""
+        rows = self._usage_rows(range_days=range_days, category=category)
+        rates = self.get_rates()
+
+        totals = {"calls": len(rows), "prompt_tokens": 0, "completion_tokens": 0,
+                  "duration_s": 0.0}
+        by_kind = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})
+        by_category = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})
+        by_user = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})
+        by_bucket = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})
+        hourly = range_days is not None and range_days <= 2
+
+        for r in rows:
+            pt, ct = r["prompt_tokens"] or 0, r["completion_tokens"] or 0
+            totals["prompt_tokens"] += pt
+            totals["completion_tokens"] += ct
+            totals["duration_s"] += r["duration_s"] or 0.0
+            by_kind[r["kind"]]["calls"] += 1
+            by_kind[r["kind"]]["prompt_tokens"] += pt
+            by_kind[r["kind"]]["completion_tokens"] += ct
+            cat = r["category"] or "(unknown)"
+            by_category[cat]["calls"] += 1
+            by_category[cat]["prompt_tokens"] += pt
+            by_category[cat]["completion_tokens"] += ct
+            uid = r["user_id"] or "(anonymous)"
+            by_user[uid]["calls"] += 1
+            by_user[uid]["prompt_tokens"] += pt
+            by_user[uid]["completion_tokens"] += ct
+            try:
+                dt = datetime.fromisoformat(r["at"])
+            except (TypeError, ValueError):
+                dt = None
+            if dt is not None:
+                bucket = dt.strftime("%Y-%m-%d %H:00") if hourly else dt.strftime("%Y-%m-%d")
+                by_bucket[bucket]["calls"] += 1
+                by_bucket[bucket]["prompt_tokens"] += pt
+                by_bucket[bucket]["completion_tokens"] += ct
+
+        totals["input_cost"] = self._usage_cost(rates, totals["prompt_tokens"], 0)
+        totals["output_cost"] = self._usage_cost(rates, 0, totals["completion_tokens"])
+        totals["cost"] = totals["input_cost"] + totals["output_cost"]
+        totals["avg_tokens_per_call"] = (
+            round((totals["prompt_tokens"] + totals["completion_tokens"]) / totals["calls"]) 
+            if totals["calls"] else 0
+        )
+        totals["avg_cost_per_call"] = (
+            totals["cost"] / totals["calls"] if totals["calls"] else 0.0
+        )
+
+        def deco(agg):
+            return [{"key": k, **v, "cost": self._usage_cost(rates, v["prompt_tokens"], v["completion_tokens"])}
+                    for k, v in agg.items()]
+
+        return {
+            "rates": rates,
+            "totals": totals,
+            "by_kind": sorted(deco(by_kind), key=lambda d: -d["cost"]),
+            "by_category": sorted(deco(by_category), key=lambda d: -d["cost"]),
+            # Exclude the anonymous bucket from top users; per-user spend is
+            # the pitch, guesses are not.
+            "by_user": sorted(
+                (d for d in deco(by_user) if d["key"] != "(anonymous)"),
+                key=lambda d: -d["cost"],
+            )[:top_users],
+            "series": [
+                {"bucket": k, **v, "cost": self._usage_cost(rates, v["prompt_tokens"], v["completion_tokens"])}
+                for k, v in sorted(by_bucket.items())
+            ],
+        }
+
+    def usage_export_rows(self, range_days=None, category=None):
+        rows = self._usage_rows(range_days=range_days, category=category)
+        return [
+            {
+                "at": r["at"],
+                "kind": r["kind"],
+                "model": r["model"],
+                "prompt_tokens": r["prompt_tokens"],
+                "completion_tokens": r["completion_tokens"],
+                "duration_s": r["duration_s"],
+                "category": r["category"],
+                "user_id": r["user_id"],
+                "session_id": r["session_id"],
+                "request_id": r["request_id"],
+            }
+            for r in rows
+        ]
 
     def close(self):
         self.conn.close()

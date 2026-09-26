@@ -8,10 +8,10 @@ from chatbot.users import UserStore
 
 
 class FakeBot:
-    def ask(self, question, k=3, source=None, history=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
         return f"answer to: {question}"
 
-    def ask_stream(self, question, k=3, source=None, history=None):
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
         yield "chunk one "
 
     def retrieve(self, question, k=3, source=None):
@@ -136,10 +136,10 @@ def test_rate_limiter_sliding_window():
 
 
 class EmptyBot:
-    def ask(self, question, k=3, source=None, history=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
         raise RuntimeError("call ingest() before retrieve()")
 
-    def ask_stream(self, question, k=3, source=None, history=None):
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
         raise RuntimeError("call ingest() before retrieve()")
         yield
 
