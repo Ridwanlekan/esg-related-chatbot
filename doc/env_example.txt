@@ -15,6 +15,12 @@ TOKENIZERS_PARALLELISM = False
 # API_KEY = ""                    # if set, all /admin* and /ingest* endpoints require `Authorization: Bearer <API_KEY>`
 #                                 # (admin console at /admin: uploads, documents, workspaces, users) and enables the
 #                                 # workspace registry at <INDEX_DIR>/workspaces.sqlite3 (custom workspaces + label overrides)
+# ADMIN_BASIC_USER = ""          # when both are set they replace the API key for the admin console and enable
+# ADMIN_BASIC_PASS = ""          # password sign-in (POST /admin/login) which issues an HttpOnly session cookie
+# ADMIN_TOTP_SECRET = ""          # when set, a current TOTP code is required at sign-in and on the legacy gate
+# ADMIN_SESSION_TTL_HOURS = 12    # admin sign-in session lifetime (server-side, hash-at-rest)
+# ADMIN_SESSION_COOKIE = esg_admin_session
+# ADMIN_SESSION_SECURE = 1        # set 1 in prod so the admin cookie is only ever sent over HTTPS
 # CORS_ORIGINS = ""               # comma-separated allowed browser origins (empty = no cross-origin access)
 # RATE_LIMIT_REQUESTS = 60        # max requests per window per IP
 # RATE_LIMIT_WINDOW_SECONDS = 60

@@ -39,7 +39,10 @@ jobs:
             az webapp config appsettings set \
               --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
               --name "${{ vars.AZURE_WEBAPP_NAME }}" \
-              --settings WEBSITES_PORT=8000 WEBSITES_ENABLE_APP_SERVICE_STORAGE=true INDEX_DIR=/home/esg-index
+              --settings WEBSITES_PORT=8000 WEBSITES_ENABLE_APP_SERVICE_STORAGE=true \
+                INDEX_DIR=/home/esg-index \
+                DATA_DIR=/home/esg-data \
+                DOCLING_VET_DIR=/home/esg-docling-vet
 
       - name: Deploy container
         uses: azure/webapps-deploy@v3

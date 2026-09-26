@@ -122,7 +122,9 @@ def make_totp_dep(secret_b32):
 
 def admin_gate_config():
     """Public, secret-free knobs the admin UI needs to render its auth card."""
+    basic = bool(os.environ.get("ADMIN_BASIC_USER") and os.environ.get("ADMIN_BASIC_PASS"))
     return {
-        "basic": bool(os.environ.get("ADMIN_BASIC_USER") and os.environ.get("ADMIN_BASIC_PASS")),
+        "basic": basic,
+        "login": basic,
         "totp": bool(os.environ.get("ADMIN_TOTP_SECRET")),
     }

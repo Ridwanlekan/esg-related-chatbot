@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import os
+import secrets
 import shutil
 import sqlite3
 import time
@@ -13,7 +14,17 @@ from pathlib import Path
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Depends, File, Form, HTTPException, FastAPI, Header, Request, UploadFile
+from fastapi import (
+    Cookie,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    FastAPI,
+    Header,
+    Request,
+    UploadFile,
+)
 
 # Load .env before any config is read (create_app() runs at import below).
 # Without this, AUTH_SECRET/API_KEY in .env were silently ignored because
@@ -29,6 +40,7 @@ from chatbot.admin_security import (
     admin_gate_config,
     make_basic_auth_check,
     make_totp_dep,
+    verify_totp,
 )
 from chatbot.admin_store import AdminStore, validate_category
 from chatbot.ingest import INGEST_PROGRESS
@@ -194,6 +206,12 @@ class CostRatesRequest(BaseModel):
     price_output_per_m: float = Field(ge=0)
 
 
+class AdminLoginRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+    totp: str | None = Field(default=None, max_length=8)
+
+
 def tz_offset_minutes(request: Request) -> int:
     try:
         return int(request.headers.get("X-Timezone-Offset", "0"))
@@ -276,17 +294,29 @@ def create_app(
     basic_check = make_basic_auth_check(config_admin_basic_user, config_admin_basic_pass)
     totp_dep = make_totp_dep(config_admin_totp)
 
+    # Admin console sign-in sessions (HttpOnly cookie). The cookie carries an
+    # opaque token whose hash lives in the admin store; the backend is the
+    # only party that can mint/validate it.
+    admin_session_cookie = os.environ.get("ADMIN_SESSION_COOKIE", "esg_admin_session")
+    admin_session_ttl_seconds = int_env("ADMIN_SESSION_TTL_HOURS", 12) * 3600
+    admin_session_secure = os.environ.get("ADMIN_SESSION_SECURE", "") == "1"
+
     def require_admin(
         request: Request,
         apikey: str | None = Header(default=None, alias="Authorization"),
+        session: str | None = Cookie(default=None, alias=admin_session_cookie),
     ):
         """Gate for /admin/* API routes.
 
-        When ADMIN_BASIC_* is configured, the Basic credentials fully replace
-        the API key for the console; otherwise a valid Bearer API key is
-        required. If ADMIN_TOTP_SECRET is set, a current TOTP code in the
-        X-Admin-TOTP header is also mandatory.
+        A valid admin sign-in session cookie alone authorizes the request
+        (no per-request credentials). Otherwise: when ADMIN_BASIC_* is
+        configured, the Basic credentials fully replace the API key for the
+        console; else a valid Bearer API key is required. If
+        ADMIN_TOTP_SECRET is set, a current TOTP code in the X-Admin-TOTP
+        header is also mandatory on the legacy path.
         """
+        if session and admin_store is not None and admin_store.get_admin_session(session):
+            return
         if basic_check is not None:
             basic_check(request)
         else:
@@ -314,6 +344,87 @@ def create_app(
             store.log_event(actor, event, object_type, object_id, detail[:2000])
         except Exception:
             logger.exception("audit log write failed (%s)", event)
+
+    @app.post("/admin/login", dependencies=rate_deps)
+    def admin_login(req: AdminLoginRequest, request: Request, response: Response):
+        """Password sign-in for the admin console -> HttpOnly session cookie.
+
+        Uses the ADMIN_BASIC_USER/PASS identity (single source of truth). On
+        success the server stores a session hash and hands the client an
+        opaque, short-lived, HttpOnly SameSite=strict cookie, so credentials
+        are never persisted client-side and nothing is re-sent per request.
+        """
+        if admin_store is None:
+            raise HTTPException(
+                status_code=503, detail="Admin console is not enabled (set API_KEY)"
+            )
+        if not (config_admin_basic_user and config_admin_basic_pass):
+            raise HTTPException(
+                status_code=503,
+                detail="Password sign-in is not configured "
+                "(set ADMIN_BASIC_USER/ADMIN_BASIC_PASS)",
+            )
+        user_ok = secrets.compare_digest(
+            (req.username or "").strip(), config_admin_basic_user
+        )
+        pass_ok = secrets.compare_digest(req.password or "", config_admin_basic_pass)
+        if not (user_ok and pass_ok):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid username or password",
+            )
+        if config_admin_totp and not verify_totp(config_admin_totp, req.totp):
+            raise HTTPException(
+                status_code=401, detail="Authenticator code required or expired"
+            )
+        created = admin_store.create_admin_session(
+            config_admin_basic_user, admin_session_ttl_seconds
+        )
+        response.set_cookie(
+            admin_session_cookie,
+            created["token"],
+            max_age=admin_session_ttl_seconds,
+            httponly=True,
+            samesite="strict",
+            secure=admin_session_secure,
+            path="/",
+        )
+        log_audit(request, "admin.login", "user", config_admin_basic_user,
+                  f"expires_at={created['expires_at']}")
+        return {"ok": True, "actor": config_admin_basic_user, "expires_at": created["expires_at"]}
+
+    @app.post("/admin/logout", dependencies=rate_deps)
+    def admin_logout(
+        request: Request,
+        response: Response,
+        session: str | None = Cookie(default=None, alias=admin_session_cookie),
+    ):
+        """Invalidate the server-side session and clear the cookie."""
+        if admin_store is not None and session:
+            existing = admin_store.get_admin_session(session)
+            admin_store.delete_admin_session(session)
+            if existing:
+                log_audit(request, "admin.logout", "user", existing["actor"])
+        response.delete_cookie(admin_session_cookie, path="/")
+        return {"ok": True}
+
+    @app.get("/admin/session")
+    def admin_session_status(
+        session: str | None = Cookie(default=None, alias=admin_session_cookie),
+    ):
+        """Public, secret-free sign-in state for the admin UI."""
+        info = None
+        if admin_store is not None and session:
+            info = admin_store.get_admin_session(session)
+        cfg = admin_gate_config()
+        return {
+            "authenticated": info is not None,
+            "actor": info["actor"] if info else None,
+            "expires_at": info["expires_at"] if info else None,
+            "login": cfg["basic"],
+            "basic": cfg["basic"],
+            "totp": cfg["totp"],
+        }
 
     def record_usage_events(request, usage_events, *, category, user_id, session_id):
         """Persist per-request LLM usage rows (best-effort, never raises).

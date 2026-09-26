@@ -167,11 +167,27 @@
         <button id="key-cancel">Cancel</button>
       </div>
       <div class="hint">API key + Basic credentials are stored in this browser (localStorage); the authenticator code is kept only for this tab (sessionStorage). Sent with admin requests while the console is open.</div>
+      <div class="login-zone hidden" style="margin-top:12px;padding-top:12px;border-top:1px solid #ddd">
+        <div class="field"><label>Admin username</label>
+          <input id="admin-login-user" type="text" placeholder="ADMIN_BASIC_USER" autocomplete="username">
+        </div>
+        <div class="field"><label>Password</label>
+          <input id="admin-login-pass" type="password" placeholder="ADMIN_BASIC_PASS" autocomplete="current-password">
+        </div>
+        <div class="field"><label id="admin-login-totp-label" class="hidden">Authenticator code</label>
+          <input id="admin-login-totp" type="text" inputmode="numeric" placeholder="6-digit code" autocomplete="one-time-code" class="hidden">
+        </div>
+        <div class="key-row" style="margin-top:10px">
+          <button id="btn-admin-login" class="primary">Sign in</button>
+        </div>
+        <div class="hint">Signs you in with a server-side session cookie (HttpOnly, SameSite=strict, short-lived) — nothing is stored in this browser and nothing is re-sent per request.</div>
+      </div>
     </div>
     <div id="key-actions" class="key-foot hidden">
       <span class="badge ok">Connected</span>
       <span class="muted" id="key-summary">Unlocks all admin actions.</span>
       <span class="spacer"></span>
+      <button id="btn-admin-logout" class="small danger hidden">Sign out</button>
       <button id="key-change" class="small">Change</button>
       <button id="key-clear" class="small danger">Clear</button>
     </div>
@@ -372,6 +388,8 @@ let basicUser = localStorage.getItem(BASIC_USER_KEY) || "";
 let basicPass = localStorage.getItem(BASIC_PASS_KEY) || "";
 let totpCode = sessionStorage.getItem(TOTP_KEY) || "";
 let authCfg = { basic: false, totp: false };
+let sessionActive = false;
+let sessionActor = "";
 let refreshTimer = null;
 let tokens = {};
 let docOffsets = {};
@@ -424,6 +442,8 @@ async function applyAuditConfig() {
   const nur = ["admin-basic-user", "admin-basic-pass", "basic-user-label", "basic-pass-label"];
   nur.forEach((id) => $(id).classList.toggle("hidden", !authCfg.basic));
   ["totp", "totp-label"].forEach((id) => $(id).classList.toggle("hidden", !authCfg.totp));
+  document.querySelectorAll(".login-zone").forEach((el) => el.classList.toggle("hidden", !authCfg.login));
+  $("admin-login-totp-label").classList.toggle("hidden", !authCfg.totp);
 }
 
 function gateHintNeedsTotp(res) {
@@ -519,13 +539,84 @@ setInterval(tickClock, 1000);
 /* ---------------- key card ---------------- */
 
 function renderKeyUi() {
-  const set = !!(adminKey || (basicUser && basicPass));
+  const set = !!(sessionActive || adminKey || (basicUser && basicPass));
   $("key-editor").classList.toggle("hidden", set && !$("key-editor").dataset.open);
   $("key-actions").classList.toggle("hidden", !set);
+  $("btn-admin-logout").classList.toggle("hidden", !sessionActive);
   const badge = $("key-status");
   badge.classList.toggle("hidden", set);
   badge.classList.toggle("warn", !set);
   if (!set) $("key-editor").dataset.open = "1";
+  $("key-summary").textContent = sessionActive
+    ? "Signed in as " + sessionActor + " (session cookie) — unlocks all admin actions."
+    : "Unlocks all admin actions.";
+}
+
+async function checkAdminSession() {
+  try {
+    const res = await fetch("/admin/session");
+    if (!res.ok) return;
+    const d = await res.json();
+    if (d.login != null) authCfg.login = d.login;
+    if (d.basic != null) authCfg.basic = d.basic;
+    if (d.totp != null) authCfg.totp = d.totp;
+    sessionActive = !!d.authenticated;
+    sessionActor = d.actor || "";
+    document.querySelectorAll(".login-zone").forEach((el) => el.classList.toggle("hidden", !authCfg.login));
+    $("admin-login-totp-label").classList.toggle("hidden", !authCfg.totp);
+    renderKeyUi();
+  } catch (e) { /* server offline etc. */ }
+}
+
+function clearStoredCreds() {
+  adminKey = ""; basicUser = ""; basicPass = ""; totpCode = "";
+  localStorage.removeItem(KEY); localStorage.removeItem(BASIC_USER_KEY);
+  localStorage.removeItem(BASIC_PASS_KEY); sessionStorage.removeItem(TOTP_KEY);
+  $("admin-key").value = $("admin-basic-user").value = $("admin-basic-pass").value =
+    $("admin-totp").value = $("admin-login-user").value = $("admin-login-pass").value =
+    $("admin-login-totp").value = "";
+}
+
+async function loginAdmin() {
+  const btn = $("btn-admin-login");
+  btn.disabled = true;
+  try {
+    const res = await fetch("/admin/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        username: $("admin-login-user").value.trim(),
+        password: $("admin-login-pass").value,
+        totp: $("admin-login-totp").value.trim() || null,
+      }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(d.detail || res.status + " " + res.statusText);
+    clearStoredCreds();
+    sessionActive = true;
+    sessionActor = d.actor || "";
+    delete $("key-editor").dataset.open;
+    renderKeyUi();
+    notify("Signed in — admin console unlocked (session cookie).");
+    refreshStatus();
+    checkProgress();
+  } catch (e) {
+    notify("Sign-in failed: " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function logoutAdmin() {
+  try {
+    await fetch("/admin/logout", { method: "POST" });
+  } catch (e) { /* best-effort */ }
+  clearStoredCreds();
+  sessionActive = false;
+  sessionActor = "";
+  delete $("key-editor").dataset.open;
+  renderKeyUi();
+  notify("Signed out.", "warn");
 }
 
 $("key-save").addEventListener("click", () => {
@@ -557,16 +648,17 @@ $("key-cancel").addEventListener("click", () => {
   renderKeyUi();
 });
 $("key-clear").addEventListener("click", () => {
-  if (!confirm("Clear the stored admin credentials?")) return;
-  adminKey = ""; basicUser = ""; basicPass = ""; totpCode = "";
-  localStorage.removeItem(KEY); localStorage.removeItem(BASIC_USER_KEY); localStorage.removeItem(BASIC_PASS_KEY);
-  sessionStorage.removeItem(TOTP_KEY);
+  if (!confirm("Clear the stored admin credentials and any active sign-in?")) return;
+  if (sessionActive) logoutAdmin();
+  clearStoredCreds();
   delete $("key-editor").dataset.open;
-  $("admin-key").value = $("admin-basic-user").value = $("admin-basic-pass").value = $("admin-totp").value = "";
   renderKeyUi();
   notify("Admin credentials cleared.", "warn");
 });
 $("admin-key").addEventListener("keydown", (e) => { if (e.key === "Enter") $("key-save").click(); });
+$("btn-admin-login").addEventListener("click", loginAdmin);
+$("btn-admin-logout").addEventListener("click", logoutAdmin);
+$("admin-login-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btn-admin-login").click(); });
 
 /* ---------------- overview ---------------- */
 
@@ -1499,7 +1591,8 @@ $("dl-usage-csv").addEventListener("click", (e) => {
 (async function init() {
   await applyAuditConfig();
   renderKeyUi();
-  if (adminKey || (basicUser && basicPass)) { $("admin-key").value = ""; refreshStatus(); checkProgress(); }
+  await checkAdminSession();
+  if (sessionActive || adminKey || (basicUser && basicPass)) { $("admin-key").value = ""; refreshStatus(); checkProgress(); }
   await loadCategories();
   const params = new URLSearchParams(location.search);
   if (params.get("tab") === "audit") showTab("tab-audit");

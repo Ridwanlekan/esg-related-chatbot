@@ -93,6 +93,13 @@ class AdminStore:
             "key TEXT PRIMARY KEY, "
             "value TEXT)"
         )
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS admin_sessions ("
+            "token_hash TEXT PRIMARY KEY, "
+            "actor TEXT NOT NULL, "
+            "created_at TEXT NOT NULL, "
+            "expires_at TEXT NOT NULL)"
+        )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_at ON usage(at)")
         self.conn.execute(
@@ -434,6 +441,77 @@ class AdminStore:
             }
             for r in rows
         ]
+
+    # ---- admin console sessions -------------------------------------------
+
+    @staticmethod
+    def _hash_session_token(token):
+        return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
+
+    def create_admin_session(self, actor, ttl_seconds=43200):
+        """Create a server-side admin session and return its raw token once.
+
+        Only the SHA-256 hash is stored, so the token is unforgeable and a
+        DB leak does not expose live credentials.
+        """
+        token = secrets.token_urlsafe(32)
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=int(ttl_seconds))
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO admin_sessions (token_hash, actor, created_at, "
+                "expires_at) VALUES (?, ?, ?, ?)",
+                (self._hash_session_token(token), actor,
+                 now.isoformat(), expires.isoformat()),
+            )
+            self.conn.commit()
+        return {
+            "token": token,
+            "actor": actor,
+            "created_at": now.isoformat(),
+            "expires_at": expires.isoformat(),
+        }
+
+    def get_admin_session(self, token):
+        """Return the session actor/expiry, or None when missing/expired."""
+        if not token:
+            return None
+        token_hash = self._hash_session_token(token)
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT actor, created_at, expires_at FROM admin_sessions "
+                "WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                expires = datetime.fromisoformat(row["expires_at"])
+            except (TypeError, ValueError):
+                expires = datetime.min.replace(tzinfo=timezone.utc)
+            if expires <= datetime.now(timezone.utc):
+                self.conn.execute(
+                    "DELETE FROM admin_sessions WHERE token_hash = ?",
+                    (token_hash,),
+                )
+                self.conn.commit()
+                return None
+            return {
+                "actor": row["actor"],
+                "created_at": row["created_at"],
+                "expires_at": row["expires_at"],
+            }
+
+    def delete_admin_session(self, token):
+        if not token:
+            return False
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM admin_sessions WHERE token_hash = ?",
+                (self._hash_session_token(token),),
+            )
+            self.conn.commit()
+            return cur.rowcount > 0
 
     def close(self):
         self.conn.close()
