@@ -89,17 +89,12 @@
   }
   .tab.active { color: var(--text); border-color: var(--accent); background: rgba(56,189,248,.12); }
   .auth-card label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
-  .auth-card input {
+  .auth-card input, .auth-card select {
     width: 100%; background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
     border-radius: 8px; padding: 9px 10px; font-size: 14px;
   }
-  .auth-card input:focus { outline: none; border-color: var(--accent); }
-  .cats { display: flex; gap: 8px; margin: 4px 0 2px; }
-  .cat {
-    flex: 1; text-align: center; padding: 9px; border-radius: 8px; font-size: 13px;
-    border: 1px solid var(--border); color: var(--muted); cursor: pointer; background: var(--panel-2);
-  }
-  .cat.active { color: var(--text); border-color: var(--accent); background: rgba(56,189,248,.12); }
+  .auth-card input:focus, .auth-card select:focus { outline: none; border-color: var(--accent); }
+  .auth-card select:disabled { opacity: .6; cursor: not-allowed; }
   .auth-card .primary { width: 100%; margin-top: 16px; padding: 10px; font-size: 14px; }
   .auth-err { margin-top: 12px; font-size: 12px; color: #f87171; min-height: 16px; white-space: pre-wrap; }
   .hidden { display: none !important; }
@@ -130,10 +125,9 @@
       <input id="signup-name" type="text" autocomplete="name" placeholder="Jane Smith">
       <label for="signup-email">Email</label>
       <input id="signup-email" type="email" autocomplete="email" placeholder="you@company.com">
-      <label>Workspace (category)</label>
-      <div class="cats" id="cat-pills">
-        <div class="muted">Loading workspaces…</div>
-      </div>
+      <label for="signup-cat">Workspace (category)</label>
+      <select id="signup-cat"><option value="">Loading workspaces…</option></select>
+      <div id="cat-pills"></div>
       <label for="signup-password">Password</label>
       <input id="signup-password" type="password" autocomplete="new-password" placeholder="8+ characters">
       <button id="signup-btn" class="primary">Create account</button>
@@ -225,7 +219,8 @@ function setActiveTab(tab) {
 
 function selectCat(cat) {
   selectedCat = cat;
-  document.querySelectorAll(".cat").forEach((el) => el.classList.toggle("active", el.dataset.cat === cat));
+  const sel = $("signup-cat");
+  if (sel && sel.value !== cat) sel.value = cat;
 }
 
 function escHtml(s) {
@@ -238,23 +233,34 @@ async function loadWorkspaces() {
   try {
     const res = await fetch("/workspaces");
     const data = await res.json();
+    const sel = $("signup-cat");
     const pills = $("cat-pills");
-    if (!data.length) {
-      pills.innerHTML = '<div class="muted">No workspaces available.</div>';
-      return;
+    // A dropdown, not one pill per workspace: the list is unbounded, and pills
+    // in a flex row stretched the auth card sideways as workspaces were added.
+    const empty = (msg) => {
+      sel.innerHTML = '<option value="">' + msg + "</option>";
+      sel.disabled = true;
+      selectedCat = "";
+    };
+    if (!data.length) return empty("No workspaces available");
+    const visible = data.filter((w) => !inviteCategory || w.category === inviteCategory);
+    if (!visible.length) return empty("No workspaces available");
+    if (!visible.some((w) => w.category === selectedCat)) {
+      selectedCat = visible[0].category;
     }
-    let cats = data.map((w) => w.category);
-    if (inviteCategory) {
-      cats = [inviteCategory];
-    }
-    if (!cats.includes(selectedCat)) selectedCat = cats[0];
-    pills.innerHTML = data
-      .filter((w) => cats.includes(w.category))
-      .map((w) =>
-        '<div class="cat' + (w.category === selectedCat ? " active" : "") + '" data-cat="' +
-        escHtml(w.category) + '">' + escHtml(w.emoji || "📄") + " " + escHtml(w.label || w.category) +
-        "</div>"
-      ).join("");
+    sel.innerHTML = visible
+      .map(
+        (w) =>
+          '<option value="' + escHtml(w.category) + '"' +
+          (w.category === selectedCat ? " selected" : "") + ">" +
+          escHtml(w.emoji || "📄") + " " + escHtml(w.label || w.category) +
+          "</option>"
+      )
+      .join("");
+    // An invite pins the workspace; disabling stops a stray edit from
+    // submitting a category the invite was not issued for.
+    sel.disabled = !!inviteCategory;
+    pills.innerHTML = "";
     if (inviteCategory) {
       const badge = document.createElement("div");
       badge.className = "muted";
@@ -262,9 +268,7 @@ async function loadWorkspaces() {
       badge.textContent = "🔒 Invite-only signup for " + inviteCategory;
       pills.appendChild(badge);
     }
-    pills.querySelectorAll(".cat").forEach((el) =>
-      el.addEventListener("click", () => selectCat(el.dataset.cat)));
-  } catch (e) { /* keep pills inert on failure */ }
+  } catch (e) { /* keep the select inert on failure */ }
 }
 
 async function api(path, opts = {}) {
@@ -538,6 +542,7 @@ $("tab-login").addEventListener("click", () => setActiveTab("login"));
 $("tab-signup").addEventListener("click", () => setActiveTab("signup"));
 $("login-btn").addEventListener("click", () => submitAuth("login"));
 $("signup-btn").addEventListener("click", () => submitAuth("signup"));
+$("signup-cat").addEventListener("change", (e) => selectCat(e.target.value));
 ["login-email", "login-password"].forEach((id) =>
   $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") submitAuth("login"); }));
 ["signup-name", "signup-email", "signup-password"].forEach((id) =>

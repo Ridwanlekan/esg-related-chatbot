@@ -100,6 +100,22 @@ class AdminStore:
             "created_at TEXT NOT NULL, "
             "expires_at TEXT NOT NULL)"
         )
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS shared_docs ("
+            "filename TEXT PRIMARY KEY, "
+            "size INTEGER NOT NULL DEFAULT 0, "
+            "created_at TEXT NOT NULL, "
+            "actor TEXT)"
+        )
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS shared_doc_targets ("
+            "filename TEXT NOT NULL, "
+            "category TEXT NOT NULL, "
+            "link_name TEXT NOT NULL, "
+            "link_kind TEXT, "
+            "created_at TEXT NOT NULL, "
+            "PRIMARY KEY (filename, category))"
+        )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_at ON usage(at)")
         self.conn.execute(
@@ -141,6 +157,101 @@ class AdminStore:
         )
         self.conn.commit()
         return cur.rowcount > 0
+
+    # ---- cross-workspace shared documents -----------------------------------
+
+    def add_shared_doc(self, filename, size=0, actor=""):
+        """Register a canonical shared document (idempotent on filename)."""
+        self.conn.execute(
+            "INSERT INTO shared_docs (filename, size, created_at, actor) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(filename) DO UPDATE SET size=excluded.size",
+            (filename, int(size or 0), _now(), actor or ""),
+        )
+        self.conn.commit()
+
+    def remove_shared_doc(self, filename):
+        with self._lock:
+            cur = self.conn.execute(
+                "DELETE FROM shared_docs WHERE filename = ?", (filename,)
+            )
+            self.conn.execute(
+                "DELETE FROM shared_doc_targets WHERE filename = ?", (filename,)
+            )
+            self.conn.commit()
+        return cur.rowcount > 0
+
+    def get_shared_doc(self, filename):
+        row = self.conn.execute(
+            "SELECT * FROM shared_docs WHERE filename = ?", (filename,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_shared_docs(self):
+        """Every shared document with its current target workspaces."""
+        docs = [
+            dict(r)
+            for r in self.conn.execute(
+                "SELECT * FROM shared_docs ORDER BY filename"
+            ).fetchall()
+        ]
+        targets = [
+            dict(r)
+            for r in self.conn.execute(
+                "SELECT * FROM shared_doc_targets ORDER BY filename, category"
+            ).fetchall()
+        ]
+        by_doc = defaultdict(list)
+        for t in targets:
+            by_doc[t["filename"]].append(t)
+        for d in docs:
+            d["targets"] = by_doc.get(d["filename"], [])
+        return docs
+
+    def add_shared_target(self, filename, category, link_name, link_kind=None):
+        cat = validate_category(category)
+        self.conn.execute(
+            "INSERT INTO shared_doc_targets (filename, category, link_name, "
+            "link_kind, created_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(filename, category) DO UPDATE SET "
+            "link_name=excluded.link_name, link_kind=excluded.link_kind",
+            (filename, cat, link_name, link_kind, _now()),
+        )
+        self.conn.commit()
+
+    def remove_shared_target(self, filename, category):
+        cur = self.conn.execute(
+            "DELETE FROM shared_doc_targets WHERE filename = ? AND category = ?",
+            (filename, category),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def get_shared_target(self, filename, category):
+        row = self.conn.execute(
+            "SELECT * FROM shared_doc_targets WHERE filename = ? AND category = ?",
+            (filename, category),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def shared_target_categories(self, filename):
+        return [
+            r[0]
+            for r in self.conn.execute(
+                "SELECT category FROM shared_doc_targets WHERE filename = ? "
+                "ORDER BY category",
+                (filename,),
+            ).fetchall()
+        ]
+
+    def all_shared_targets(self):
+        """Flattened target rows, used to validate private uploads/deletes."""
+        return [
+            dict(r)
+            for r in self.conn.execute(
+                "SELECT * FROM shared_doc_targets"
+            ).fetchall()
+        ]
 
     # ---- audit log ---------------------------------------------------------
 

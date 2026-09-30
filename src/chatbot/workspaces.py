@@ -5,6 +5,10 @@ from chatbot.model_utils import BASE_DIR
 
 DEFAULT_WORKSPACES = "finance,hr"
 
+# Canonical store for cross-workspace shared documents. It lives under the data
+# root but is never a workspace, so it must never get its own index.
+SHARED_DIR_NAME = "_shared"
+
 WORKSPACE_LABELS = {
     "finance": {
         "label": "ESG Finance",
@@ -68,13 +72,26 @@ def index_dir():
 def workspace_names():
     raw = os.environ.get("WORKSPACES", DEFAULT_WORKSPACES)
     base = [c.strip() for c in raw.split(",") if c.strip()]
-    return base + [c for c in _EXTRA if c not in base]
+    names = base + [c for c in _EXTRA if c not in base]
+    # Single choke point: the shared-document store is never a workspace, so a
+    # misconfigured WORKSPACES value cannot give it an index.
+    return [c for c in names if is_workspace(c)]
+
+
+def is_workspace(name):
+    """True when `name` is a real workspace.
+
+    Guards the shared-document store: a misconfigured WORKSPACES value must
+    not turn data/_shared into a workspace with its own index, which would
+    silently ingest every shared document into a bogus scope.
+    """
+    return bool(name) and name != SHARED_DIR_NAME
 
 
 def base_workspace_names():
     """Categories configured via the WORKSPACES env variable (not admin-added)."""
     raw = os.environ.get("WORKSPACES", DEFAULT_WORKSPACES)
-    return [c.strip() for c in raw.split(",") if c.strip()]
+    return [c.strip() for c in raw.split(",") if c.strip() and is_workspace(c.strip())]
 
 
 def default_workspace_config():

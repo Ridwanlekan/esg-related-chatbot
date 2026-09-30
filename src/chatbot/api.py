@@ -35,7 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from chatbot import smalltalk, telemetry
+from chatbot import shared_docs, smalltalk, telemetry
 from chatbot.admin_security import (
     admin_gate_config,
     make_basic_auth_check,
@@ -201,6 +201,17 @@ class DocumentDeleteRequest(BaseModel):
     filename: str
 
 
+class SharedLinkRequest(BaseModel):
+    filename: str
+    categories: list[str] = Field(default_factory=list)
+    link_names: dict[str, str] | None = None
+
+
+class SharedUnlinkRequest(BaseModel):
+    filename: str
+    category: str
+
+
 class CostRatesRequest(BaseModel):
     price_input_per_m: float = Field(ge=0)
     price_output_per_m: float = Field(ge=0)
@@ -330,18 +341,24 @@ def create_app(
 
     app.state.admin_gate = admin_gate_config()
 
-    def log_audit(request, event, object_type=None, object_id=None, detail=""):
-        """Best-effort append-only audit record for an admin action."""
-        store = app.state.admin_store
-        if store is None:
-            return
+    def actor_label(request):
+        """Identify the caller for audit rows and registry bookkeeping."""
         actor = ""
         if config_api_key:
             actor = "key:" + hashlib.sha256(config_api_key.encode()).hexdigest()[:8]
         if config_admin_basic_user:
             actor = "user:" + config_admin_basic_user
+        return actor
+
+    def log_audit(request, event, object_type=None, object_id=None, detail=""):
+        """Best-effort append-only audit record for an admin action."""
+        store = app.state.admin_store
+        if store is None:
+            return
         try:
-            store.log_event(actor, event, object_type, object_id, detail[:2000])
+            store.log_event(
+                actor_label(request), event, object_type, object_id, detail[:2000]
+            )
         except Exception:
             logger.exception("audit log write failed (%s)", event)
 
@@ -544,6 +561,27 @@ def create_app(
             return app_.state.bot
         raise HTTPException(status_code=403, detail=f"Unknown workspace: {category}")
 
+    def sync_workspace_state(request: Request):
+        """Re-derive app.state.workspace_config after the workspace set changes.
+
+        workspace_config is a startup snapshot of workspace_names(). Creating a
+        workspace through the admin API refreshes the module-level registry but
+        not that snapshot, so get_bot() could not resolve a workspace created
+        seconds earlier: upload wrote the file to disk and then failed the
+        following ingest with 403 "Unknown workspace".
+        """
+        app_ = request.app
+        if app_.state.bot is not None or app_.state.workspace_registry:
+            # Single-bot or explicitly injected registry: nothing to derive.
+            return
+        conf = default_workspace_config()
+        # Drop cached bots for workspaces that no longer exist, but keep the
+        # rest so live vector-store handles survive unrelated changes.
+        app_.state.category_bots = {
+            cat: b for cat, b in app_.state.category_bots.items() if cat in conf
+        }
+        app_.state.workspace_config = conf
+
     def resolve_session(request: Request, session_id, user_id, store):
         if session_id:
             owner = store.owner_of(session_id)
@@ -695,7 +733,9 @@ def create_app(
         for cat in workspace_names():
             meta = workspace_meta(cat)
             folder = Path(root_data_dir()) / cat
-            file_count = len([p for p in folder.iterdir() if p.is_file()]) if folder.is_dir() else 0
+            # Recursive, so this matches the count the delete guard reports and
+            # the admin prompt can state it accurately.
+            file_count = len([p for p in folder.rglob("*") if p.is_file()]) if folder.is_dir() else 0
             _, chunk_count = _vector_stats(cat)
             rows.append(
                 {
@@ -723,6 +763,7 @@ def create_app(
             cat, label=req.label, blurb=req.blurb, emoji=req.emoji
         )
         reload_extra_workspaces(get_store.db_path)
+        sync_workspace_state(request)
         os.makedirs(Path(root_data_dir()) / cat, exist_ok=True)
         os.makedirs(Path(index_dir()), exist_ok=True)
         log_audit(request, "workspace.create", "workspace", cat,
@@ -756,7 +797,10 @@ def create_app(
 
     @app.delete("/admin/workspaces/{category}", dependencies=admin_gate_deps)
     def admin_delete_workspace(
-        category: str, request: Request, get_store: AdminStore = admin_store_dep
+        category: str,
+        request: Request,
+        purge: bool = False,
+        get_store: AdminStore = admin_store_dep,
     ):
         if category not in workspace_names():
             raise HTTPException(status_code=404, detail="Unknown workspace")
@@ -766,11 +810,57 @@ def create_app(
                 detail="Built-in workspaces cannot be deleted; exclude them via the "
                 "WORKSPACES env variable instead.",
             )
+        folder = Path(root_data_dir()) / category
+        documents = sorted(
+            str(p.relative_to(folder)) for p in folder.rglob("*") if p.is_file()
+        ) if folder.is_dir() else []
+        # Deleting the row alone left data/<category>/ and its vector index
+        # behind as an unreferenced orphan. Removing documents is irreversible,
+        # so refuse until the caller explicitly confirms with ?purge=true.
+        if documents and not purge:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Workspace '{category}' still holds {len(documents)} "
+                    f"document(s). Repeat with purge=true to permanently delete "
+                    f"the folder and its index: " + ", ".join(documents[:10])
+                ),
+            )
+        removed = []
+        # An empty workspace has nothing to lose, so its folder and index are
+        # removed without demanding a second confirmation.
+        if purge or not documents:
+            # Drop shared-document links first so the shared registry does not
+            # keep rows pointing at files that no longer exist.
+            for row in get_store.all_shared_targets():
+                if row["category"] != category:
+                    continue
+                link = shared_docs.safe_name(row["link_name"] or row["filename"])
+                target = shared_docs.target_path(category, link)
+                if target.exists() or target.is_symlink():
+                    target.unlink()
+                get_store.remove_shared_target(row["filename"], category)
+            if folder.is_dir():
+                shutil.rmtree(folder)
+                removed.append(str(folder))
+            store_path = Path(index_dir()) / f"vectors_{category}.sqlite3"
+            for path in (store_path,
+                         store_path.with_suffix(".sqlite3-wal"),
+                         store_path.with_suffix(".sqlite3-shm")):
+                if path.exists():
+                    path.unlink()
+                    removed.append(str(path))
         if not get_store.delete_workspace(category):
             raise HTTPException(status_code=404, detail="Workspace not in admin store")
         reload_extra_workspaces(get_store.db_path)
-        log_audit(request, "workspace.delete", "workspace", category)
-        return {"deleted": category}
+        sync_workspace_state(request)
+        # Evict the cached bot so no live sqlite handle survives the workspace.
+        app.state.category_bots.pop(category, None)
+        log_audit(
+            request, "workspace.delete", "workspace", category,
+            f"purge={bool(purge)} documents={len(documents)}",
+        )
+        return {"deleted": category, "purged": removed}
 
     def _vector_stats(cat):
         db = Path(index_dir()) / f"vectors_{cat}.sqlite3"
@@ -803,6 +893,7 @@ def create_app(
         else:
             cats = list(registry) if registry else workspace_names()
         groups = []
+        shared_map = _shared_targets_by_path(app.state.admin_store)
         for cat in cats:
             indexed = _indexed_sources(cat)
             folder = Path(root_data_dir()) / cat
@@ -811,13 +902,18 @@ def create_app(
                 for p in sorted(folder.iterdir()):
                     if not p.is_file():
                         continue
-                    all_files.append(
-                        {
-                            "name": p.name,
-                            "size": p.stat().st_size,
-                            "indexed": p.name in indexed,
-                        }
-                    )
+                    entry = {
+                        "name": p.name,
+                        "size": p.stat().st_size,
+                        "indexed": p.name in indexed,
+                    }
+                    # Only present when the file is a shared-document link, so
+                    # private-document listings keep their existing shape and the
+                    # console can offer "detach" instead of a refused Delete.
+                    shared = shared_map.get((cat, p.name))
+                    if shared:
+                        entry["shared"] = shared
+                    all_files.append(entry)
             page = all_files[offset : offset + limit]
             groups.append(
                 {
@@ -828,6 +924,30 @@ def create_app(
                 }
             )
         return {"documents": groups, "limit": limit, "offset": offset}
+
+    def _shared_conflict(store, category, name):
+        """Explain why writing `name` into `category` would damage a shared doc.
+
+        A shared document is hardlinked into its workspaces, so a plain
+        `write_bytes` on the same name would truncate the shared inode and
+        silently rewrite the content of every workspace that subscribes to it.
+        Private uploads and deletes must refuse instead.
+        """
+        if store is None:
+            return None
+        shared_map = _shared_targets_by_path(store)
+        filename = shared_map.get((category, name))
+        if filename is None:
+            return None
+        others = [
+            c for c in store.shared_target_categories(filename) if c != category
+        ]
+        where = ", ".join(others) if others else "no other workspace"
+        return (
+            f"'{name}' in {category} is a shared document served to {where}. "
+            f"Edit or detach it from the Shared documents panel instead — "
+            f"uploading over it would rewrite the shared copy."
+        )
 
     @app.post(
         "/admin/upload",
@@ -841,6 +961,14 @@ def create_app(
     ):
         if category not in workspace_names():
             raise HTTPException(status_code=422, detail="Unknown workspace")
+        store = app.state.admin_store
+        for f in files:
+            name = os.path.basename((f.filename or "").replace("\\", "/"))
+            if not name:
+                continue
+            conflict = _shared_conflict(store, category, name)
+            if conflict:
+                raise HTTPException(status_code=409, detail=conflict)
         folder = Path(root_data_dir()) / category
         os.makedirs(folder, exist_ok=True)
         saved = []
@@ -872,6 +1000,9 @@ def create_app(
             raise HTTPException(status_code=422, detail="Unknown workspace")
         folder = Path(root_data_dir()) / req.category
         name = os.path.basename(req.filename.replace("\\", "/"))
+        conflict = _shared_conflict(app.state.admin_store, req.category, name)
+        if conflict:
+            raise HTTPException(status_code=409, detail=conflict)
         target = folder / name
         if not folder.is_dir() or not target.is_file():
             raise HTTPException(status_code=404, detail="Document not found")
@@ -888,6 +1019,233 @@ def create_app(
             "stale_chunks_removed": stats.get("stale_chunks_removed", 0),
             "chunks_upserted": stats.get("chunks_upserted", 0),
         }
+
+    # ---- cross-workspace shared documents -----------------------------------
+
+    def _shared_targets_by_path(store):
+        """Map (category, link_name) -> shared filename, for collision checks."""
+        return {
+            (t["category"], t["link_name"]): t["filename"]
+            for t in store.all_shared_targets()
+        }
+
+    async def _reindex(request, categories):
+        """Re-index each workspace once; returns per-category ingest stats."""
+        results = {}
+        for cat in dict.fromkeys(categories):
+            try:
+                bot = get_bot(request, cat)
+            except HTTPException:
+                continue
+            if bot is None:
+                continue
+            results[cat] = (await run_in_threadpool(bot.read_and_embed_data)).__dict__
+        return results
+
+    def _apply_links(store, filename, categories, link_names, actor, skip_conflict=False):
+        """Create the on-disk link plus the registry row for each category.
+
+        `link_names` maps category -> name inside that workspace folder. Any
+        category omitted from it keeps the name already recorded in the
+        registry, so re-linking a workspace never orphans its previous name.
+
+        Returns (linked, skipped). `skipped` entries carry the reason so the
+        admin console can explain a partial success instead of silently
+        dropping a workspace.
+        """
+        canonical = shared_docs.canonical_path(filename)
+        linked, skipped = [], []
+        for cat in categories:
+            existing = store.get_shared_target(filename, cat)
+            link_name = (link_names or {}).get(cat) or (existing or {}).get(
+                "link_name"
+            ) or filename
+            try:
+                target = shared_docs.target_path(cat, link_name)
+            except ValueError as exc:
+                skipped.append({"category": cat, "reason": str(exc)})
+                continue
+            if skip_conflict and shared_docs.conflicting_target(canonical, target):
+                skipped.append({
+                    "category": cat,
+                    "reason": f"'{link_name}' already exists in {cat} and is not "
+                              f"this shared document.",
+                })
+                continue
+            # A previously registered name in this workspace is being replaced;
+            # drop it so the old file cannot linger and be ingested as though it
+            # were a private document.
+            if existing and existing["link_name"] != link_name:
+                try:
+                    stale = shared_docs.target_path(cat, existing["link_name"])
+                except ValueError:
+                    stale = None
+                if stale is not None and (stale.exists() or stale.is_symlink()):
+                    if shared_docs.same_file(canonical, stale):
+                        stale.unlink()
+            try:
+                kind = shared_docs.create_link(canonical, target)
+            except (OSError, ValueError) as exc:
+                skipped.append({"category": cat, "reason": str(exc)})
+                continue
+            store.add_shared_target(filename, cat, link_name, kind)
+            linked.append({"category": cat, "link_name": link_name, "link_kind": kind})
+        if linked:
+            store.log_event(
+                actor, "shared.link", "shared_document", filename,
+                ",".join(l["category"] for l in linked),
+            )
+        return linked, skipped
+
+    @app.get("/admin/shared-documents", dependencies=admin_gate_deps)
+    def admin_shared_documents():
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Admin store not configured (set API_KEY to enable admin "
+                "console features).",
+            )
+        docs = store.list_shared_docs()
+
+        def lookup(filename):
+            try:
+                path = shared_docs.canonical_path(filename)
+            except ValueError:
+                return None
+            return path if path.exists() else None
+
+        for doc in docs:
+            doc["present"] = lookup(doc["filename"]) is not None
+            doc["size"] = (
+                shared_docs.canonical_path(doc["filename"]).stat().st_size
+                if doc["present"] else 0
+            )
+            doc["targets"] = shared_docs.verify_links(doc["targets"], lookup)
+            doc["workspace_count"] = len(doc["targets"])
+        return {"documents": docs, "workspaces": workspace_names()}
+
+    @app.post(
+        "/admin/shared-documents",
+        dependencies=admin_gate_deps,
+        response_model=dict,
+    )
+    async def admin_shared_upload(
+        request: Request,
+        categories: str = Form(default=""),
+        files: list[UploadFile] = File(default=[]),
+    ):
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        cats = [c.strip() for c in categories.replace(",", " ").split() if c.strip()]
+        cats = [c for c in cats if c in workspace_names()]
+        if not cats:
+            raise HTTPException(
+                status_code=422, detail="Select at least one valid workspace."
+            )
+
+        shared_docs.shared_root().mkdir(parents=True, exist_ok=True)
+        started = time.time()
+        saved = []
+        for f in files:
+            name = shared_docs.safe_name(f.filename)
+            if not name:
+                continue
+            canonical = shared_docs.canonical_path(name)
+            previously = store.shared_target_categories(name)
+            size = shared_docs.replace_canonical(canonical, await f.read())
+            store.add_shared_doc(name, size, actor=actor_label(request))
+            # Re-link every workspace that already consumed this document: the
+            # content changed under their existing links, so their index must
+            # be rebuilt or they will keep serving the previous version.
+            _apply_links(store, name, cats + previously, None, actor_label(request))
+            saved.append(name)
+        if not saved:
+            raise HTTPException(status_code=422, detail="No files were uploaded")
+
+        affected = []
+        for name in saved:
+            for cat in store.shared_target_categories(name):
+                if cat not in affected:
+                    affected.append(cat)
+        stats = await _reindex(request, affected)
+        log_audit(request, "shared.upload", "shared_document", ",".join(saved),
+                  ",".join(affected))
+        return {
+            "saved_files": saved,
+            "reindexed": stats,
+            "duration_seconds": round(time.time() - started, 1),
+        }
+
+    @app.post("/admin/shared-documents/link", dependencies=admin_gate_deps)
+    async def admin_shared_link(request: Request, req: SharedLinkRequest):
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        filename = shared_docs.safe_name(req.filename)
+        if not filename or not shared_docs.canonical_path(filename).exists():
+            raise HTTPException(status_code=404, detail="Shared document not found")
+        cats = [c for c in dict.fromkeys(req.categories) if c in workspace_names()]
+        if not cats:
+            raise HTTPException(
+                status_code=422, detail="Select at least one valid workspace."
+            )
+        linked, skipped = _apply_links(
+            store, filename, cats, req.link_names, actor_label(request), skip_conflict=True
+        )
+        stats = await _reindex(request, [l["category"] for l in linked])
+        return {"filename": filename, "linked": linked, "skipped": skipped,
+                "reindexed": stats}
+
+    @app.post("/admin/shared-documents/unlink", dependencies=admin_gate_deps)
+    async def admin_shared_unlink(request: Request, req: SharedUnlinkRequest):
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        filename = shared_docs.safe_name(req.filename)
+        row = store.get_shared_target(filename, req.category) if filename else None
+        if row is None:
+            raise HTTPException(status_code=404, detail="That link does not exist")
+        try:
+            target = shared_docs.target_path(req.category, row["link_name"])
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        if target.exists() or target.is_symlink():
+            target.unlink()
+        store.remove_shared_target(filename, req.category)
+        # The workspace no longer has the file, so re-index to prune its chunks.
+        stats = await _reindex(request, [req.category])
+        log_audit(request, "shared.unlink", "shared_document", filename, req.category)
+        return {"filename": filename, "detached": req.category, "reindexed": stats}
+
+    @app.post("/admin/shared-documents/delete", dependencies=admin_gate_deps)
+    async def admin_shared_delete(request: Request, req: SharedUnlinkRequest):
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        filename = shared_docs.safe_name(req.filename)
+        doc = store.get_shared_doc(filename) if filename else None
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Shared document not found")
+        affected = store.shared_target_categories(filename)
+        for cat in affected:
+            row = store.get_shared_target(filename, cat)
+            try:
+                target = shared_docs.target_path(cat, row["link_name"])
+            except ValueError:
+                continue
+            if target.exists() or target.is_symlink():
+                target.unlink()
+        try:
+            shared_docs.canonical_path(filename).unlink()
+        except FileNotFoundError:
+            pass
+        store.remove_shared_doc(filename)
+        stats = await _reindex(request, affected)
+        log_audit(request, "shared.delete", "shared_document", filename,
+                  ",".join(affected))
+        return {"deleted": filename, "detached_from": affected, "reindexed": stats}
 
     @app.get("/admin/users", dependencies=admin_gate_deps)
     def admin_users(limit: int = 100, offset: int = 0):

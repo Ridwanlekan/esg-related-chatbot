@@ -55,6 +55,11 @@
   input[type=file] { display: none; }
   .muted { color: var(--muted); font-size: 12px; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .checks { display: flex; flex-wrap: wrap; gap: 6px 14px; padding-top: 2px; }
+  .checks label { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+  .ws-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--panel-2, rgba(255,255,255,.03)); border: 1px solid var(--border); border-radius: 999px; padding: 2px 6px 2px 10px; font-size: 12px; }
+  .ws-chip button { border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px; }
+  .ws-chip button:hover { color: var(--err); }
   .tabs { display: flex; gap: 8px; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
   .tabs button {
     border-radius: 8px 8px 0 0; border: 1px solid transparent; border-bottom: none;
@@ -238,6 +243,27 @@
       <input id="file-input" type="file" multiple>
     </div>
     <div class="card">
+      <h2>Shared documents <span class="muted">(served to several workspaces)</span></h2>
+      <div class="hint" style="margin-bottom:10px">One copy is stored in <code>data/_shared/</code> and linked into each workspace you pick. Every workspace sees the same file, so there is a single version to maintain and no way for departments to drift apart. Re-uploading a shared document updates every linked workspace.</div>
+      <div class="dropzone" id="shared-dz">
+        <div class="dz-title">Drag &amp; drop files here</div>
+        <div>— or click to browse —</div>
+        <small id="shared-dz-files">No files chosen yet.</small>
+      </div>
+      <input id="shared-file-input" type="file" multiple>
+      <div class="row-form" style="margin-top:12px">
+        <div class="field" style="flex:1 1 320px">
+          <label>Workspaces</label>
+          <div id="shared-cats" class="checks"></div>
+        </div>
+        <div class="field"><button id="btn-shared-upload" class="primary">Publish shared document</button></div>
+      </div>
+      <div class="toolbar" style="margin-top:10px">
+        <button id="btn-refresh-shared" class="small">Refresh</button>
+      </div>
+      <div id="shared-list"><div class="muted">Loading…</div></div>
+    </div>
+    <div class="card">
       <h2>Documents by workspace</h2>
       <div class="toolbar">
         <input id="doc-search" placeholder="Filter by file name…">
@@ -393,6 +419,7 @@ let sessionActor = "";
 let refreshTimer = null;
 let tokens = {};
 let docOffsets = {};
+let sharedState = { documents: [], workspaces: [] };
 
 const tabs = [
   ["tab-overview", "view-overview"],
@@ -418,7 +445,7 @@ function showTab(name) {
     $(btn).classList.toggle("active", btn === name);
     $(view).classList.toggle("hidden", btn !== name);
   }
-  if (name === "tab-documents") loadDocuments();
+  if (name === "tab-documents") { loadDocuments(); loadCategories(); loadSharedDocuments(); }
   if (name === "tab-workspaces") { loadWorkspaces(); loadInvites(); loadCategories(); }
   if (name === "tab-users") loadUsers();
   if (name === "tab-audit") loadAudit();
@@ -441,7 +468,12 @@ async function applyAuditConfig() {
   } catch (e) { authCfg = { basic: false, totp: false }; }
   const nur = ["admin-basic-user", "admin-basic-pass", "basic-user-label", "basic-pass-label"];
   nur.forEach((id) => $(id).classList.toggle("hidden", !authCfg.basic));
-  ["totp", "totp-label"].forEach((id) => $(id).classList.toggle("hidden", !authCfg.totp));
+  // The input is id="admin-totp"; looking up "totp" returns null and threw,
+  // which rejected init() and skipped session check, category load and refresh.
+  ["admin-totp", "totp-label"].forEach((id) => {
+    const el = $(id);
+    if (el) el.classList.toggle("hidden", !authCfg.totp);
+  });
   document.querySelectorAll(".login-zone").forEach((el) => el.classList.toggle("hidden", !authCfg.login));
   $("admin-login-totp-label").classList.toggle("hidden", !authCfg.totp);
 }
@@ -451,8 +483,17 @@ function gateHintNeedsTotp(res) {
 }
 
 function setBusy(btn, busy, label) {
+  // Remember the resting label the first time a button goes busy. Without
+  // this, clearing busy falls back to btn.textContent — which by then is the
+  // busy label, leaving the button permanently reading "uploading…" after the
+  // request has already finished.
+  if (busy) {
+    if (btn.dataset.label == null) btn.dataset.label = btn.textContent;
+    btn.textContent = label || "working…";
+  } else if (btn.dataset.label != null) {
+    btn.textContent = btn.dataset.label;
+  }
   btn.disabled = busy;
-  btn.textContent = busy ? (label || "working…") : (btn.dataset.label || btn.textContent);
 }
 
 function log(msg) {
@@ -770,6 +811,42 @@ async function checkProgress() {
   } catch (e) { /* not authed or disabled */ }
 }
 
+// Ingesting a real document can take minutes (first run also loads the
+// embedding model), and the progress bar lives on the Overview tab — invisible
+// while uploading from Documents. Report progress on the button itself so a
+// slow run is distinguishable from a stalled one.
+function watchIngest(btn, tokenName) {
+  stopIngestWatch(tokenName);
+  // A poll may already be awaiting the network when the caller stops us; the
+  // cancelled flag makes that in-flight poll return instead of re-arming the
+  // timer and re-busying a button whose work already finished.
+  const state = { cancelled: false };
+  tokens[tokenName + ":state"] = state;
+  const tick = async () => {
+    if (state.cancelled) return;
+    let p;
+    try {
+      p = await (await api("/ingest/status", { headers: authHeaders() })).json();
+    } catch (e) { return; }
+    if (state.cancelled || !p || !p.running) return;
+    const file = p.current_file ? String(p.current_file).split("/").pop() : "";
+    setBusy(btn, true, "indexing " + (p.processed_files || 0) + "/" +
+      (p.total_files || "?") + (file ? " — " + file : ""));
+    tokens[tokenName] = setTimeout(tick, 1200);
+  };
+  tick();
+}
+
+function stopIngestWatch(tokenName) {
+  clearTimeout(tokens[tokenName]);
+  tokens[tokenName] = null;
+  const state = tokens[tokenName + ":state"];
+  if (state) {
+    state.cancelled = true;
+    tokens[tokenName + ":state"] = null;
+  }
+}
+
 async function loadCategories() {
   try {
     const res = await fetch("/workspaces");
@@ -779,10 +856,225 @@ async function loadCategories() {
     $("up-cat").innerHTML = opts;
     $("user-cat").innerHTML = opts;
     $("invite-cat").innerHTML = opts;
+    const boxes = ws
+      .map((w) => {
+        const c = esc(w.category);
+        return '<label><input type="checkbox" value="' + c + '"> ' +
+          esc(w.label || w.category) + "</label>";
+      })
+      .join("");
+    $("shared-cats").innerHTML = boxes;
   } catch (e) {
     console.error("loadCategories failed:", e);
     // leave selects empty so the user can see something's wrong
   }
+}
+
+/* ---------------- shared documents ---------------- */
+
+const STATE_TAG = {
+  ok: ["ok", "linked"],
+  broken: ["err", "link missing"],
+  diverged: ["warn", "diverged"],
+  missing: ["err", "file missing"],
+  conflict: ["warn", "name conflict"],
+};
+
+function selectedSharedCats() {
+  return Array.from($("shared-cats").querySelectorAll("input:checked")).map(
+    (i) => i.value
+  );
+}
+
+async function loadSharedDocuments() {
+  const box = $("shared-list");
+  try {
+    const res = await api("/admin/shared-documents", { headers: authHeaders() });
+    sharedState = await res.json();
+    sharedState.documents = sharedState.documents || [];
+    sharedState.workspaces = sharedState.workspaces || [];
+    renderSharedDocuments(sharedState);
+  } catch (e) {
+    box.innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+  }
+}
+
+function renderSharedDocuments(data) {
+  const box = $("shared-list");
+  box.innerHTML = "";
+  const docs = data.documents || [];
+  if (!docs.length) {
+    box.appendChild(
+      elm("div", "muted", "No shared documents yet. Publish one above to serve " +
+        "the same document to several workspaces.")
+    );
+    return;
+  }
+  const notIn = new Set((data.workspaces || []));
+  for (const d of docs) {
+    const g = document.createElement("div");
+    g.className = "doc-group";
+
+    const h = elm("h3", "", d.filename + " ");
+    h.appendChild(
+      elm("span", "count",
+        (d.workspace_count || 0) + " workspace(s) · " + fmtSize(d.size))
+    );
+    g.appendChild(h);
+
+    if (!d.present) {
+      g.appendChild(elm("div", "muted",
+        "The file is missing from data/_shared/ but still registered. " +
+        "Re-publish it to restore, or delete the entry."));
+    }
+
+    const chips = elm("div", "checks");
+    for (const t of d.targets || []) {
+      notIn.delete(t.category);
+      const [cls, label] = STATE_TAG[t.state] || ["", t.state];
+      const chip = elm("span", "ws-chip");
+      const x = elm("button", "", "×");
+      x.title = "Detach from " + t.category +
+        (t.state === "ok" ? "" : " — link is " + t.state);
+      x.onclick = () => unlinkShared(d.filename, t.category);
+      chip.appendChild(elm("span", "tag " + cls, t.category + " · " + label));
+      chip.appendChild(x);
+      chips.appendChild(chip);
+    }
+    g.appendChild(chips);
+
+    const actions = elm("div", "toolbar");
+    actions.style.marginTop = "8px";
+    const add = elm("button", "small", "+ Add workspace");
+    add.onclick = () => addSharedTargets(d.filename);
+    const repub = elm("button", "small", "Replace file…");
+    repub.onclick = () => replaceShared(d.filename);
+    const del = elm("button", "small danger", "Delete everywhere");
+    del.onclick = () => deleteShared(d.filename, d.workspace_count || 0);
+    actions.appendChild(add);
+    actions.appendChild(repub);
+    actions.appendChild(del);
+    g.appendChild(actions);
+    box.appendChild(g);
+  }
+  if (notIn.size) {
+    box.appendChild(elm("div", "muted",
+      "Not shared with: " + Array.from(notIn).join(", ")));
+  }
+}
+
+async function uploadShared() {
+  const files = sharedPicker.files();
+  if (!files.length) { notify("Choose at least one file to publish.", "warn"); return; }
+  const cats = selectedSharedCats();
+  if (!cats.length) { notify("Tick at least one workspace.", "warn"); return; }
+  const fd = new FormData();
+  fd.append("categories", cats.join(","));
+  for (const f of files) fd.append("files", f, f.name);
+  const btn = $("btn-shared-upload");
+  setBusy(btn, true, "publishing & indexing…");
+  watchIngest(btn, "sharedWatch");
+  try {
+    const res = await api("/admin/shared-documents",
+      { method: "POST", headers: authHeaders(false), body: fd });
+    const d = await res.json();
+    const where = Object.keys(d.reindexed || {});
+    notify("Published " + d.saved_files.join(", ") + " to " +
+      (where.length ? where.join(", ") : "no workspace") + ".");
+    sharedPicker.reset();
+    await loadSharedDocuments();
+    await loadDocuments();
+    refreshStatus();
+  } catch (e) { notify("Publish failed: " + e.message, "err"); }
+  finally { stopIngestWatch("sharedWatch"); setBusy(btn, false); }
+}
+
+async function replaceShared(filename) {
+  const pick = document.createElement("input");
+  pick.type = "file";
+  pick.onchange = async () => {
+    const f = pick.files[0];
+    if (!f) return;
+    const cats = selectedSharedCats();
+    const fd = new FormData();
+    fd.append("categories", cats.join(","));
+    fd.append("files", f, filename);
+    try {
+      const res = await api("/admin/shared-documents",
+        { method: "POST", headers: authHeaders(false), body: fd });
+      const d = await res.json();
+      notify("Updated " + filename + " in " +
+        Object.keys(d.reindexed || {}).join(", ") + ".");
+      await loadSharedDocuments();
+      await loadDocuments();
+    } catch (e) { notify("Update failed: " + e.message, "err"); }
+  };
+  pick.click();
+}
+
+async function addSharedTargets(filename) {
+  const doc = (sharedState.documents || []).find((d) => d.filename === filename);
+  const current = new Set((doc ? doc.targets || [] : []).map((t) => t.category));
+  const avail = (sharedState.workspaces || []).filter((c) => !current.has(c));
+  if (!avail.length) { notify("Already shared with every workspace.", "warn"); return; }
+  const names = window.prompt(
+    "Add " + filename + " to which workspace(s)?\nAvailable: " + avail.join(", ") +
+    "\nComma-separate, and optionally use name:workspace to rename, e.g. " +
+    "corp-policy.docx:hr",
+    avail.join(",")
+  );
+  if (!names) return;
+  const cats = [], linkNames = {};
+  for (const part of names.split(",").map((s) => s.trim()).filter(Boolean)) {
+    const idx = part.lastIndexOf(":");
+    if (idx > 0) { linkNames[part.slice(idx + 1).trim()] = part.slice(0, idx).trim(); cats.push(part.slice(idx + 1).trim()); }
+    else cats.push(part);
+  }
+  try {
+    const res = await api("/admin/shared-documents/link",
+      { method: "POST", headers: authHeaders(), body: JSON.stringify({ filename, categories: cats, link_names: linkNames }) });
+    const d = await res.json();
+    if (d.linked && d.linked.length) {
+      notify("Linked to " + d.linked.map((l) => l.category).join(", ") + ".");
+    }
+    for (const s of d.skipped || []) {
+      notify(s.category + " skipped: " + s.reason, "warn");
+    }
+    await loadSharedDocuments();
+    await loadDocuments();
+  } catch (e) { notify("Link failed: " + e.message, "err"); }
+}
+
+async function unlinkShared(filename, category) {
+  if (!confirm("Stop serving '" + filename + "' in " + category +
+    "?\nThe document stays shared with its other workspaces.")) return;
+  try {
+    await api("/admin/shared-documents/unlink", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({ filename, category }),
+    });
+    notify("Detached " + filename + " from " + category + ".");
+    await loadSharedDocuments();
+    await loadDocuments();
+    refreshStatus();
+  } catch (e) { notify("Detach failed: " + e.message, "err"); }
+}
+
+async function deleteShared(filename, n) {
+  if (!confirm("Delete '" + filename + "'?\nThis removes the single copy in " +
+    "data/_shared/ and the link in " + n + " workspace(s). This cannot be undone.")) return;
+  try {
+    const res = await api("/admin/shared-documents/delete", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({ filename, category: "" }),
+    });
+    const d = await res.json();
+    notify("Deleted " + filename + " from " +
+      (d.detached_from || []).join(", ") + ".");
+    await loadSharedDocuments();
+    await loadDocuments();
+    refreshStatus();
+  } catch (e) { notify("Delete failed: " + e.message, "err"); }
 }
 
 /* ---------------- documents ---------------- */
@@ -840,11 +1132,23 @@ function renderDocuments(q) {
         const tag = elm("span", "tag " + (f.indexed ? "ok" : "warn"),
           f.indexed ? "indexed" : "not indexed");
         row.appendChild(tag);
+        if (f.shared) {
+          const st = elm("span", "tag custom", "shared");
+          st.title = "Served from data/_shared/" + f.shared +
+            " — edit or detach it in the Shared documents panel above.";
+          row.appendChild(st);
+        }
         row.appendChild(elm("span", "name", f.name));
         row.appendChild(elm("span", "muted", fmtSize(f.size)));
-        const del = elm("button", "small danger", "Delete");
-        del.onclick = () => deleteDoc(cat, f.name);
-        row.appendChild(del);
+        if (f.shared) {
+          const detach = elm("button", "small", "Detach");
+          detach.onclick = () => unlinkShared(f.shared, cat);
+          row.appendChild(detach);
+        } else {
+          const del = elm("button", "small danger", "Delete");
+          del.onclick = () => deleteDoc(cat, f.name);
+          row.appendChild(del);
+        }
         group.appendChild(row);
       }
     }
@@ -875,8 +1179,7 @@ async function deleteDoc(category, name) {
 }
 
 function chosenFiles() {
-  const input = $("file-input");
-  return input.files.length ? Array.from(input.files) : (window._dropFiles || []);
+  return privatePicker.files();
 }
 
 async function uploadFiles() {
@@ -889,41 +1192,82 @@ async function uploadFiles() {
 
   const btn = $("btn-upload");
   setBusy(btn, true, "uploading & indexing…");
+  watchIngest(btn, "upWatch");
   log("[" + cat + "] upload started (" + files.length + " file(s); re-reading all data dir files)…");
   try {
     const res = await api("/admin/upload", { method: "POST", headers: authHeaders(false), body: fd });
     const d = await res.json();
     log("[" + cat + "] done — docs seen: " + d.documents_seen + ", chunks: " + d.chunks_upserted + ", stale removed: " + d.stale_chunks_removed);
     notify("Uploaded " + d.saved_files.length + " file(s) — " + d.chunks_upserted + " chunks upserted.");
-    $("file-input").value = "";
-    window._dropFiles = null;
-    $("dz-files").textContent = "No files chosen yet.";
+    privatePicker.reset();
     await loadDocuments();
     refreshStatus();
   } catch (e) { notify("Upload failed: " + e.message, "err"); }
-  finally { setBusy(btn, false); }
+  finally { stopIngestWatch("upWatch"); setBusy(btn, false); }
 }
 
 /* ---- drag & drop ---- */
-const dz = $("dropzone");
-const hiddenInput = $("file-input");
-dz.addEventListener("click", () => hiddenInput.click());
-["dragenter", "dragover"].forEach((ev) =>
-  dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
-["dragleave", "drop"].forEach((ev) =>
-  dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
-dz.addEventListener("drop", (e) => {
-  const files = Array.from(e.dataTransfer.files || []);
-  if (!files.length) return;
-  window._dropFiles = files;
-  hiddenInput.value = "";
-  $("dz-files").textContent = files.map((f) => f.name).join(", ") + " (" + files.map(fmtFileSize).join(", ") + ")";
-});
-hiddenInput.addEventListener("change", () => {
-  window._dropFiles = null;
-  const f = hiddenInput.files;
-  $("dz-files").textContent = f.length ? Array.from(f).map((x) => x.name).join(", ") : "No files chosen yet.";
-});
+// The file inputs are display:none, so each upload surface needs a visible
+// trigger. Without one there is no way to choose a file at all.
+function wireDropzone(dzId, inputId, labelId, stashKey) {
+  const zone = $(dzId);
+  const input = $(inputId);
+  const label = $(labelId);
+
+  const show = (files) => {
+    label.textContent = files.length
+      ? files.map((f) => f.name).join(", ") +
+        " (" + files.map(fmtFileSize).join(", ") + ")"
+      : "No files chosen yet.";
+  };
+
+  const stash = (files) => {
+    window[stashKey] = files.length ? files : null;
+    input.value = "";
+    show(files);
+  };
+
+  zone.addEventListener("click", () => input.click());
+  ["dragenter", "dragover"].forEach((ev) =>
+    zone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      zone.classList.add("drag");
+    })
+  );
+  ["dragleave", "drop"].forEach((ev) =>
+    zone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      zone.classList.remove("drag");
+    })
+  );
+  zone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    stash(Array.from((e.dataTransfer && e.dataTransfer.files) || []));
+  });
+  // Clicking through to the native picker bypasses the drop handler, so keep
+  // the label in step on change too.
+  input.addEventListener("change", () => {
+    const files = Array.from(input.files || []);
+    window[stashKey] = null;
+    show(files);
+  });
+
+  return {
+    files: () => (window[stashKey] && window[stashKey].length
+      ? window[stashKey]
+      : Array.from(input.files || [])),
+    reset: () => {
+      window[stashKey] = null;
+      input.value = "";
+      show([]);
+    },
+  };
+}
+
+const privatePicker = wireDropzone("dropzone", "file-input", "dz-files", "_dropFiles");
+const sharedPicker = wireDropzone(
+  "shared-dz", "shared-file-input", "shared-dz-files", "_sharedDropFiles"
+);
 function fmtFileSize(f) { return fmtSize(f.size); }
 
 /* ---------------- workspaces ---------------- */
@@ -1001,7 +1345,7 @@ function workspaceCard(ws) {
 
   if (ws.custom) {
     const del = elm("button", "small danger", "Delete");
-    del.onclick = () => deleteWorkspace(ws.category);
+    del.onclick = () => deleteWorkspace(ws.category, ws.data_file_count);
     actions.appendChild(del);
   }
 
@@ -1027,17 +1371,38 @@ async function saveWorkspace(category, editView) {
   } catch (e) { notify("Save failed: " + e.message, "err"); }
 }
 
-async function deleteWorkspace(category) {
-  if (!confirm('Delete workspace "' + category + '"? Its folder and index are left in place; it just stops appearing for signups.')) return;
+async function deleteWorkspace(category, docCount) {
+  const n = Number(docCount || 0);
+  const what = n === 0
+    ? "It is empty, so nothing is lost."
+    : "This permanently deletes " + n + " document" + (n === 1 ? "" : "s") +
+      " and the search index. It cannot be undone.";
+  if (!confirm('Delete workspace "' + category + '"?\n\n' + what)) return;
   try {
-    await api("/admin/workspaces/" + encodeURIComponent(category), {
-      method: "DELETE", headers: authHeaders(),
-    });
-    notify("Deleted " + category);
-    await loadCategories();
-    loadWorkspaces();
-    refreshStatus();
-  } catch (e) { notify("Delete failed: " + e.message, "err"); }
+    // The count is known up front, so the intent is stated once and honoured
+    // immediately; purge=true is what actually removes the folder and index.
+    const res = await api(
+      "/admin/workspaces/" + encodeURIComponent(category) + (n > 0 ? "?purge=true" : ""),
+      { method: "DELETE", headers: authHeaders() });
+    notify("Deleted " + category +
+      (n > 0 ? " and removed " + n + " document" + (n === 1 ? "" : "s") + "." : "."));
+  } catch (e) {
+    // Backstop: the list we rendered was fetched earlier, so documents may
+    // have appeared since. Confirm once more against the server's own count.
+    if (e.status === 409 && confirm(e.message + "\n\nDelete anyway?")) {
+      try {
+        await api("/admin/workspaces/" + encodeURIComponent(category) + "?purge=true",
+          { method: "DELETE", headers: authHeaders() });
+        notify("Deleted " + category + ".");
+      } catch (e2) { notify("Delete failed: " + e2.message, "err"); return; }
+    } else {
+      if (e.status !== 409) notify("Delete failed: " + e.message, "err");
+      return;
+    }
+  }
+  await loadCategories();
+  loadWorkspaces();
+  refreshStatus();
 }
 
 async function createWorkspace() {
@@ -1407,6 +1772,8 @@ async function viewTranscript(sid) {
 $("btn-refresh").addEventListener("click", refreshStatus);
 $("btn-reindex-all").addEventListener("click", () => reindex(null, $("btn-reindex-all")));
 $("btn-upload").addEventListener("click", uploadFiles);
+$("btn-shared-upload").addEventListener("click", uploadShared);
+$("btn-refresh-shared").addEventListener("click", loadSharedDocuments);
 $("btn-create-ws").addEventListener("click", createWorkspace);
 $("btn-create-user").addEventListener("click", createUser);
 $("btn-refresh-docs").addEventListener("click", loadDocuments);
