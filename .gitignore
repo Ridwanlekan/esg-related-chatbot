@@ -5,6 +5,7 @@
 
 # Local workflow notes (never commit)
 doc/solution-workflow.txt
+followup_questions.txt
 
 # Python
 __pycache__/
@@ -50,3 +51,11 @@ ppt/
 ESG Workspace Chatbot.docx
 ESG Workspace Chatbot.pdf
 esg_chatbot_pitch_deck.md
+esg_chatbot_features.md
+esg_chatbot_transcript.md
+
+# Scratch / prototyping files (local experiments, not wired into src/)
+rag copy.py
+rag_temp.py
+function_test.py
+test_azure_credentials.py
