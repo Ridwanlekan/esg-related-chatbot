@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import uuid
@@ -6,6 +7,17 @@ from datetime import datetime, timezone
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def _decode_sources(raw):
+    """Parse a stored citation blob, tolerating legacy rows and bad JSON."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
 
 
 class SessionStore:
@@ -31,6 +43,7 @@ class SessionStore:
             "content TEXT NOT NULL, "
             "created_at TEXT NOT NULL)"
         )
+        self._migrate_message_sources()
         self.conn.commit()
 
     def _migrate_user_id(self):
@@ -40,6 +53,21 @@ class SessionStore:
         }
         if "user_id" not in cols:
             self.conn.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT")
+            self.conn.commit()
+
+    def _migrate_message_sources(self):
+        """Add the per-message citation column.
+
+        Citations are the product's trust claim, so an answer that loses its
+        sources the moment the page is reloaded is only half the feature.
+        Stored as a JSON array of citation objects, one blob per message.
+        """
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "sources" not in cols:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN sources TEXT")
             self.conn.commit()
 
     def create(self, session_id, user_id=None):
@@ -64,15 +92,27 @@ class SessionStore:
         ).fetchone()
         return row is not None
 
-    def append(self, session_id, role, content):
+    def append(self, session_id, role, content, sources=None):
         self.create(session_id)
         self.conn.execute(
-            "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
-            (session_id, role, content, _now()),
+            "INSERT INTO messages (session_id, role, content, created_at, sources) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                session_id,
+                role,
+                content,
+                _now(),
+                json.dumps(sources) if sources else None,
+            ),
         )
         self.conn.commit()
 
     def history(self, session_id, limit=10):
+        """Prior turns for the LLM prompt.
+
+        Deliberately role and content only: citations are a presentation concern
+        and would spend context window on text the model does not need.
+        """
         rows = self.conn.execute(
             "SELECT role, content FROM messages "
             "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
@@ -85,11 +125,18 @@ class SessionStore:
 
     def messages(self, session_id):
         rows = self.conn.execute(
-            "SELECT role, content FROM messages "
+            "SELECT role, content, sources FROM messages "
             "WHERE session_id = ? ORDER BY id ASC",
             (session_id,),
         ).fetchall()
-        return [{"role": row["role"], "content": row["content"]} for row in rows]
+        return [
+            {
+                "role": row["role"],
+                "content": row["content"],
+                "sources": _decode_sources(row["sources"]),
+            }
+            for row in rows
+        ]
 
     def list_sessions(self, limit=20, offset=0, user_id=None):
         where, params = "", []

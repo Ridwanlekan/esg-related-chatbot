@@ -590,7 +590,10 @@ class _RecordingStore:
     def get_doc_hash(self, source):
         return self.hashes.get(source)
 
-    def insert_batch(self, ids, embeddings, sources, indexes, contents, hashes):
+    def insert_batch(
+        self, ids, embeddings, sources, indexes, contents, hashes,
+        page_starts=None, page_ends=None,
+    ):
         for s, h in zip(sources, hashes):
             self.hashes[s] = h
             self.seen_sources.append(s)

@@ -48,13 +48,43 @@ def make_auth_check(api_key):
     return check
 
 
+def trusted_proxies():
+    """Peer addresses whose X-Forwarded-For header we are willing to believe."""
+    raw = os.environ.get("TRUSTED_PROXY_IPS", "")
+    return [entry.strip() for entry in raw.split(",") if entry.strip()]
+
+
+def client_ip(request):
+    """Best-effort caller address for rate-limit keying.
+
+    When TLS is terminated in front of the app, `request.client.host` is the
+    proxy, not the user, so every caller collapses into one bucket. uvicorn's
+    own proxy_headers handling rewrites the scope client for the standard
+    deployment; this is the app-level fallback for deployments that terminate
+    elsewhere.
+
+    X-Forwarded-For is honoured ONLY from a peer listed in TRUSTED_PROXY_IPS.
+    Trusting it unconditionally would let any client mint a fresh rate-limit
+    bucket per request by sending a random header, which is strictly worse than
+    the shared-bucket bug it fixes.
+    """
+    peer = request.client.host if request.client else None
+    allowed = trusted_proxies()
+    if not peer or ("*" not in allowed and peer not in allowed):
+        return peer or "unknown"
+    for candidate in (c.strip() for c in request.headers.get("x-forwarded-for", "").split(",")):
+        if candidate:
+            return candidate
+    return peer
+
+
 def make_rate_limit(limiter, requests, window_seconds):
-    """Return a FastAPI dependency enforcing a per-IP sliding-window cap."""
+    """Return a FastAPI dependency enforcing a per-caller sliding-window cap."""
     if not requests:
         return None
 
     def check(request: Request):
-        key = request.client.host if request.client else "unknown"
+        key = client_ip(request)
         if not limiter.allow(f"{key}:{request.url.path}"):
             raise HTTPException(status_code=429, detail="Rate limit exceeded")
 

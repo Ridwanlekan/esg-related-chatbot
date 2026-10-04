@@ -163,3 +163,73 @@ def test_fts_backfilled_for_legacy_database(tmp_path):
     hits = s._search_lexical("alpha", k=5)
     assert hits and hits[0].content == "alpha beta"
     s.close()
+
+
+def _paged(store):
+    store.insert_batch(
+        ["p1", "p2", "p3"],
+        [_emb(0), _emb(1), _emb(2)],
+        ["report.pdf"] * 3,
+        [0, 1, 2],
+        ["emissions on page one", "governance on page two", "safety on page nine"],
+        ["h"] * 3,
+        page_starts=[1, 2, 9],
+        page_ends=[1, 2, 9],
+    )
+
+
+def test_pages_survive_dense_search(store):
+    _paged(store)
+    results = store.search(_emb(1), k=1)
+    assert (results[0].page_start, results[0].page_end) == (2, 2)
+    assert results[0].has_pages
+
+
+def test_pages_survive_lexical_search(store):
+    _paged(store)
+    results = store._search_lexical("governance", k=1)
+    assert results[0].page_start == 2
+
+
+def test_pages_survive_hybrid_search(store):
+    """Hybrid rebuilds its results, so page metadata is easy to drop there."""
+    _paged(store)
+    results = store.search_hybrid("governance", _emb(1), k=1)
+    assert results[0].page_start == 2
+    assert results[0].chunk_id == "p2"
+
+
+def test_pages_are_absent_for_unpagulated_sources(store):
+    store.insert_batch(*_sample())
+    assert all(r.page_start is None for r in store.search(_emb(0), k=5))
+    assert all(not r.has_pages for r in store.search_hybrid("content", _emb(0), k=5))
+
+
+def test_legacy_index_gains_page_columns_without_losing_rows(tmp_path):
+    """An index built before page tracking opens as-is and reads NULL pages."""
+    import sqlite3
+
+    import sqlite_vec
+
+    db_path = str(tmp_path / "legacy.sqlite3")
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE chunks (id TEXT PRIMARY KEY, source TEXT NOT NULL, "
+        "chunk_index INTEGER NOT NULL, content TEXT NOT NULL, doc_hash TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO chunks VALUES ('c1', 'a.txt', 0, 'alpha beta', 'h')")
+    conn.commit()
+    conn.close()
+
+    compiled = sqlite3.connect(db_path)
+    compiled.enable_load_extension(True)
+    sqlite_vec.load(compiled)
+    compiled.close()
+
+    s = SQLiteVecStore(db_path=db_path, dim=DIM)
+    cols = {r[1] for r in s.conn.execute("PRAGMA table_info(chunks)").fetchall()}
+    assert {"page_start", "page_end"} <= cols
+    assert s.count() == 1
+    hits = s._search_lexical("alpha", k=5)
+    assert hits[0].page_start is None
+    s.close()

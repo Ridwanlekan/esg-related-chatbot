@@ -9,6 +9,10 @@ TOKENIZERS_PARALLELISM = False
 # DATA_DIR = <project>/data        # root folder holding one subfolder per workspace
 # AUTH_SECRET = ""                 # JWT signing secret (required in prod; ephemeral if unset)
 # TOKEN_TTL_SECONDS = 604800       # session token lifetime (default 7 days)
+# DOWNLOAD_TOKEN_TTL_SECONDS = 3600 # citation link lifetime (default 1 hour, clamped to 60..86400).
+#                                 # Citation links carry a capability for one document rather than the
+#                                 # session, so a native new-tab navigation can open them; rotating
+#                                 # AUTH_SECRET revokes every issued link.
 # USERS_DB = <index>/users.sqlite3 # where accounts live (default: .index/users.sqlite3)
 
 # --- Admin / operations -------------------------------------------------------
@@ -24,6 +28,16 @@ TOKENIZERS_PARALLELISM = False
 # CORS_ORIGINS = ""               # comma-separated allowed browser origins (empty = no cross-origin access)
 # RATE_LIMIT_REQUESTS = 60        # max requests per window per IP
 # RATE_LIMIT_WINDOW_SECONDS = 60
+# --- Reverse proxy -----------------------------------------------------------
+# TLS is terminated in front of the app in every real deployment, so without these the
+# rate limiter sees the proxy address for every caller and one global bucket is shared by
+# all users. FORWARDED_ALLOW_IPS is read by uvicorn (peers whose X-Forwarded-For it
+# applies); TRUSTED_PROXY_IPS is the app-level fallback in security.client_ip and only
+# affects rate-limit keying. Set both to * on Azure App Service, where the platform front
+# end is the only thing that can reach the container. Never set them to * on a port that
+# the public Internet can reach directly, or any client can forge its own bucket.
+# FORWARDED_ALLOW_IPS = 127.0.0.1
+# TRUSTED_PROXY_IPS = ""
 # AZURE_OPENAI_TIMEOUT = 120      # seconds per Azure call
 # OPENAI_MAX_RETRIES = 3
 # MAX_GENERATION_TOKENS = 600     # answer length cap (bounds latency + cost)

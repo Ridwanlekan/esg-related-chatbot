@@ -9,6 +9,7 @@ import secrets
 import shutil
 import sqlite3
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from fastapi import (
     HTTPException,
     FastAPI,
     Header,
+    Query,
     Request,
     UploadFile,
 )
@@ -32,7 +34,7 @@ from fastapi import (
 load_dotenv()
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from chatbot import shared_docs, smalltalk, telemetry
@@ -43,6 +45,17 @@ from chatbot.admin_security import (
     verify_totp,
 )
 from chatbot.admin_store import AdminStore, validate_category
+from chatbot.documents import DocumentNotFound, resolve_document
+from chatbot.download_links import (
+    TOKEN_QUERY_PARAM,
+    content_disposition,
+    delivery_for,
+    download_ttl_seconds,
+    is_download_token,
+    mint_download_token,
+    page_fragment,
+    verify_download_token,
+)
 from chatbot.ingest import INGEST_PROGRESS
 from chatbot.security import RateLimiter, int_env, make_auth_check, make_rate_limit
 from chatbot.session_store import SessionStore
@@ -78,6 +91,80 @@ def _default_bot_factory():
     return RAGBot()
 
 
+DOCUMENT_DOWNLOAD_PATH = "/documents/download"
+DOCUMENT_LINK_PATH = "/documents/link"
+
+
+class SourceRef(BaseModel):
+    """One verifiable citation: where the claim came from, and how to open it.
+
+    `similarity` is the retrieval distance-to-cosine score, NOT a confidence
+    figure. It is shown for transparency about why a document was retrieved and
+    must never be presented to users as a percentage of correctness.
+
+    `page_start`/`page_end` are the 1-based page range the quoted chunk sits on,
+    or None when the document has no pagination or predates page tracking. They
+    are part of the citation, not a hint: "p. 42" is what makes a claim checkable
+    against a 200-page report.
+    """
+
+    source: str
+    url: str
+    chunk_id: str
+    chunk_index: int
+    similarity: float
+    page_start: int | None = None
+    page_end: int | None = None
+
+
+def document_url(source, token=None, page_start=None):
+    """Citation link for a retrieved source.
+
+    The reference travels as a query parameter rather than a path segment on
+    purpose: ASGI percent-decodes scope["path"] before routing, so a %2F-encoded
+    filename arrives as a real "/" and gets split into extra path segments.
+    A query parameter cannot be re-split.
+
+    `token` is a single-document download capability rather than the session
+    token, so that the link survives being opened natively in a new tab, which
+    sends no Authorization header. `page_start` becomes a `#page=` fragment,
+    which only does something for the formats served inline.
+    """
+    query = {"source": source}
+    if token:
+        query[TOKEN_QUERY_PARAM] = token
+    encoded = urllib.parse.urlencode(query, safe="", quote_via=urllib.parse.quote)
+    return f"{DOCUMENT_DOWNLOAD_PATH}?{encoded}{page_fragment(page_start)}"
+
+
+def citation_refs(results, token_for=None):
+    """Turn retrieval results into citation objects for an API response.
+
+    `token_for(source)` mints the download capability; it is called at most once
+    per distinct document because several retrieved chunks usually share a file.
+    """
+    tokens = {}
+    refs = []
+    for r in results or []:
+        token = None
+        if token_for is not None:
+            if r.source not in tokens:
+                tokens[r.source] = token_for(r.source)
+            token = tokens[r.source]
+        refs.append(
+            SourceRef(
+                source=r.source,
+                url=document_url(r.source, token, r.page_start),
+                chunk_id=r.chunk_id,
+                chunk_index=r.chunk_index,
+                similarity=round(float(r.similarity), 4),
+                page_start=r.page_start,
+                page_end=r.page_end,
+            )
+        )
+    return refs
+
+
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=8000)
     session_id: str | None = None
@@ -89,7 +176,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     session_id: str
     answer: str
-    sources: list[str] = []
+    sources: list[SourceRef] = []
 
 
 class SearchRequest(BaseModel):
@@ -105,11 +192,26 @@ class SearchItem(BaseModel):
     similarity: float
     score: float | None
     content: str
+    page_start: int | None = None
+    page_end: int | None = None
 
 
 class SearchResponse(BaseModel):
     question: str
     results: list[SearchItem]
+
+
+class DocumentLinkRequest(BaseModel):
+    """Mint a fresh download link for a document the caller can already reach."""
+
+    source: str = Field(min_length=1, max_length=512)
+    page_start: int | None = Field(default=None, ge=1)
+
+
+class DocumentLinkResponse(BaseModel):
+    source: str
+    url: str
+    expires_in: int
 
 
 class SessionList(BaseModel):
@@ -270,9 +372,15 @@ def create_app(
         user_store = UserStore(DEFAULT_USERS_PATH, secret=auth_secret)
     auth_enabled = user_store is not None
 
+    # Signs and verifies citation download links. With auth on this is AUTH_SECRET,
+    # so rotating it revokes every outstanding link. With auth off there is no
+    # secret to borrow, so links get a per-process one: dev mode already serves
+    # documents to anyone who asks, and native new-tab links keep working there.
+    link_secret = user_store.secret if user_store is not None else secrets.token_hex(32)
     app = FastAPI(title="ESG Workspace Chatbot API", version="1.0.0")
     app.state.bot = bot
     app.state.user_store = user_store
+    app.state.link_secret = link_secret
     app.state.session_store = session_store or SessionStore(DEFAULT_SESSIONS_PATH)
     app.state.workspace_registry = dict(workspaces or {})
     app.state.admin_store = admin_store
@@ -350,14 +458,21 @@ def create_app(
             actor = "user:" + config_admin_basic_user
         return actor
 
-    def log_audit(request, event, object_type=None, object_id=None, detail=""):
-        """Best-effort append-only audit record for an admin action."""
+    def log_audit(request, event, object_type=None, object_id=None, detail="",
+                  actor=None):
+        """Best-effort append-only audit record for an admin action.
+
+        `actor` overrides the console-derived label for events raised by an end
+        user (a citation download), which have no admin credential to derive one
+        from.
+        """
         store = app.state.admin_store
         if store is None:
             return
         try:
             store.log_event(
-                actor_label(request), event, object_type, object_id, detail[:2000]
+                actor or actor_label(request), event, object_type, object_id,
+                detail[:2000],
             )
         except Exception:
             logger.exception("audit log write failed (%s)", event)
@@ -498,6 +613,16 @@ def create_app(
         )
         return response
 
+    def dev_identity():
+        """The single caller dev mode pretends there is when auth is off."""
+        return {
+            "id": "dev",
+            "email": "dev@localhost",
+            "name": "Developer",
+            "category": (workspace_names() or ["finance"])[0],
+            "dev": True,
+        }
+
     if auth_enabled:
 
         async def require_user(
@@ -507,6 +632,11 @@ def create_app(
                 raise HTTPException(status_code=401, detail="Missing or invalid token")
             payload = verify_jwt(user_store.secret, authorization[len("Bearer ") :])
             if not payload or not payload.get("sub"):
+                raise HTTPException(status_code=401, detail="Missing or invalid token")
+            # A download capability is not a session. Without this check a link
+            # copied out of a chat message would authenticate as its owner for
+            # every authenticated endpoint until it expired.
+            if is_download_token(payload):
                 raise HTTPException(status_code=401, detail="Missing or invalid token")
             return {
                 "id": payload["sub"],
@@ -518,15 +648,53 @@ def create_app(
     else:
 
         async def require_user() -> dict:
-            return {
-                "id": "dev",
-                "email": "dev@localhost",
-                "name": "Developer",
-                "category": (workspace_names() or ["finance"])[0],
-                "dev": True,
-            }
+            return dev_identity()
 
     user_dep = Depends(require_user)
+
+    def citation_token_for(user):
+        """Mint a download capability for `user`, or None when auth is off.
+
+        Without auth there is nothing to scope a link to and nothing to check it
+        against, so the plain URL is emitted and documents stay as open as dev
+        mode already is.
+        """
+        if not auth_enabled or not user:
+            return None
+
+        def mint(source):
+            return mint_download_token(link_secret, user["id"], source)
+
+        return mint
+
+    def refresh_source_links(messages, user):
+        """Re-sign the citation links stored with a session.
+
+        Sessions outlive the hour a link is good for, and the URLs are persisted
+        verbatim. Re-minting on read is what lets a week-old conversation still
+        open its evidence; the source is unchanged, only the capability is new.
+        """
+        mint = citation_token_for(user)
+        if mint is None:
+            return messages
+        refreshed = []
+        for message in messages:
+            sources = message.get("sources") if isinstance(message, dict) else None
+            if not isinstance(sources, list) or not sources:
+                refreshed.append(message)
+                continue
+            refs = []
+            for ref in sources:
+                if isinstance(ref, dict) and ref.get("source"):
+                    ref = {
+                        **ref,
+                        "url": document_url(
+                            ref["source"], mint(ref["source"]), ref.get("page_start")
+                        ),
+                    }
+                refs.append(ref)
+            refreshed.append({**message, "sources": refs})
+        return refreshed
 
     def get_sessions(request: Request):
         return request.app.state.session_store
@@ -638,6 +806,8 @@ def create_app(
                 "POST /chat",
                 "POST /chat/stream",
                 "POST /search",
+                "POST /documents/link",
+                "GET /documents/download",
                 "POST /ingest",
                 "POST /ingest/{category}",
                 "GET /ingest/status",
@@ -1580,9 +1750,14 @@ def create_app(
                 request, usage_events,
                 category=user["category"], user_id=user["id"], session_id=session_id,
             )
-            sources = [r.source for r in getattr(bot, "last_results", []) or []]
+            sources = citation_refs(
+                getattr(bot, "last_results", []), citation_token_for(user)
+            )
         store.append(session_id, "user", req.question)
-        store.append(session_id, "assistant", reply)
+        store.append(
+            session_id, "assistant", reply,
+            sources=[ref.model_dump() for ref in sources],
+        )
         return ChatResponse(session_id=session_id, answer=reply, sources=sources)
 
     @app.post("/chat/stream", dependencies=rate_deps)
@@ -1601,6 +1776,7 @@ def create_app(
         def event_stream():
             chunks = []
             usage_events = []
+            sources = []
             try:
                 if reply is not None:
                     chunks.append(reply)
@@ -1615,6 +1791,11 @@ def create_app(
                     ):
                         chunks.append(piece)
                         yield f"data: {json.dumps({'delta': piece})}\n\n"
+                    # Resolved before the persistence step below so the stored
+                    # assistant turn keeps the citations it was answered with.
+                    sources = citation_refs(
+                        getattr(bot, "last_results", []), citation_token_for(user)
+                    )
             except RuntimeError as e:
                 yield f"data: {json.dumps({'error': str(e)})}\n\n"
             finally:
@@ -1623,12 +1804,13 @@ def create_app(
                     category=user["category"], user_id=user["id"], session_id=session_id,
                 )
                 store.append(session_id, "user", req.question)
-                store.append(session_id, "assistant", "".join(chunks))
-            if reply is not None:
-                sources = []
-            else:
-                sources = [r.source for r in getattr(bot, "last_results", []) or []]
-            yield f"data: {json.dumps({'sources': sources})}\n\n"
+                store.append(
+                    session_id,
+                    "assistant",
+                    "".join(chunks),
+                    sources=[ref.model_dump() for ref in sources],
+                )
+            yield f"data: {json.dumps({'sources': [s.model_dump() for s in sources]})}\n\n"
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(
@@ -1658,10 +1840,128 @@ def create_app(
                 similarity=round(r.similarity, 4),
                 score=round(r.score, 4) if r.score is not None else None,
                 content=r.content,
+                page_start=r.page_start,
+                page_end=r.page_end,
             )
             for r in results
         ]
         return SearchResponse(question=req.question, results=items)
+
+    @app.post(DOCUMENT_LINK_PATH, response_model=DocumentLinkResponse, dependencies=rate_deps)
+    def document_link(req: DocumentLinkRequest, user: dict = user_dep):
+        """Mint a fresh download link for a document the caller may already open.
+
+        Links in a chat response are signed when the answer is produced, which is
+        right for the common case but goes stale in a long-lived session. This
+        re-issues one without reloading the conversation.
+        """
+        try:
+            resolve_document(user["category"], req.source)
+        except DocumentNotFound:
+            raise HTTPException(status_code=404, detail="Document not found")
+        mint = citation_token_for(user)
+        token = mint(req.source) if mint else None
+        return DocumentLinkResponse(
+            source=req.source,
+            url=document_url(req.source, token, req.page_start),
+            expires_in=download_ttl_seconds(),
+        )
+
+    @app.get(DOCUMENT_DOWNLOAD_PATH, dependencies=rate_deps)
+    def download_document(
+        request: Request,
+        source: str | None = Query(default=None, max_length=512),
+        token: str | None = Query(default=None, max_length=4096),
+        authorization: str | None = Header(default=None),
+    ):
+        """Serve a cited source document to a user entitled to their workspace.
+
+        Two ways in, because the two ways a citation gets opened are different:
+
+        * `?source=` plus the caller's bearer token, which is what the app's own
+          fetch calls send.
+        * `?source=` plus a signed download token, which is what a native browser
+          navigation sends, since navigating never attaches an Authorization
+          header. That is what makes cmd-click and "open in new tab" work.
+
+        With a download token the source comes from the token, never from the
+        query string, so a link cannot be edited to name a different document in
+        the same workspace. The workspace comes from the live user record, so
+        deleting or moving a user immediately invalidates links already in their
+        browser history.
+
+        The `source` value is re-derived server-side by documents.resolve_document,
+        which confines the result to the caller's workspace or the shared store.
+        Every failure mode after authentication is a 404, so the response never
+        reveals whether a document outside the caller's scope exists.
+
+        Delivery follows download_links.delivery_for: PDF, text and raster images
+        render inline so the `#page=` fragment lands on the cited page, while
+        anything the browser might treat as a document the caller wrote (HTML,
+        SVG, XML, office formats) is served as an opaque attachment. Inline HTML on
+        this origin would be stored XSS against the very session that serves it.
+        """
+        via_token = False
+        if not auth_enabled:
+            identity = dev_identity()
+            effective = source
+        else:
+            # Both credential families resolve to a (user id, document) pair; the
+            # download token carries the document with it, the session token does
+            # not and trusts the query string because it is scoped to the user.
+            capability = verify_download_token(link_secret, token) if token else None
+            via_token = capability is not None
+            if via_token:
+                user_id, token_source = capability["user_id"], capability["source"]
+                if source and source != token_source:
+                    raise HTTPException(status_code=404, detail="Document not found")
+                effective = token_source
+            else:
+                payload = None
+                if authorization and authorization.startswith("Bearer "):
+                    payload = verify_jwt(
+                        user_store.secret, authorization[len("Bearer ") :]
+                    )
+                    if payload and is_download_token(payload):
+                        payload = None
+                if not payload or not payload.get("sub"):
+                    raise HTTPException(status_code=401, detail="Missing or invalid token")
+                user_id, effective = payload["sub"], source
+            identity = user_store.get(user_id)
+            if identity is None:
+                # Correctly signed, but the account behind it is gone.
+                raise HTTPException(status_code=401, detail="Missing or invalid token")
+        if not effective:
+            raise HTTPException(status_code=404, detail="Document not found")
+        try:
+            path = resolve_document(identity["category"], effective)
+        except DocumentNotFound:
+            raise HTTPException(status_code=404, detail="Document not found")
+        log_audit(
+            request,
+            "document.download",
+            "document",
+            f"{identity['category']}/{effective}",
+            # Which credential opened the file is the first question asked of this
+            # row, so both paths are labelled. A capability URL that turns up in a
+            # shared document is a different incident from an in-app fetch.
+            detail=f"user={identity['id']} via={'token' if via_token else 'bearer'}",
+            actor=f"user:{identity.get('email') or identity['id']}",
+        )
+        media_type, disposition, filename = delivery_for(path)
+        return FileResponse(
+            path,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": content_disposition(disposition, filename),
+                "X-Content-Type-Options": "nosniff",
+                # A citation URL carries a capability. If a reader clicks a link
+                # inside the served PDF, this is what stops the token from
+                # travelling to that third-party site as a Referer.
+                "Referrer-Policy": "no-referrer",
+                "Cache-Control": "private, no-store",
+            },
+        )
 
     def iter_workspace_bots(request: Request):
         app_ = request.app
@@ -1719,7 +2019,10 @@ def create_app(
     def get_session(session_id: str, user: dict = user_dep, store=store_dep):
         if store.owner_of(session_id) != user["id"]:
             raise HTTPException(status_code=404, detail="Session not found")
-        return SessionMessages(session_id=session_id, messages=store.messages(session_id))
+        return SessionMessages(
+            session_id=session_id,
+            messages=refresh_source_links(store.messages(session_id), user),
+        )
 
     @app.delete("/sessions/{session_id}")
     def delete_session(session_id: str, user: dict = user_dep, store=store_dep):
@@ -1738,4 +2041,18 @@ def run(host="0.0.0.0", port=None, reload=False):
     telemetry.configure_logging(getattr(logging, level, logging.INFO))
     if port is None:
         port = int(os.environ.get("PORT", "8000"))
-    uvicorn.run("chatbot.api:app", host=host, port=port, reload=reload)
+    # TLS is terminated by a reverse proxy in every real deployment (Azure App
+    # Service front end in prod), so without proxy headers request.client.host is
+    # the proxy for every caller and per-IP rate limiting silently degrades into
+    # one global bucket. FORWARDED_ALLOW_IPS names the peers whose headers we
+    # trust; on App Service only the platform front end can reach the container,
+    # hence "*" in deploy.yml.
+    forwarded = os.environ.get("FORWARDED_ALLOW_IPS", "")
+    uvicorn.run(
+        "chatbot.api:app",
+        host=host,
+        port=port,
+        reload=reload,
+        proxy_headers=True,
+        forwarded_allow_ips=forwarded or "127.0.0.1",
+    )

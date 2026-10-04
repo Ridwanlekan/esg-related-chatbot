@@ -105,11 +105,15 @@ class TestWorkspaceRouting:
 
         r = c.post("/chat", json={"question": "climate risk?"}, headers=auth(fin_token))
         assert r.json()["answer"] == "finance: answer to 'climate risk?'"
-        assert r.json()["sources"] == ["10. IFRS S1.pdf"]
+        fin = r.json()["sources"][0]
+        assert fin["source"] == "10. IFRS S1.pdf"
+        # The link carries a download capability so a native new-tab navigation,
+        # which sends no Authorization header, can still open the document.
+        assert fin["url"].startswith("/documents/download?source=10.%20IFRS%20S1.pdf&token=")
 
         r = c.post("/chat", json={"question": "diversity metric?"}, headers=auth(hr_token))
         assert r.json()["answer"] == "hr: answer to 'diversity metric?'"
-        assert r.json()["sources"] == ["ESG for HR.docx"]
+        assert r.json()["sources"][0]["source"] == "ESG for HR.docx"
 
         assert bots["finance"].ask_calls == ["climate risk?"]
         assert bots["hr"].ask_calls == ["diversity metric?"]

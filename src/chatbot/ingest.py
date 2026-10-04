@@ -21,6 +21,13 @@ DEFAULT_PATTERNS = tuple(
 
 VET_DIR_NAME = ".docling_vet"
 
+# Bumped whenever the chunking contract changes in a way an existing index cannot
+# satisfy — adding page attribution to chunks was the first. It is mixed into the
+# stored hash so every document is re-extracted exactly once after the change and
+# then goes back to skipping on an unchanged hash. Without it, a document indexed
+# before page tracking would match its own hash forever and never gain pages.
+INGEST_SCHEMA_VERSION = 2
+
 
 @dataclass(frozen=True)
 class IngestStats:
@@ -35,6 +42,9 @@ class IngestStats:
 class ExtractedText:
     text: str
     from_docling: bool = False
+    # [(page_no, text)] when the source is paginated, else empty. Used to give
+    # every chunk an exact page, so a citation can say which page to open.
+    pages: tuple = ()
 
 
 def recursive_split(text, chunk_size=DEFAULT_CHUNK_SIZE, overlap=DEFAULT_OVERLAP):
@@ -77,6 +87,17 @@ def _read_bytes(path):
         return f.read()
 
 
+def _doc_hash(raw):
+    """Content hash of a file, stamped with the indexer version that read it.
+
+    Compared against the stored value and never parsed, so the suffix costs
+    nothing and buys a single guaranteed reindex whenever INGEST_SCHEMA_VERSION
+    moves. Without it, documents already in the index would report themselves
+    unchanged and keep the chunk layout of whatever version first saw them.
+    """
+    return f"{hashlib.sha256(raw).hexdigest()}:v{INGEST_SCHEMA_VERSION}"
+
+
 def _decode(raw):
     for encoding in ("utf-8", "latin-1"):
         try:
@@ -86,17 +107,47 @@ def _decode(raw):
     return raw.decode("utf-8", errors="replace")
 
 
-def _docling_text(path, loader):
-    """Convert via Docling. Returns None when the format isn't handled.
+def _docling_extract(path, loader):
+    """Convert via Docling, returning `(markdown, pages)`.
+
+    `pages` is `[(page_no, text), ...]` for a paginated document, else empty.
+    Returns `(None, ())` when the format isn't handled.
 
     A loader passed explicitly bypasses the global availability check so
-    tests (and callers) can inject a stub. Raises ConversionError on failure.
+    tests (and callers) can inject a stub. Raises ConversionError if the
+    conversion itself fails, but never for a failure to split pages: page
+    numbers are an enrichment, and not having them must not stop a document
+    from being indexed.
     """
-    if loader is not None:
-        if not loader.supports(path):
-            return None
-        return loader.convert(path)
-    return docling_loader.extract_text(path)
+    if loader is None:
+        if not (docling_loader.enabled() and docling_loader.is_available()):
+            return None, ()
+        loader = docling_loader.get_loader()
+    if not loader.supports(path):
+        return None, ()
+
+    pages = ()
+    text = None
+    convert_both = getattr(loader, "convert_both", None)
+    try:
+        if convert_both is not None:
+            text, raw_pages = convert_both(path)
+        else:
+            text = loader.convert(path)
+            convert_pages = getattr(loader, "convert_pages", None)
+            raw_pages = convert_pages(path) if convert_pages else None
+    except ConversionError:
+        # A real conversion failure, not a missing enrichment: let the caller
+        # decide whether to fall back to plain-text decoding.
+        raise
+    except Exception as exc:
+        logger.debug("Per-page extraction unavailable for %s: %s", path, exc)
+        raw_pages = None
+    if raw_pages:
+        pages = tuple(
+            (int(no), txt) for no, txt in raw_pages if txt and txt.strip()
+        )
+    return text, pages
 
 
 def _extract_document(path, loader=None):
@@ -107,12 +158,14 @@ def _extract_document(path, loader=None):
     text-like formats. Binary formats that fail conversion are skipped.
     """
     try:
-        text = _docling_text(path, loader)
+        text, pages = _docling_extract(path, loader)
     except ConversionError as exc:
         logger.warning("Docling conversion failed for %s: %s", path, exc)
-        text = None
+        text, pages = None, ()
     if text is not None:
-        return ExtractedText(text=clean_docling_text(text), from_docling=True)
+        return ExtractedText(
+            text=clean_docling_text(text), from_docling=True, pages=pages
+        )
 
     ext = docling_loader.extension_of(path)
     if ext in docling_loader.TEXT_FALLBACK_EXTENSIONS or ext in ("txt", "log", ""):
@@ -120,6 +173,29 @@ def _extract_document(path, loader=None):
         if text:
             return ExtractedText(text=text)
     return None
+
+
+def chunk_with_pages(extracted, chunk_size=DEFAULT_CHUNK_SIZE, overlap=DEFAULT_OVERLAP):
+    """Split a document into (chunk, page_start, page_end) triples.
+
+    Paginated documents are chunked page by page. That costs a little context at
+    each page break, where a paragraph could otherwise straddle two pages, and
+    buys an unambiguous answer to "which page is this quote on?" — the property
+    the whole citation feature rests on. Trying to recover pages after the fact
+    by matching offsets against the concatenated text would have to guess at
+    where Docling's Markdown serialiser inserted separators, and a wrong page
+    number on a compliance citation is worse than none.
+
+    Unpaginated sources keep the original whole-document behaviour, so plain text
+    and HTML retrieval is untouched.
+    """
+    if not extracted.pages:
+        return [(chunk, None, None) for chunk in recursive_split(extracted.text, chunk_size, overlap)]
+    triples = []
+    for page_no, page_text in extracted.pages:
+        for chunk in recursive_split(page_text, chunk_size, overlap):
+            triples.append((chunk, page_no, page_no))
+    return triples
 
 
 def _vet_base(data_dir):
@@ -248,9 +324,12 @@ def ingest_documents(
     pending_indexes = []
     pending_contents = []
     pending_hashes = []
+    pending_page_starts = []
+    pending_page_ends = []
 
     def flush():
-        nonlocal pending_ids, pending_sources, pending_indexes, pending_contents, pending_hashes
+        nonlocal pending_ids, pending_sources, pending_indexes, pending_contents
+        nonlocal pending_hashes, pending_page_starts, pending_page_ends
         if not pending_ids:
             return 0
         embeddings = embed_fn(pending_contents)
@@ -261,6 +340,8 @@ def ingest_documents(
             pending_indexes,
             pending_contents,
             pending_hashes,
+            page_starts=pending_page_starts,
+            page_ends=pending_page_ends,
         )
         n = len(pending_ids)
         pending_ids = []
@@ -268,6 +349,8 @@ def ingest_documents(
         pending_indexes = []
         pending_contents = []
         pending_hashes = []
+        pending_page_starts = []
+        pending_page_ends = []
         return n
 
     chunks_upserted = 0
@@ -287,7 +370,7 @@ def ingest_documents(
         for i, (path, source) in enumerate(zip(files, rel_sources), 1):
             progress.begin_file(source)
             raw = _read_bytes(path)
-            doc_hash = hashlib.sha256(raw).hexdigest()
+            doc_hash = _doc_hash(raw)
             if store.get_doc_hash(source) == doc_hash:
                 logger.debug("  [%d/%d] unchanged, skipping %s", i, len(files), source)
                 progress.end_file()
@@ -304,9 +387,13 @@ def ingest_documents(
                 continue
             if extracted.from_docling and vet_base is not None:
                 _write_vet(vet_base, source, extracted.text)
-            chunks = recursive_split(extracted.text)
-            logger.info("  -> %d chunk(s)", len(chunks))
-            for index, chunk in enumerate(chunks):
+            chunked = chunk_with_pages(extracted)
+            logger.info(
+                "  -> %d chunk(s)%s",
+                len(chunked),
+                f" across {len(extracted.pages)} page(s)" if extracted.pages else "",
+            )
+            for index, (chunk, page_start, page_end) in enumerate(chunked):
                 chunk_id = hashlib.sha256(
                     f"{source}::{index}::{doc_hash}".encode()
                 ).hexdigest()
@@ -315,8 +402,10 @@ def ingest_documents(
                 pending_indexes.append(index)
                 pending_contents.append(chunk)
                 pending_hashes.append(doc_hash)
+                pending_page_starts.append(page_start)
+                pending_page_ends.append(page_end)
             documents_reindexed += 1
-            progress.end_file(reindexed=True, chunks=len(chunks))
+            progress.end_file(reindexed=True, chunks=len(chunked))
             if len(pending_ids) >= batch_size:
                 chunks_upserted += flush()
 

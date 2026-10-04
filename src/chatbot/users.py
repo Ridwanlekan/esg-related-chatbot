@@ -17,6 +17,10 @@ logger = logging.getLogger("esg.users")
 PBKDF2_ITERATIONS = 200_000
 MIN_PASSWORD_LENGTH = 8
 DEFAULT_TOKEN_TTL_SECONDS = 7 * 24 * 3600
+# Token families share one signing scheme, so they must be distinguishable by
+# their claims. `document_download` lives in chatbot.download_links; it is named
+# there because only that module mints one.
+SESSION_PURPOSE = "session"
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 _EPHEMERAL_WARNED = False
@@ -250,6 +254,10 @@ class UserStore:
                 "email": user["email"],
                 "name": user["name"],
                 "category": user["category"],
+                # Stamped explicitly so the download endpoint can refuse a session
+                # token. Tokens issued before this claim existed have no purpose
+                # and are still accepted as sessions.
+                "purpose": SESSION_PURPOSE,
             },
             ttl_seconds=ttl,
         )

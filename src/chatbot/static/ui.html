@@ -41,8 +41,18 @@
   .msg { max-width: 78%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
   .msg.user { align-self: flex-end; background: var(--accent-2); color: #062033; }
   .msg.bot { align-self: flex-start; background: var(--panel-2); border: 1px solid var(--border); }
-  .msg .sources { margin-top: 8px; font-size: 11px; color: var(--muted); }
-  .msg .sources span { margin-right: 8px; }
+  .msg .sources { margin-top: 8px; font-size: 11px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .msg .sources .label { opacity: .8; }
+  .msg .sources a, #search-results .hit a {
+    color: var(--accent); text-decoration: none; border: 1px solid var(--border);
+    border-radius: 999px; padding: 2px 9px; cursor: pointer; background: var(--panel);
+  }
+  .msg .sources a:hover, #search-results .hit a:hover { border-color: var(--accent); text-decoration: underline; }
+  .msg .sources a .sim { opacity: .7; margin-left: 5px; }
+  .msg .sources a .page {
+    opacity: .8; margin-left: 5px; padding-left: 5px;
+    border-left: 1px solid var(--border);
+  }
   .cursor::after { content: "▌"; animation: blink 1s steps(1) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
   #composer { display: flex; gap: 10px; padding: 14px 20px; border-top: 1px solid var(--border); }
@@ -349,14 +359,191 @@ function addMsg(role, text) {
   return div;
 }
 
+function citationUrl(ref) {
+  // Older/partial payloads can still be a bare filename; keep the chip working
+  // as plain text rather than rendering a link that cannot resolve.
+  return typeof ref === "string" ? "" : (ref.url || "");
+}
+
+// The chip is a real link and is left alone. Every href already carries a
+// single-document download capability, so cmd-click, middle-click, right-click
+// and "open in new tab" all work the way the reader expects, and a PDF opens in
+// the browser's viewer on the cited page.
+function citationLink(source, pageStart) {
+  let url = "/documents/download?source=" + encodeURIComponent(source);
+  if (typeof pageStart === "number" && pageStart > 0) url += "#page=" + pageStart;
+  return url;
+}
+
+// Only a plain left-click is intercepted, to renew the link before following it:
+// an hour-old transcript would otherwise hand the reader an expired capability.
+// Modified clicks are left to the browser, which is what makes them native.
+async function openCitation(source, pageStart, e) {
+  e.preventDefault();
+  try {
+    const res = await fetch("/documents/link", {
+      method: "POST",
+      headers: Object.assign({ "content-type": "application/json" }, authHeaders()),
+      body: JSON.stringify({ source: source, page_start: pageStart || null }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      alert(body.detail || "Could not open that document (" + res.status + ")");
+      return;
+    }
+    const body = await res.json();
+    window.location.assign(body.url || citationLink(source, pageStart));
+  } catch (err) {
+    alert("Could not open that document: " + err.message);
+  }
+}
+
+// Render the pages a citation actually rests on. Retrieval picks chunks from
+// scattered pages, so collapsing them to "pp. 7-39" claims 33 pages of evidence
+// where there are five — and a span written as a range reads as a claim about the
+// document rather than a pointer into it. Runs of consecutive pages are still
+// compressed, and a long list is abbreviated, because the label sits in a chip.
+function pageLabel(pageStart, pageEnd, pageList) {
+  if (Array.isArray(pageList) && pageList.length) {
+    const pages = pageList.slice().sort((a, b) => a - b);
+    const runs = [];
+    for (const page of pages) {
+      const last = runs[runs.length - 1];
+      if (last && page === last[1] + 1) last[1] = page;
+      else runs.push([page, page]);
+    }
+    const run = (r) => (r[0] === r[1] ? String(r[0]) : r[0] + "–" + r[1]);
+    if (runs.length === 1) {
+      return runs[0][0] === runs[0][1] ? "p. " + runs[0][0] : "pp. " + run(runs[0]);
+    }
+    // The cap sits above what real retrieval produces (five or six pages on the
+    // IFRS corpus), because abbreviating the common case would hide exactly the
+    // pages this label exists to name. Past the cap the chip would crowd out the
+    // source name, so the head and tail carry the claim and the count keeps it
+    // honest about what was left out.
+    if (runs.length <= 6) return "pp. " + runs.map(run).join(", ");
+    return (
+      "pp. " + run(runs[0]) + ", " + run(runs[1]) + " … " + run(runs[runs.length - 1]) +
+      " (" + pages.length + " pages)"
+    );
+  }
+  if (typeof pageStart !== "number" || pageStart < 1) return "";
+  if (typeof pageEnd === "number" && pageEnd > pageStart) return "pp. " + pageStart + "–" + pageEnd;
+  return "p. " + pageStart;
+}
+
+function citationChip(ref) {
+  const chip = document.createElement("a");
+  const url = citationUrl(ref);
+  const source = typeof ref === "string" ? ref : ref.source;
+  const pageStart = typeof ref === "string" ? null : ref.page_start;
+  const pageEnd = typeof ref === "string" ? null : ref.page_end;
+  const pages = pageLabel(pageStart, pageEnd, typeof ref === "string" ? null : ref.page_list);
+  if (url || pageStart) {
+    // Fall back to a locally built link when the payload predates signed URLs,
+    // so an older stored session still resolves to something clickable.
+    chip.href = url || citationLink(source, pageStart);
+    // The number is a retrieval score, not a correctness percentage. Say so, so
+    // it cannot be read aloud in a pitch as "95% confident".
+    const bits = ["Open the source document"];
+    if (pages) bits.push(pages);
+    if (typeof ref !== "string" && typeof ref.similarity === "number") {
+      bits.push("retrieval similarity " + ref.similarity.toFixed(2));
+    }
+    chip.title = bits.join(" · ");
+    chip.textContent = source;
+    if (typeof ref !== "string" && typeof ref.similarity === "number") {
+      const sim = document.createElement("span");
+      sim.className = "sim";
+      sim.textContent = ref.similarity.toFixed(2);
+      chip.appendChild(sim);
+    }
+    if (pages) {
+      const page = document.createElement("span");
+      page.className = "page";
+      page.textContent = pages;
+      chip.appendChild(page);
+    }
+    chip.onclick = (e) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+      openCitation(source, pageStart, e);
+    };
+  } else {
+    chip.textContent = source;
+  }
+  return chip;
+}
+
+function pageSet(ref) {
+  const pages = new Set();
+  for (const page of [ref.page_start, ref.page_end]) {
+    if (typeof page === "number" && page > 0) pages.add(page);
+  }
+  return pages;
+}
+
+// Re-point a citation URL at a page without re-minting it. The fragment is
+// resolved by the browser alone: it never reaches the server and is not part of
+// the signed capability, so editing it cannot widen what the link grants.
+function withPageFragment(url, page) {
+  if (typeof page !== "number" || page <= 0) return url;
+  return String(url).split("#")[0] + "#page=" + page;
+}
+
 function addSources(botEl, sources) {
-  const seen = [...new Set(sources)];
+  // One chip per document, not per chunk: several retrieved chunks commonly
+  // come from the same file and three links to one PDF is noise, not evidence.
+  // Pages are merged instead of dropped, because which pages an answer leaned on
+  // is the part a reader wants to see before opening the file.
+  const bySource = new Map();
+  for (const ref of sources || []) {
+    const key = typeof ref === "string" ? ref : ref.source;
+    const existing = bySource.get(key);
+    if (!existing) {
+      // Seed with this ref's own pages. Leaving the first one out made the label
+      // depend on retrieval order: pages 5 then 10 merged to "p. 10", hiding the
+      // page the answer actually opened on.
+      bySource.set(key, {
+        ref: ref,
+        pages: typeof ref === "string" ? new Set() : pageSet(ref),
+        chunks: 1,
+      });
+      continue;
+    }
+    if (typeof ref === "string" || typeof existing.ref === "string") continue;
+    existing.chunks += 1;
+    for (const page of pageSet(ref)) existing.pages.add(page);
+  }
+  const chips = [];
+  for (const entry of bySource.values()) {
+    let ref = entry.ref;
+    if (entry.pages.size && typeof ref === "object") {
+      const pages = Array.from(entry.pages).sort((a, b) => a - b);
+      const start = pages[0];
+      ref = Object.assign({}, ref, {
+        page_start: start,
+        page_end: pages[pages.length - 1],
+        // A modified click goes straight to the browser with this href, so the
+        // fragment has to agree with the range on the label.
+        url: withPageFragment(ref.url, start),
+        // Only a real merge carries an explicit page list. A single chunk's
+        // page_start/page_end may legitimately span several pages, and that span
+        // is contiguous by construction, so it must keep rendering as a range.
+        page_list: entry.chunks > 1 ? pages : null,
+      });
+    }
+    chips.push(citationChip(ref));
+  }
   const prev = botEl.querySelector(".sources");
   if (prev) prev.remove();
-  if (!seen.length) return;
+  if (!chips.length) return;
   const s = document.createElement("div");
   s.className = "sources";
-  s.textContent = "sources: " + seen.join(" · ");
+  const label = document.createElement("span");
+  label.className = "label";
+  label.textContent = "Sources:";
+  s.appendChild(label);
+  for (const chip of chips) s.appendChild(chip);
   botEl.appendChild(s);
 }
 
@@ -378,8 +565,11 @@ async function loadMessages(id) {
   const data = await res.json();
   if (!data.messages || !data.messages.length) { renderWelcomeMsg(); return; }
   for (const m of data.messages) {
-    if (m.role === "user") addMsg("user", m.content);
-    else addMsg("bot", m.content);
+    if (m.role === "user") { addMsg("user", m.content); continue; }
+    const el = addMsg("bot", m.content);
+    // Citations are stored with the turn, so a reloaded session is still
+    // verifiable rather than degrading to an unbacked answer.
+    if (m.sources && m.sources.length) addSources(el, m.sources);
   }
 }
 
@@ -521,10 +711,21 @@ async function doSearch() {
     div.className = "hit";
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.textContent = `${hit.source} #${hit.chunk_index} · sim ${hit.similarity}`;
+    const pages = pageLabel(hit.page_start, hit.page_end);
+    meta.textContent = `${hit.source} #${hit.chunk_index}`
+      + (pages ? ` · ${pages}` : "")
+      + ` · sim ${hit.similarity}`;
+    const link = document.createElement("a");
+    link.textContent = "open document";
+    link.title = "Open the source document";
+    link.href = citationLink(hit.source, hit.page_start);
+    link.onclick = (e) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+      openCitation(hit.source, hit.page_start, e);
+    };
     const txt = document.createElement("div");
     txt.textContent = hit.content.slice(0, 220);
-    div.appendChild(meta); div.appendChild(txt);
+    div.appendChild(meta); div.appendChild(link); div.appendChild(txt);
     box.appendChild(div);
   }
 }

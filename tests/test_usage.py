@@ -9,6 +9,7 @@ from chatbot.admin_store import AdminStore
 from chatbot.api import create_app
 from chatbot.session_store import SessionStore
 from chatbot.users import UserStore
+from chatbot.vector_store import SearchResult
 
 
 class UsageBot:
@@ -16,10 +17,16 @@ class UsageBot:
 
     def __init__(self):
         self.store = SimpleNamespace(count=lambda: 5)
-        self.last_results = [SimpleNamespace(source="10. IFRS S1.pdf")]
+        self.last_results = [SearchResult(
+            chunk_id="c1", source="10. IFRS S1.pdf", chunk_index=0,
+            content="chunk body", distance=0.25,
+        )]
 
     def retrieve(self, question, k=3, source=None, history=None, usage_sink=None):
-        self.last_results = [SimpleNamespace(source="10. IFRS S1.pdf")]
+        self.last_results = [SearchResult(
+            chunk_id="c1", source="10. IFRS S1.pdf", chunk_index=0,
+            content="chunk body", distance=0.25,
+        )]
         return self.last_results
 
     def ask(self, question, k=3, source=None, history=None, usage_sink=None):

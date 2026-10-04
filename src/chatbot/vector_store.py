@@ -16,10 +16,18 @@ class SearchResult:
     content: str
     distance: float
     score: float | None = None
+    # Page range this chunk came from, 1-based and inclusive, or None when the
+    # source has no pagination (plain text, markdown) or predates page tracking.
+    page_start: int | None = None
+    page_end: int | None = None
 
     @property
     def similarity(self):
         return 1.0 - self.distance
+
+    @property
+    def has_pages(self):
+        return self.page_start is not None
 
 
 class VectorStore(ABC):
@@ -32,6 +40,8 @@ class VectorStore(ABC):
         chunk_indexes,
         contents,
         doc_hashes,
+        page_starts=None,
+        page_ends=None,
     ):
         pass
 
@@ -104,6 +114,7 @@ class SQLiteVecStore(VectorStore):
             "content TEXT NOT NULL, "
             "doc_hash TEXT NOT NULL)"
         )
+        self._ensure_schema()
         self.conn.execute(
             f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks "
             f"USING vec0(embedding float[{self.dim}], source text)"
@@ -115,6 +126,20 @@ class SQLiteVecStore(VectorStore):
         self._backfill_fts_if_needed()
         self.conn.commit()
 
+    def _ensure_schema(self):
+        """Add the page columns to an index built before page tracking existed.
+
+        ALTER TABLE ADD COLUMN is the right tool here: existing rows and their
+        rowids survive, which is what the vec0 and fts5 shadow tables point at,
+        and the new columns read back as NULL. That is why ingestion re-processes
+        unchanged documents exactly once (see INGEST_SCHEMA_VERSION in
+        chatbot.ingest) instead of asking anyone to delete .index/.
+        """
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(chunks)").fetchall()}
+        for column in ("page_start", "page_end"):
+            if column not in cols:
+                self.conn.execute(f"ALTER TABLE chunks ADD COLUMN {column} INTEGER")
+
     def _backfill_fts_if_needed(self):
         fts_count = self.conn.execute("SELECT COUNT(*) AS c FROM chunks_fts").fetchone()["c"]
         chunk_count = self.conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]
@@ -124,21 +149,42 @@ class SQLiteVecStore(VectorStore):
                 "SELECT rowid, content, source FROM chunks"
             )
 
-    def insert_batch(self, ids, embeddings, sources, chunk_indexes, contents, doc_hashes):
+    def insert_batch(
+        self,
+        ids,
+        embeddings,
+        sources,
+        chunk_indexes,
+        contents,
+        doc_hashes,
+        page_starts=None,
+        page_ends=None,
+    ):
         embeddings = _normalize(embeddings)
         if embeddings.shape[1] != self.dim:
             raise ValueError(
                 f"embedding dim {embeddings.shape[1]} != store dim {self.dim}; "
                 "reindex with the matching embedding model"
             )
+        total = len(ids)
+        page_starts = list(page_starts) if page_starts is not None else [None] * total
+        page_ends = list(page_ends) if page_ends is not None else [None] * total
         try:
-            for chunk_id, source, idx, content, doc_hash, vec in zip(
-                ids, sources, chunk_indexes, contents, doc_hashes, embeddings
+            for chunk_id, source, idx, content, doc_hash, vec, start, end in zip(
+                ids,
+                sources,
+                chunk_indexes,
+                contents,
+                doc_hashes,
+                embeddings,
+                page_starts,
+                page_ends,
             ):
                 cur = self.conn.execute(
-                    "INSERT OR IGNORE INTO chunks (id, source, chunk_index, content, doc_hash) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (chunk_id, source, idx, content, doc_hash),
+                    "INSERT OR IGNORE INTO chunks "
+                    "(id, source, chunk_index, content, doc_hash, page_start, page_end) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (chunk_id, source, idx, content, doc_hash, start, end),
                 )
                 if cur.rowcount == 0:
                     continue
@@ -206,7 +252,7 @@ class SQLiteVecStore(VectorStore):
 
     def _fetch(self, rowids):
         meta = self.conn.execute(
-            f"SELECT rowid, id, source, chunk_index, content FROM chunks "
+            f"SELECT rowid, id, source, chunk_index, content, page_start, page_end FROM chunks "
             f"WHERE rowid IN ({', '.join('?' for _ in rowids)})",
             rowids,
         ).fetchall()
@@ -241,6 +287,8 @@ class SQLiteVecStore(VectorStore):
                     chunk_index=row["chunk_index"],
                     content=row["content"],
                     distance=dist,
+                    page_start=row["page_start"],
+                    page_end=row["page_end"],
                 )
             )
         results.sort(key=lambda r: r.distance)
@@ -279,6 +327,8 @@ class SQLiteVecStore(VectorStore):
                     content=row["content"],
                     distance=0.0,
                     score=-raw,
+                    page_start=row["page_start"],
+                    page_end=row["page_end"],
                 )
             )
         results.sort(key=lambda r: r.score, reverse=True)
@@ -310,6 +360,8 @@ class SQLiteVecStore(VectorStore):
                 content=entry["result"].content,
                 distance=entry["result"].distance,
                 score=entry["score"],
+                page_start=entry["result"].page_start,
+                page_end=entry["result"].page_end,
             )
             for entry in ranked
         ]

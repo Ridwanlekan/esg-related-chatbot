@@ -13,7 +13,7 @@ A retrieval-augmented generation (RAG) chatbot platform where each user signs up
 - **Persistent vector index** (SQLite + sqlite-vec): embeddings are stored on disk, so startup is instant and the LLM/embedding models aren't re-run on every launch.
 - **Incremental ingestion**: unchanged documents are skipped (content-hash based); edited files are re-indexed; deleted files are pruned from the index automatically.
 - **Multi-format ingestion**: Docling parses PDF, Office, HTML, Markdown, AsciiDoc, CSV, images (OCR), audio/video (ASR), and more into clean Markdown before chunking.
-- **Metadata-aware**: each chunk tracks its source file, chunk index, and document hash, with source-filtered retrieval.
+- **Metadata-aware**: each chunk tracks its source file, chunk index, document hash, and page range, with source-filtered retrieval.
 - **Hybrid retrieval**: dense semantic search fused with lexical BM25 matches (SQLite FTS5) via reciprocal rank fusion — catches exact names and phrases the embedding model would miss.
 - **Offline retrieval**: semantic search uses a local sentence-transformer model — the OpenAI API is only called to generate the final answer.
 - **Conversational follow-ups**: follow-up questions are rewritten into standalone queries using chat history (`rewrite.py`) so turns like "which is the largest?" retrieve against the right context.
@@ -185,7 +185,7 @@ Built-in controls (all env-driven, see `doc/env_example.txt`):
 - **User auth (JWTs)**: `/chat`, `/chat/stream`, `/search`, `/sessions*`, `/me` require `Authorization: Bearer <jwt>` from signup/login. Tokens are signed with HMAC-SHA256, carry the user's category (workspace), and expire (`TOKEN_TTL_SECONDS`, default 7 days). If `AUTH_SECRET` is unset the server warns and uses an ephemeral secret (dev only).
 - **Admin API key**: set `API_KEY` to protect all `/admin*` and `/ingest*` endpoints (re-indexing, document upload/delete, workspace and user management are ops actions). If unset, the server logs a startup warning that admin endpoints are open and the workspace/user-management endpoints return 503 — do not expose it beyond localhost without a key.
 - **Per-user sessions**: chat sessions are owned by the issuer; cross-user access returns 404.
-- **Rate limiting**: per-IP sliding window on `/chat`, `/chat/stream`, `/search`, `/auth/*` (`RATE_LIMIT_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS`, default 60/60).
+- **Rate limiting**: per-caller sliding window on `/chat`, `/chat/stream`, `/search`, `/auth/*` (`RATE_LIMIT_REQUESTS` per `RATE_LIMIT_WINDOW_SECONDS`, default 60/60). Behind a TLS-terminating proxy the caller address comes from `X-Forwarded-For`, but only when the immediate peer is listed in `TRUSTED_PROXY_IPS` — otherwise every caller collapses into one shared bucket, or a client could forge its own. `run()` also passes `FORWARDED_ALLOW_IPS` to uvicorn; both are set in `deploy.yml` for Azure App Service.
 - **CORS**: `CORS_ORIGINS` restricts browser origins that can call the API (empty = same-origin only).
 - **Azure call hardening**: explicit timeouts (`AZURE_OPENAI_TIMEOUT`, default 120s) and retries (`OPENAI_MAX_RETRIES`, default 3); generation capped at `MAX_GENERATION_TOKENS`.
 - **Missing config fails fast**: startup raises a clear error if Azure credentials are absent.
@@ -270,7 +270,15 @@ esg-api                       # uvicorn on 0.0.0.0:8000
 
 Interactive docs at `http://localhost:8000/docs`.
 
-**Browser UI**: open `http://localhost:8000/ui` — a self-contained UI with signup/login (category pills are loaded live from `GET /workspaces`, so admin-created workspaces appear automatically), streaming answers, day-aware greetings, per-user session history (in `localStorage`), sources, and retrieval-only search. No CDN dependencies. Pass your browser's UTC offset to the API via `X-Timezone-Offset` automatically.
+**Browser UI**: open `http://localhost:8000/ui` — a self-contained UI with signup/login (category pills are loaded live from `GET /workspaces`, so admin-created workspaces appear automatically), streaming answers, day-aware greetings, per-user session history (in `localStorage`), clickable source citations, and retrieval-only search. No CDN dependencies. Pass your browser's UTC offset to the API via `X-Timezone-Offset` automatically.
+
+**Verifiable citations**: every answer carries its sources as objects — `{source, url, chunk_id, chunk_index, similarity, page_start, page_end}` — and each one opens the actual file from `GET /documents/download`. The reference is re-resolved server-side strictly inside the caller's own workspace (or the shared store), so a citation can never surface another department's document. Downloads are audit-logged, and citations are stored with the turn, so reloading a past session stays verifiable.
+
+**Page-level citations**: chunks are cut per page, so each one records the page it was printed on and a citation reads "policy.pdf · p. 42". The link's `#page=42` fragment opens the PDF in the browser's viewer at exactly that page. PDFs, plain text and images are served `inline` so the fragment means something; HTML, SVG, XML and office formats stay `attachment` with `nosniff`, because an inline corporate HTML file on this origin would be stored XSS. Sources without pagination (`.txt`, `.docx`) carry no page rather than an invented one. When several chunks of one document are cited, the chip names the pages they actually rest on — "pp. 7–9, 11, 20" — rather than collapsing them into a span like "pp. 7–20", which reads as a contiguous claim of 14 pages where retrieval found five.
+
+**Links you can open natively**: a citation href carries a short-lived download capability — HMAC-signed with `AUTH_SECRET`, scoped to one document, expiring after `DOWNLOAD_TOKEN_TTL_SECONDS` (default 1 hour) — instead of the session token. Browser navigations never send an `Authorization` header, so this is what makes cmd-click, middle-click, "open in new tab" and "copy link address" work. It is deliberately not the session token: a leaked link exposes one document, not a login. Entitlement is re-checked against the live user record at redemption, so deleting or moving a user invalidates links already in their history, and rotating `AUTH_SECRET` revokes all of them. A plain left-click re-mints the link first via `POST /documents/link`, so a long-open tab never hands out an expired one.
+
+What that capability does **not** protect against, since it is a bearer secret in a URL: the browser address bar and history (and any history sync provider), screenshots, copy-paste, and the access log of any proxy in front of the app. This app logs only the route path, never the query string, and serves the file with `Referrer-Policy: no-referrer` so a link clicked inside a PDF cannot leak it onward — but a reverse proxy that logs full request lines will capture the token, and App Service does by default. The one-hour expiry and the one-document scope are what bound that exposure. There is no per-link revocation: the levers are the TTL, moving or deleting the user, or rotating `AUTH_SECRET`, which signs every session and every other citation link out at the same time. Keeping the secret out of the URL entirely needs a service worker that injects the header, which was considered and rejected as disproportionate for this stack.
 
 **Admin UI**: open `http://localhost:8000/admin` — a full admin console with four tabs, protected by the `API_KEY` (entered once in the page, stored in `localStorage`, sent as `Authorization: Bearer <API_KEY>`):
 
@@ -289,6 +297,8 @@ Interactive docs at `http://localhost:8000/docs`.
 | `POST /chat`        | user   | ask in your workspace; small talk returns day-aware greetings     |
 | `POST /chat/stream` | user   | same, streaming SSE (`data: {"delta": "text"}`, trailing `{"sources": [...]}` event) |
 | `POST /search`      | user   | retrieval only — no LLM call (scoped to your workspace)          |
+| `POST /documents/link` | user | mint a fresh citation link for a document you can already open |
+| `GET /documents/download?source=` | user | open a cited source document, scoped to your workspace (audit-logged); accepts a session token or a signed `token=` from a citation link |
 | `GET /admin`        | public | admin console HTML page                                          |
 | `GET /admin/status` | admin  | index status + totals (workspaces/chunks/users/sessions)         |
 | `GET /admin/workspaces` | admin | list workspaces with built-in/custom type                    |
