@@ -42,7 +42,9 @@ jobs:
               --settings WEBSITES_PORT=8000 WEBSITES_ENABLE_APP_SERVICE_STORAGE=true \
                 INDEX_DIR=/home/esg-index \
                 DATA_DIR=/home/esg-data \
-                DOCLING_VET_DIR=/home/esg-docling-vet
+                DOCLING_VET_DIR=/home/esg-docling-vet \
+                'FORWARDED_ALLOW_IPS=*' \
+                'TRUSTED_PROXY_IPS=*'
 
       - name: Deploy container
         uses: azure/webapps-deploy@v3

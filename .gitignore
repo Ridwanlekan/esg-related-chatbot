@@ -7,6 +7,12 @@
 doc/solution-workflow.txt
 followup_questions.txt
 
+# Commercial proposals and pricing models: client name, tier prices, margin and
+# cost basis. This is a public repo, so these are never tracked. Kept local
+# and shared by hand.
+doc/*proposal*.md
+doc/*pricing*.md
+
 # Python
 __pycache__/
 *.py[cod]
@@ -44,15 +50,37 @@ models/
 data/*
 !data/demo/
 
-# Exported/pitch slide artifacts (generated PPTX/PDF/HTML exports and assets)
+# Generated exports and slide artifacts
 ppt/
 
-# Pitch deck deliverables (generated exports + working .md source of truth)
-ESG Workspace Chatbot.docx
-ESG Workspace Chatbot.pdf
-esg_chatbot_pitch_deck.md
-esg_chatbot_features.md
-esg_chatbot_transcript.md
+# Deliverables produced in the working tree: pitch docs, invoices, quotes,
+# contracts. Scoped to the repository root with a leading slash on purpose — a
+# bare *.html or *.md would also swallow src/chatbot/static/*.html and
+# doc/env_example.txt, which are source and must stay tracked. Anything dropped
+# loose in the root is a deliverable by definition; deliverables belong under
+# ppt/ or client/ instead.
+/*.docx
+/*.pdf
+/*.pptx
+/*.xlsx
+/*.html
+/*.md
+/*.csv
+/*.eml
+/*.pages
+/*.numbers
+!/README.md
+
+# Commercial and client material, and third-party briefs: never in this repo.
+# Holds real contact details, bank references and pricing, so whole directories
+# are ignored rather than relying on the file types above. Third-party challenge
+# and brief directories are matched by shape instead of by client name, so that
+# this public repo does not publish who the clients are.
+/client/
+/invoices/
+*-coding-challenge/
+*-coding-test/
+__MACOSX/
 
 # Scratch / prototyping files (local experiments, not wired into src/)
 rag copy.py

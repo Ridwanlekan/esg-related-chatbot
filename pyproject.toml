@@ -29,6 +29,19 @@ dev = ["pytest"]
 ingest = ["docling==2.129.0"]
 # Adds audio/video transcription (Whisper). Also needs the ffmpeg binary.
 ingest-asr = ["docling[asr]==2.129.0"]
+# Voice mode: on-device STT and TTS. Cloud STT/TTS need nothing extra, since
+# they reuse the openai client already required by the base install.
+# faster-whisper pulls in PyAV, which bundles the ffmpeg libraries, so no ffmpeg
+# binary or system package is needed.
+# av<19 is load-bearing: faster-whisper's audio.decode_audio() calls
+# av.open(..., metadata_errors="ignore"), and PyAV 19 dropped that keyword, so
+# an unpinned PyAV fails at transcribe time with "open() got an unexpected
+# keyword argument 'metadata_errors'". Drop the ceiling once faster-whisper
+# ships a fix.
+# kokoro-onnx (not the reference `kokoro` package) because that one requires
+# Python <3.13 and we pin 3.13. It also needs no torch. espeak-ng arrives as a
+# wheel via espeakng-loader, so there is no system package to install.
+voice = ["faster-whisper>=1.0.0", "av<19", "kokoro-onnx>=0.6.0", "soundfile>=0.13"]
 
 [project.scripts]
 esg-chatbot = "chatbot.cli:main"

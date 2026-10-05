@@ -41,11 +41,38 @@
   .msg { max-width: 78%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-wrap: break-word; }
   .msg.user { align-self: flex-end; background: var(--accent-2); color: #062033; }
   .msg.bot { align-self: flex-start; background: var(--panel-2); border: 1px solid var(--border); }
-  .msg .sources { margin-top: 8px; font-size: 11px; color: var(--muted); }
-  .msg .sources span { margin-right: 8px; }
+  .msg .sources { margin-top: 8px; font-size: 11px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .msg .sources .label { opacity: .8; }
+  .msg .sources a, #search-results .hit a {
+    color: var(--accent); text-decoration: none; border: 1px solid var(--border);
+    border-radius: 999px; padding: 2px 9px; cursor: pointer; background: var(--panel);
+  }
+  .msg .sources a:hover, #search-results .hit a:hover { border-color: var(--accent); text-decoration: underline; }
+  .msg .sources a .sim { opacity: .7; margin-left: 5px; }
+  .msg .sources a .page {
+    opacity: .8; margin-left: 5px; padding-left: 5px;
+    border-left: 1px solid var(--border);
+  }
   .cursor::after { content: "▌"; animation: blink 1s steps(1) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
+  @keyframes micpulse { 50% { opacity: .55; } }
   #composer { display: flex; gap: 10px; padding: 14px 20px; border-top: 1px solid var(--border); }
+  #voice-notice {
+    padding: 6px 20px 0; font-size: 12px; color: #fbbf24; min-height: 18px;
+  }
+  #mic { min-width: 42px; font-size: 15px; }
+  #voice-auto { min-width: 42px; font-size: 15px; }
+  #voice-auto.off { opacity: .4; }
+  #mic.recording {
+    background: #7f1d1d; border-color: #f87171; color: #fecaca;
+    animation: micpulse 1.2s ease-in-out infinite;
+  }
+  .msg .speaker {
+    float: right; margin: -2px 0 2px 10px; padding: 1px 7px; font-size: 13px;
+    line-height: 1.6; background: transparent; color: var(--muted);
+  }
+  .msg .speaker:hover { color: var(--text); border-color: var(--accent); }
+  .msg .speaker.playing { color: var(--accent); border-color: var(--accent); }
   #input {
     flex: 1; resize: none; background: var(--panel); color: var(--text);
     border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px;
@@ -151,8 +178,11 @@
 <main>
   <section id="chat">
     <div id="messages"></div>
+    <div id="voice-notice"></div>
     <div id="composer">
       <textarea id="input" rows="1" placeholder="Ask about your workspace documents…"></textarea>
+      <button id="voice-auto" title="Read answers aloud">🔊</button>
+      <button id="mic" title="Speak your question">🎤</button>
       <button id="send">Send</button>
     </div>
   </section>
@@ -330,6 +360,8 @@ function welcome() {
 }
 
 function logout() {
+  stopSpeaking();
+  if (voice.state === "listening") { releaseMic(); setVoiceState("idle"); }
   token = null; me = null; sessionId = null;
   localStorage.removeItem(TOKEN_KEY);
   setSession(null); clearMessages();
@@ -349,14 +381,191 @@ function addMsg(role, text) {
   return div;
 }
 
+function citationUrl(ref) {
+  // Older/partial payloads can still be a bare filename; keep the chip working
+  // as plain text rather than rendering a link that cannot resolve.
+  return typeof ref === "string" ? "" : (ref.url || "");
+}
+
+// The chip is a real link and is left alone. Every href already carries a
+// single-document download capability, so cmd-click, middle-click, right-click
+// and "open in new tab" all work the way the reader expects, and a PDF opens in
+// the browser's viewer on the cited page.
+function citationLink(source, pageStart) {
+  let url = "/documents/download?source=" + encodeURIComponent(source);
+  if (typeof pageStart === "number" && pageStart > 0) url += "#page=" + pageStart;
+  return url;
+}
+
+// Only a plain left-click is intercepted, to renew the link before following it:
+// an hour-old transcript would otherwise hand the reader an expired capability.
+// Modified clicks are left to the browser, which is what makes them native.
+async function openCitation(source, pageStart, e) {
+  e.preventDefault();
+  try {
+    const res = await fetch("/documents/link", {
+      method: "POST",
+      headers: Object.assign({ "content-type": "application/json" }, authHeaders()),
+      body: JSON.stringify({ source: source, page_start: pageStart || null }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      alert(body.detail || "Could not open that document (" + res.status + ")");
+      return;
+    }
+    const body = await res.json();
+    window.location.assign(body.url || citationLink(source, pageStart));
+  } catch (err) {
+    alert("Could not open that document: " + err.message);
+  }
+}
+
+// Render the pages a citation actually rests on. Retrieval picks chunks from
+// scattered pages, so collapsing them to "pp. 7-39" claims 33 pages of evidence
+// where there are five — and a span written as a range reads as a claim about the
+// document rather than a pointer into it. Runs of consecutive pages are still
+// compressed, and a long list is abbreviated, because the label sits in a chip.
+function pageLabel(pageStart, pageEnd, pageList) {
+  if (Array.isArray(pageList) && pageList.length) {
+    const pages = pageList.slice().sort((a, b) => a - b);
+    const runs = [];
+    for (const page of pages) {
+      const last = runs[runs.length - 1];
+      if (last && page === last[1] + 1) last[1] = page;
+      else runs.push([page, page]);
+    }
+    const run = (r) => (r[0] === r[1] ? String(r[0]) : r[0] + "–" + r[1]);
+    if (runs.length === 1) {
+      return runs[0][0] === runs[0][1] ? "p. " + runs[0][0] : "pp. " + run(runs[0]);
+    }
+    // The cap sits above what real retrieval produces (five or six pages on the
+    // IFRS corpus), because abbreviating the common case would hide exactly the
+    // pages this label exists to name. Past the cap the chip would crowd out the
+    // source name, so the head and tail carry the claim and the count keeps it
+    // honest about what was left out.
+    if (runs.length <= 6) return "pp. " + runs.map(run).join(", ");
+    return (
+      "pp. " + run(runs[0]) + ", " + run(runs[1]) + " … " + run(runs[runs.length - 1]) +
+      " (" + pages.length + " pages)"
+    );
+  }
+  if (typeof pageStart !== "number" || pageStart < 1) return "";
+  if (typeof pageEnd === "number" && pageEnd > pageStart) return "pp. " + pageStart + "–" + pageEnd;
+  return "p. " + pageStart;
+}
+
+function citationChip(ref) {
+  const chip = document.createElement("a");
+  const url = citationUrl(ref);
+  const source = typeof ref === "string" ? ref : ref.source;
+  const pageStart = typeof ref === "string" ? null : ref.page_start;
+  const pageEnd = typeof ref === "string" ? null : ref.page_end;
+  const pages = pageLabel(pageStart, pageEnd, typeof ref === "string" ? null : ref.page_list);
+  if (url || pageStart) {
+    // Fall back to a locally built link when the payload predates signed URLs,
+    // so an older stored session still resolves to something clickable.
+    chip.href = url || citationLink(source, pageStart);
+    // The number is a retrieval score, not a correctness percentage. Say so, so
+    // it cannot be read aloud in a pitch as "95% confident".
+    const bits = ["Open the source document"];
+    if (pages) bits.push(pages);
+    if (typeof ref !== "string" && typeof ref.similarity === "number") {
+      bits.push("retrieval similarity " + ref.similarity.toFixed(2));
+    }
+    chip.title = bits.join(" · ");
+    chip.textContent = source;
+    if (typeof ref !== "string" && typeof ref.similarity === "number") {
+      const sim = document.createElement("span");
+      sim.className = "sim";
+      sim.textContent = ref.similarity.toFixed(2);
+      chip.appendChild(sim);
+    }
+    if (pages) {
+      const page = document.createElement("span");
+      page.className = "page";
+      page.textContent = pages;
+      chip.appendChild(page);
+    }
+    chip.onclick = (e) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+      openCitation(source, pageStart, e);
+    };
+  } else {
+    chip.textContent = source;
+  }
+  return chip;
+}
+
+function pageSet(ref) {
+  const pages = new Set();
+  for (const page of [ref.page_start, ref.page_end]) {
+    if (typeof page === "number" && page > 0) pages.add(page);
+  }
+  return pages;
+}
+
+// Re-point a citation URL at a page without re-minting it. The fragment is
+// resolved by the browser alone: it never reaches the server and is not part of
+// the signed capability, so editing it cannot widen what the link grants.
+function withPageFragment(url, page) {
+  if (typeof page !== "number" || page <= 0) return url;
+  return String(url).split("#")[0] + "#page=" + page;
+}
+
 function addSources(botEl, sources) {
-  const seen = [...new Set(sources)];
+  // One chip per document, not per chunk: several retrieved chunks commonly
+  // come from the same file and three links to one PDF is noise, not evidence.
+  // Pages are merged instead of dropped, because which pages an answer leaned on
+  // is the part a reader wants to see before opening the file.
+  const bySource = new Map();
+  for (const ref of sources || []) {
+    const key = typeof ref === "string" ? ref : ref.source;
+    const existing = bySource.get(key);
+    if (!existing) {
+      // Seed with this ref's own pages. Leaving the first one out made the label
+      // depend on retrieval order: pages 5 then 10 merged to "p. 10", hiding the
+      // page the answer actually opened on.
+      bySource.set(key, {
+        ref: ref,
+        pages: typeof ref === "string" ? new Set() : pageSet(ref),
+        chunks: 1,
+      });
+      continue;
+    }
+    if (typeof ref === "string" || typeof existing.ref === "string") continue;
+    existing.chunks += 1;
+    for (const page of pageSet(ref)) existing.pages.add(page);
+  }
+  const chips = [];
+  for (const entry of bySource.values()) {
+    let ref = entry.ref;
+    if (entry.pages.size && typeof ref === "object") {
+      const pages = Array.from(entry.pages).sort((a, b) => a - b);
+      const start = pages[0];
+      ref = Object.assign({}, ref, {
+        page_start: start,
+        page_end: pages[pages.length - 1],
+        // A modified click goes straight to the browser with this href, so the
+        // fragment has to agree with the range on the label.
+        url: withPageFragment(ref.url, start),
+        // Only a real merge carries an explicit page list. A single chunk's
+        // page_start/page_end may legitimately span several pages, and that span
+        // is contiguous by construction, so it must keep rendering as a range.
+        page_list: entry.chunks > 1 ? pages : null,
+      });
+    }
+    chips.push(citationChip(ref));
+  }
   const prev = botEl.querySelector(".sources");
   if (prev) prev.remove();
-  if (!seen.length) return;
+  if (!chips.length) return;
   const s = document.createElement("div");
   s.className = "sources";
-  s.textContent = "sources: " + seen.join(" · ");
+  const label = document.createElement("span");
+  label.className = "label";
+  label.textContent = "Sources:";
+  s.appendChild(label);
+  for (const chip of chips) s.appendChild(chip);
   botEl.appendChild(s);
 }
 
@@ -378,8 +587,11 @@ async function loadMessages(id) {
   const data = await res.json();
   if (!data.messages || !data.messages.length) { renderWelcomeMsg(); return; }
   for (const m of data.messages) {
-    if (m.role === "user") addMsg("user", m.content);
-    else addMsg("bot", m.content);
+    if (m.role === "user") { addMsg("user", m.content); continue; }
+    const el = addMsg("bot", m.content);
+    // Citations are stored with the turn, so a reloaded session is still
+    // verifiable rather than degrading to an unbacked answer.
+    if (m.sources && m.sources.length) addSources(el, m.sources);
   }
 }
 
@@ -494,6 +706,11 @@ async function send() {
     if (remaining) body.textContent += remaining;
     if (sources.length) addSources(bot, sources);
     if (body.textContent === "thinking…") body.textContent = "(no response)";
+    const answer = body.textContent;
+    if (answer && answer !== "(no response)") {
+      const speaker = addSpeaker(bot, answer);
+      if (voice.autoSpeak && speaker) speak(answer, speaker);
+    }
   } catch (e) {
     bot.classList.remove("cursor");
     body.textContent = "Error: " + e.message;
@@ -501,9 +718,304 @@ async function send() {
     if (timer) cancelAnimationFrame(timer);
     streaming = false;
     $("send").disabled = false;
+    if (voice.state === "idle") $("mic").disabled = false;
     sessionOffset = 0;
     renderSessions();
   }
+}
+
+// ---------------------------------------------------------------- voice mode
+// STT: mic press starts a MediaRecorder, second press stops it, the blob goes
+// to /voice/stt and the transcript lands in the composer for review. TTS:
+// answers are spoken back and every bot message gets a replay button.
+//
+// One state machine, one owner. voice.state is the only thing that decides
+// what the mic does, so a slow transcription can never be started twice and the
+// button always reflects reality.
+const VOICE_MAX_SECONDS = 60;      // server also caps upload size
+const VOICE_MAX_SPEECH_CHARS = 1500; // answers run long; read the opening part
+const VOICE_AUTOSPEAK_KEY = "voice_autospeak";
+
+const voice = {
+  state: "idle",      // idle | listening | transcribing | speaking
+  recorder: null,
+  stream: null,
+  chunks: [],
+  startedAt: 0,
+  timer: null,
+  audio: null,
+  audioUrl: null,
+  autoSpeak: localStorage.getItem(VOICE_AUTOSPEAK_KEY) !== "off",
+};
+
+// Safari only lets audio play after a gesture, and the TTS response arrives
+// long after the click that started it. Unlocking inside the click is the
+// difference between "just works" and a dead speaker button.
+function primeAudioPlayback() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const buffer = ctx.createBuffer(1, 1, 22050);
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(ctx.destination);
+    src.start(0);
+    if (ctx.state === "suspended") ctx.resume();
+  } catch (e) { /* playback stays gesture-gated; speak() falls back to a tap */ }
+}
+
+// Browsers disagree on the container they can record: Chrome/Firefox give
+// webm/opus, Safari gives mp4/aac. Ask for something this browser supports
+// rather than assuming, and let it pick when we do not care.
+function pickRecorderMime() {
+  if (typeof MediaRecorder === "undefined") return "";
+  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus", "audio/ogg"];
+  return candidates.find((t) => MediaRecorder.isTypeSupported(t)) || "";
+}
+
+function extForMime(mime) {
+  if (!mime) return "webm";
+  if (mime.includes("mp4")) return "mp4";
+  if (mime.includes("ogg")) return "ogg";
+  return "webm";
+}
+
+function voiceNotice(text) { $("voice-notice").textContent = text || ""; }
+
+function setVoiceState(next) {
+  voice.state = next;
+  const mic = $("mic");
+  mic.classList.toggle("recording", next === "listening");
+  mic.disabled = next === "transcribing" || streaming;
+  mic.textContent = next === "listening" ? "■" : "🎤";
+  mic.title = next === "listening" ? "Stop recording" : "Speak your question";
+  if (voice.timer) {
+    clearTimeout(voice.timer);
+    voice.timer = null;
+  }
+  if (next === "idle") voice.timer = null;
+  // The notice line is NOT cleared here: every failure path sets a message and
+  // then returns to idle, and clearing on idle would erase the explanation the
+  // user needs. Callers clear it when starting a fresh attempt instead.
+}
+
+// Stop the capture hardware without discarding what was recorded. Split from
+// releaseMic on purpose: MediaRecorder delivers its final dataavailable and stop
+// events asynchronously, after the caller has returned.
+function stopTracks() {
+  if (voice.stream) {
+    voice.stream.getTracks().forEach((t) => t.stop());
+    voice.stream = null;
+  }
+}
+
+// Hard teardown, for aborts and logout: whatever was recorded is not wanted.
+function releaseMic() {
+  stopTracks();
+  if (voice.recorder && voice.recorder.state !== "inactive") {
+    try { voice.recorder.stop(); } catch (e) { /* already stopped */ }
+  }
+  voice.recorder = null;
+  voice.chunks = [];
+}
+
+// Permission prompts and unsupported browsers both land here; the message is
+// the whole error UX, so it has to say what to do next.
+function voiceError(err) {
+  const name = err && err.name;
+  if (name === "NotAllowedError" || name === "SecurityError") {
+    voiceNotice("Microphone permission denied. Allow it in your browser's site settings, or just type your question.");
+  } else if (name === "NotFoundError") {
+    voiceNotice("No microphone found. Type your question instead.");
+  } else if (!window.isSecureContext) {
+    voiceNotice("Microphone needs a secure connection (HTTPS or localhost).");
+  } else {
+    voiceNotice("Microphone unavailable: " + (err && err.message ? err.message : err));
+  }
+  setVoiceState("idle");
+}
+
+async function startRecording() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || typeof MediaRecorder === "undefined") {
+    voiceNotice("This browser cannot record audio. Type your question instead.");
+    return;
+  }
+  try {
+    voice.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) { voiceError(e); return; }
+
+  const mimeType = pickRecorderMime();
+  try {
+    voice.recorder = mimeType ? new MediaRecorder(voice.stream, { mimeType }) : new MediaRecorder(voice.stream);
+  } catch (e) { releaseMic(); voiceError(e); return; }
+
+  voice.chunks = [];
+  voice.recorder.ondataavailable = (ev) => { if (ev.data && ev.data.size) voice.chunks.push(ev.data); };
+  voice.recorder.onstop = () => {
+    // Read the chunks before clearing them, then let go.
+    const blob = new Blob(voice.chunks, { type: mimeType || "audio/webm" });
+    voice.recorder = null;
+    voice.chunks = [];
+    transcribe(blob);
+  };
+  voice.recorder.start();
+  voice.startedAt = Date.now();
+  setVoiceState("listening");
+  voiceNotice("Listening… press again to send (up to " + VOICE_MAX_SECONDS + "s).");
+  // Hard stop, so a forgotten second tap cannot record forever or bill forever.
+  voice.timer = setTimeout(() => { if (voice.state === "listening") stopRecording(); }, VOICE_MAX_SECONDS * 1000);
+}
+
+function stopRecording() {
+  if (voice.state !== "listening" || !voice.recorder) return;
+  setVoiceState("transcribing");
+  voiceNotice("Transcribing…");
+  // Ask the recorder to finish, then release the microphone straight away so
+  // the browser shows recording as stopped. The recorder and its chunks stay
+  // put until onstop fires: those events arrive asynchronously, and clearing
+  // them here would hand the provider an empty blob.
+  if (voice.recorder.state !== "inactive") {
+    try { voice.recorder.stop(); } catch (e) { /* already stopped */ }
+  }
+  stopTracks();
+}
+
+async function transcribe(blob) {
+  if (!blob || !blob.size) { voiceNotice("Nothing was recorded. Try again."); setVoiceState("idle"); return; }
+  const ext = extForMime(blob.type);
+  const form = new FormData();
+  form.append("file", blob, "speech." + ext);
+  try {
+    const res = await api("/voice/stt", { method: "POST", headers: authHeaders(), body: form, auth: true });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      voiceNotice("Transcription failed: " + (data.detail || res.status));
+      setVoiceState("idle");
+      return;
+    }
+    const data = await res.json();
+    const text = (data.text || "").trim();
+    if (!text) { voiceNotice("Didn't catch that. Try again, or type your question."); setVoiceState("idle"); return; }
+    // Land in the composer rather than sending it: a misheard word should be
+    // cheap to fix, not an expensive wrong query against the workspace.
+    $("input").value = text;
+    $("input").focus();
+    $("input").setSelectionRange(text.length, text.length);
+    voiceNotice("Transcript ready — edit if needed, then press Send.");
+    setVoiceState("idle");
+  } catch (e) {
+    voiceNotice("Transcription failed: " + e.message);
+    setVoiceState("idle");
+  }
+}
+
+// Page references are rendered as separate chips, but defensively drop any
+// inline citation markup: "see p. 12" is noise when spoken aloud.
+function speechText(text) {
+  return (text || "")
+    .replace(/\s*\[[^\]]{0,40}\]/g, " ")
+    .replace(/\s*\((?:p{1,2}\.|pages?)\s*[^)]{0,20}\)/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stopSpeaking() {
+  if (voice.audio) {
+    voice.audio.pause();
+    voice.audio.currentTime = 0;
+    voice.audio = null;
+  }
+  if (voice.audioUrl) { URL.revokeObjectURL(voice.audioUrl); voice.audioUrl = null; }
+  document.querySelectorAll(".msg .speaker.playing").forEach((b) => {
+    b.classList.remove("playing");
+    b.textContent = "▶";
+    b.title = "Read this answer aloud";
+  });
+  if (voice.state === "speaking") setVoiceState("idle");
+}
+
+async function speak(text, btn) {
+  const clean = speechText(text).slice(0, VOICE_MAX_SPEECH_CHARS);
+  if (!clean) return;
+  stopSpeaking();
+  setVoiceState("speaking");
+  try {
+    const res = await api("/voice/tts", {
+      method: "POST",
+      headers: authHeaders(true),
+      body: JSON.stringify({ text: clean }),
+      auth: true,
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      voiceNotice("Speech unavailable: " + (data.detail || res.status));
+      setVoiceState("idle");
+      return;
+    }
+    const blob = await res.blob();
+    voice.audioUrl = URL.createObjectURL(blob);
+    const audio = new Audio(voice.audioUrl);
+    voice.audio = audio;
+    if (btn) { btn.classList.add("playing"); btn.textContent = "■"; btn.title = "Stop"; }
+    audio.onended = () => stopSpeaking();
+    audio.onerror = () => { voiceNotice("Could not play the audio."); stopSpeaking(); };
+    try {
+      await audio.play();
+    } catch (e) {
+      // Autoplay policy still refused: leave the replay button as the way in.
+      voiceNotice("Tap ▶ on the answer to hear it.");
+      stopSpeaking();
+    }
+  } catch (e) {
+    voiceNotice("Speech unavailable: " + e.message);
+    setVoiceState("idle");
+  }
+}
+
+// One replay button per bot answer. Clicking while it plays stops playback, so
+// the control is its own off switch.
+function addSpeaker(msgEl, text) {
+  if (!msgEl || !text || !text.trim()) return null;
+  const btn = document.createElement("button");
+  btn.className = "speaker";
+  btn.textContent = "▶";
+  btn.title = "Read this answer aloud";
+  btn.setAttribute("aria-label", "Read this answer aloud");
+  btn.onclick = (e) => {
+    e.stopPropagation();
+    if (voice.state === "speaking") { stopSpeaking(); return; }
+    speak(text, btn);
+  };
+  msgEl.appendChild(btn);
+  return btn;
+}
+
+function toggleAutoSpeak() {
+  voice.autoSpeak = !voice.autoSpeak;
+  localStorage.setItem(VOICE_AUTOSPEAK_KEY, voice.autoSpeak ? "on" : "off");
+  syncAutoSpeakButton();
+  voiceNotice(voice.autoSpeak ? "Answers will be read aloud." : "Answers stay on screen only.");
+  if (!voice.autoSpeak) stopSpeaking();
+  setVoiceState("idle");
+}
+
+function syncAutoSpeakButton() {
+  const b = $("voice-auto");
+  b.classList.toggle("off", !voice.autoSpeak);
+  b.textContent = voice.autoSpeak ? "🔊" : "🔇";
+  b.title = voice.autoSpeak ? "Answers are read aloud" : "Answers stay on screen only";
+  b.setAttribute("aria-pressed", String(voice.autoSpeak));
+}
+syncAutoSpeakButton();
+
+async function onMicClick() {
+  if (voice.state === "speaking") { stopSpeaking(); return; }
+  if (voice.state === "listening") { stopRecording(); return; }
+  if (voice.state === "transcribing" || streaming) return;
+  voiceNotice("");  // drop a stale message from a previous attempt
+  primeAudioPlayback();
+  await startRecording();
 }
 
 async function doSearch() {
@@ -521,22 +1033,35 @@ async function doSearch() {
     div.className = "hit";
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.textContent = `${hit.source} #${hit.chunk_index} · sim ${hit.similarity}`;
+    const pages = pageLabel(hit.page_start, hit.page_end);
+    meta.textContent = `${hit.source} #${hit.chunk_index}`
+      + (pages ? ` · ${pages}` : "")
+      + ` · sim ${hit.similarity}`;
+    const link = document.createElement("a");
+    link.textContent = "open document";
+    link.title = "Open the source document";
+    link.href = citationLink(hit.source, hit.page_start);
+    link.onclick = (e) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+      openCitation(hit.source, hit.page_start, e);
+    };
     const txt = document.createElement("div");
     txt.textContent = hit.content.slice(0, 220);
-    div.appendChild(meta); div.appendChild(txt);
+    div.appendChild(meta); div.appendChild(link); div.appendChild(txt);
     box.appendChild(div);
   }
 }
 
 $("send").addEventListener("click", send);
+$("mic").addEventListener("click", onMicClick);
+$("voice-auto").addEventListener("click", toggleAutoSpeak);
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
 $("search-btn").addEventListener("click", doSearch);
 $("search-q").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
 $("load-more").addEventListener("click", () => { sessionOffset += SESSION_PAGE; renderSessions(); });
-$("new-session").addEventListener("click", () => { setSession(null); clearMessages(); renderWelcomeMsg(); });
+$("new-session").addEventListener("click", () => { stopSpeaking(); setSession(null); clearMessages(); renderWelcomeMsg(); });
 $("logout").addEventListener("click", logout);
 $("tab-login").addEventListener("click", () => setActiveTab("login"));
 $("tab-signup").addEventListener("click", () => setActiveTab("signup"));

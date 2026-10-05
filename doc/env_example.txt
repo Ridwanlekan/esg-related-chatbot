@@ -9,6 +9,10 @@ TOKENIZERS_PARALLELISM = False
 # DATA_DIR = <project>/data        # root folder holding one subfolder per workspace
 # AUTH_SECRET = ""                 # JWT signing secret (required in prod; ephemeral if unset)
 # TOKEN_TTL_SECONDS = 604800       # session token lifetime (default 7 days)
+# DOWNLOAD_TOKEN_TTL_SECONDS = 3600 # citation link lifetime (default 1 hour, clamped to 60..86400).
+#                                 # Citation links carry a capability for one document rather than the
+#                                 # session, so a native new-tab navigation can open them; rotating
+#                                 # AUTH_SECRET revokes every issued link.
 # USERS_DB = <index>/users.sqlite3 # where accounts live (default: .index/users.sqlite3)
 
 # --- Admin / operations -------------------------------------------------------
@@ -24,6 +28,16 @@ TOKENIZERS_PARALLELISM = False
 # CORS_ORIGINS = ""               # comma-separated allowed browser origins (empty = no cross-origin access)
 # RATE_LIMIT_REQUESTS = 60        # max requests per window per IP
 # RATE_LIMIT_WINDOW_SECONDS = 60
+# --- Reverse proxy -----------------------------------------------------------
+# TLS is terminated in front of the app in every real deployment, so without these the
+# rate limiter sees the proxy address for every caller and one global bucket is shared by
+# all users. FORWARDED_ALLOW_IPS is read by uvicorn (peers whose X-Forwarded-For it
+# applies); TRUSTED_PROXY_IPS is the app-level fallback in security.client_ip and only
+# affects rate-limit keying. Set both to * on Azure App Service, where the platform front
+# end is the only thing that can reach the container. Never set them to * on a port that
+# the public Internet can reach directly, or any client can forge its own bucket.
+# FORWARDED_ALLOW_IPS = 127.0.0.1
+# TRUSTED_PROXY_IPS = ""
 # AZURE_OPENAI_TIMEOUT = 120      # seconds per Azure call
 # OPENAI_MAX_RETRIES = 3
 # MAX_GENERATION_TOKENS = 600     # answer length cap (bounds latency + cost)
@@ -34,6 +48,54 @@ TOKENIZERS_PARALLELISM = False
 # MAX_RETAINED_SESSIONS = 500     # chat sessions kept (oldest auto-pruned)
 # DOCLING_ENABLED = 1             # 0 disables Docling (plain-text only)
 # DOCLING_OCR = 1                 # 0 disables OCR for scanned PDFs/images
+
+# --- Voice mode (STT + TTS) ----------------------------------------------------
+# The mic button sits next to the chat input. First press records, second press
+# stops and transcribes into the composer; answers are then read back aloud.
+# Requires HTTPS (or localhost) or the browser blocks getUserMedia.
+#
+# Both voice providers default to "local": STT via faster-whisper, TTS via
+# Kokoro. Neither needs an Azure deployment, which is why this works out of the
+# box; "openai" moves either one onto the Azure OpenAI endpoint above and then
+# needs a deployment provisioned there.
+#
+# VOICE_STT_PROVIDER = "local"     # "local" = faster-whisper on this machine
+#                                 # "openai" = Whisper API on the Azure OpenAI
+#                                 #   endpoint above (no extra dependency)
+# VOICE_STT_MODEL = "small"        # local only: tiny/base/small/medium/large
+# VOICE_TTS_PROVIDER = "kokoro"    # "kokoro" = local Kokoro v1.0 (WAV out)
+#                                 # "openai" = Azure speech endpoint (mp3 out)
+# VOICE_TTS_VOICE = "af_heart"     # kokoro: af_* am_* bf_* bm_* (54 voices).
+#                                 #   openai: alloy | nova | onyx | shimmer
+# VOICE_TTS_MODEL = "gpt-4o-mini-tts"   # openai only: deployment name
+# VOICE_TTS_MODEL_PATH = "models/tts/kokoro-v1.0.onnx"   # kokoro only
+# VOICE_TTS_VOICES_PATH = "models/tts/voices-v1.0.bin"    # kokoro only
+# VOICE_TTS_LANG = "en-gb"         # kokoro G2P language: en-us | en-gb | ...
+# VOICE_TTS_SPEED = "1.0"          # kokoro playback rate
+# VOICE_MAX_UPLOAD_MB = 5          # hard cap on an uploaded recording
+# VOICE_TTS_MAX_CHARS = 4000       # cap on characters sent to TTS
+# VOICE_STT_PRICE_PER_MIN = 0.006  # $/audio-minute, for the usage dashboard only
+# VOICE_TTS_PRICE_PER_M = 0.60     # $/1M characters, ditto. Local TTS costs
+#                                 #   nothing per request; set to 0 to see that.
+#
+# Both "local" providers need the extra: pip install 'esg-chatbot[voice]'.
+# No ffmpeg binary and no espeak-ng system package are required — faster-whisper
+# decodes through PyAV (which bundles ffmpeg) and Kokoro gets espeak-ng as a
+# wheel via espeakng-loader. Without the extra, /voice/stt and /voice/tts return
+# 503 with that message and the mic degrades to typing — the rest of the app is
+# unaffected.
+#
+# Weights: the faster-whisper "small" model (~484 MB) downloads from HuggingFace
+# on first use. Kokoro does not — its ~350 MB of weights are baked into the
+# container image by the Dockerfile, and locally you fetch them once with
+#   curl -L -o models/tts/kokoro-v1.0.onnx \
+#     https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
+#   curl -L -o models/tts/voices-v1.0.bin \
+#     https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+#
+# Note: audio is held in memory for the length of the request and never written
+# to disk or logged. Local STT passes the clip through a temp file because
+# faster-whisper needs a seekable path; it is deleted as soon as it returns.
 # DOCLING_ASR = 1                 # 0 disables audio/video transcription
 # DOCLING_ASR_MODEL = WHISPER_TURBO   # any docling asr_model_specs name
 # DOCLING_VET_DIR = .docling_vet  # cleaned Markdown saved before ingest (gitignored; 0/false disables)

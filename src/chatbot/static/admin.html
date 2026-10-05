@@ -1885,24 +1885,49 @@ function renderUsageTotals(t) {
     `<div class="total"><div class="num">${fmtUsd(t.avg_cost_per_call)}</div><div class="lbl">Avg $ / call</div></div>`;
 }
 
+// Volume label for one aggregate row. Token kinds show tokens; voice kinds
+// show their own unit (stt: seconds of audio, tts: characters); a mixed
+// bucket (e.g. a workspace with both chat and voice) shows both.
+function usageVolumeLabel(d) {
+  const tokens = d.prompt_tokens + d.completion_tokens;
+  const units = d.units || 0;
+  const parts = [];
+  if (tokens > 0) parts.push(fmtTokens(tokens) + " tokens");
+  if (units > 0) {
+    const suffix = d.key === "stt" ? "s audio" : (d.key === "tts" ? " chars" : " units");
+    parts.push((units < 1000 ? units.toFixed(1) : fmtTokens(units)) + suffix);
+  }
+  return parts.length ? parts.join(" · ") : "0 tokens";
+}
+
 function renderUsageBars(list, el, showUser) {
   if (!list.length) { el.innerHTML = '<div class="muted">No usage yet.</div>'; return; }
   const max = Math.max(...list.map((d) => d.cost), 0.000001);
   el.innerHTML = list.map((d) => {
     const label = showUser ? (d.key.length > 18 ? d.key.slice(0, 18) + "…" : d.key) : d.key;
-    const tokens = d.prompt_tokens + d.completion_tokens;
-    return usageBarRow(label, d.cost, max, `${fmtTokens(tokens)} tokens · ${fmtUsd(d.cost)}`);
+    return usageBarRow(label, d.cost, max, `${usageVolumeLabel(d)} · ${fmtUsd(d.cost)}`);
   }).join("");
 }
 
 function renderUsageCostMath(data) {
   const t = data.totals, r = data.rates;
+  let voiceRows = "";
+  if (t.voice_seconds > 0) {
+    voiceRows += `<tr><td>STT audio</td><td>${t.voice_seconds.toFixed(1)}s</td>` +
+      `<td>$${r.price_stt_per_min}/min</td><td>${fmtUsd(t.voice_seconds / 60 * r.price_stt_per_min)}</td></tr>`;
+  }
+  if (t.voice_chars > 0) {
+    voiceRows += `<tr><td>TTS chars</td><td>${fmtTokens(t.voice_chars)}</td>` +
+      `<td>$${r.price_tts_per_m}/1M</td><td>${fmtUsd(t.voice_chars / 1e6 * r.price_tts_per_m)}</td></tr>`;
+  }
   $("usage-math").innerHTML =
-    '<div class="muted" style="margin-bottom:8px">Estimated spend = input tokens × $/1M + output tokens × $/1M</div>' +
+    '<div class="muted" style="margin-bottom:8px">Estimated spend = input tokens × $/1M + output tokens × $/1M' +
+    (voiceRows ? ' + transcribed audio × $/min + spoken characters × $/1M' : '') + '</div>' +
     '<table class="table">' +
-    `<tr><th>Component</th><th>Tokens</th><th>Rate</th><th>Cost</th></tr>` +
+    `<tr><th>Component</th><th>Volume</th><th>Rate</th><th>Cost</th></tr>` +
     `<tr><td>Input</td><td>${fmtTokens(t.prompt_tokens)}</td><td>$${r.price_input_per_m}/1M</td><td>${fmtUsd(t.input_cost)}</td></tr>` +
     `<tr><td>Output</td><td>${fmtTokens(t.completion_tokens)}</td><td>$${r.price_output_per_m}/1M</td><td>${fmtUsd(t.output_cost)}</td></tr>` +
+    voiceRows +
     `<tr><td>Avg tokens / call</td><td>${fmtTokens(t.avg_tokens_per_call)}</td><td></td><td></td></tr>` +
     `<tr><td colspan="3"><b>Total</b></td><td><b>${fmtUsd(t.cost)}</b></td></tr>` +
     "</table>";

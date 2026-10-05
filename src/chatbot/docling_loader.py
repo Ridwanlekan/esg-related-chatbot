@@ -207,7 +207,94 @@ class DoclingLoader:
         return getattr(self, attr)
 
     def convert(self, path):
-        """Convert one file to Markdown. Raises ConversionError on failure."""
+        """Convert one file to Markdown. Raises ConversionError on failure.
+
+        The raw document export; callers normalise it with clean_docling_text.
+        """
+        return self._convert_document(path).export_to_markdown()
+
+    def convert_pages(self, path):
+        """Convert one file to `[(page_no, text), ...]`, in page order.
+
+        Returns None for formats with no pagination (HTML, plain markdown), where
+        a page number would be a fiction rather than a citation.
+
+        Docling's own `export_to_markdown(page_no=n)` is not used here. It
+        filters on provenance but drops a merged item entirely rather than
+        slicing it, which silently loses text when two pages share a text block —
+        and a citation that points at the wrong page is worse than no citation.
+        Slicing each item by its per-page `charspan` keeps every character and
+        puts it on the page it was printed on.
+        """
+        return self._pages_from(self._convert_document(path))
+
+    def convert_both(self, path):
+        """Convert once and return `(markdown, [(page_no, text), ...])`.
+
+        Conversion is by far the expensive part of ingestion — parse, layout
+        analysis, and OCR — so a caller that needs both the document text and
+        its page split must get them from a single pass. Calling convert() and
+        convert_pages() separately would parse and OCR every paginated document
+        twice for no extra information.
+        """
+        document = self._convert_document(path)
+        markdown = document.export_to_markdown()
+        try:
+            pages = self._pages_from(document)
+        except Exception as exc:
+            # The conversion was the expensive part and it succeeded; losing the
+            # page split is a smaller loss than making the caller redo the work.
+            logger.debug("page split failed for %s: %s", path, exc)
+            pages = None
+        return markdown, pages
+
+    @staticmethod
+    def _pages_from(document):
+        """Per-page text for an already-converted document, or None if unpaginated."""
+        if not getattr(document, "pages", None):
+            return None
+
+        pieces = {}
+        for item, _level in document.iterate_items():
+            for page_no, text in DoclingLoader._page_pieces(item, document):
+                pieces.setdefault(page_no, []).append(text)
+
+        ordered = []
+        for page_no in sorted(pieces):
+            text = "\n\n".join(part for part in pieces[page_no] if part.strip())
+            text = clean_docling_text(text)
+            if text.strip():
+                ordered.append((page_no, text))
+        return ordered or None
+
+    @staticmethod
+    def _page_pieces(item, document):
+        """Yield (page_no, text) for one Docling item, one entry per page it spans."""
+        provenance = list(getattr(item, "prov", None) or [])
+        if not provenance:
+            return
+        text = getattr(item, "text", None)
+        if isinstance(text, str):
+            for prov in provenance:
+                span = getattr(prov, "charspan", None)
+                piece = text[span[0] : span[1]] if span else text
+                if piece.strip():
+                    yield prov.page_no, piece
+            return
+        # Tables, pictures and form fields have no .text; their Markdown is
+        # whole-block, so it is attributed to the page the block starts on.
+        try:
+            # The owning document is what resolves a table's structure; without
+            # it Docling serialises a degraded table and warns about it.
+            markdown = item.export_to_markdown(doc=document)
+        except TypeError:
+            markdown = item.export_to_markdown()
+        except Exception:
+            return
+        if markdown and markdown.strip():
+            yield provenance[0].page_no, markdown
+
+    def _convert_document(self, path):
         media = is_media(path)
         if media and not asr_enabled():
             raise ConversionError(f"ASR disabled for {os.path.basename(path)}")
@@ -221,7 +308,7 @@ class DoclingLoader:
 
         if result.status not in (ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS):
             raise ConversionError(f"Docling status {result.status} for {path}")
-        return result.document.export_to_markdown()
+        return result.document
 
 
 _default_loader = None

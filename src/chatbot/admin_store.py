@@ -11,6 +11,12 @@ CATEGORY_RE = re.compile(r"^[a-z][a-z0-9_-]{1,29}$")
 
 DEFAULT_PRICE_INPUT_PER_M = 0.40
 DEFAULT_PRICE_OUTPUT_PER_M = 1.60
+# Voice ledger rates. Defaults mirror the provider pricing the voice feature
+# falls back to (Whisper API $/audio-minute, gpt-4o-mini-tts $/1M characters) —
+# verify current provider pricing before relying on the absolute numbers, and
+# note local faster-whisper STT has no per-request marginal cost at all.
+DEFAULT_PRICE_STT_PER_MIN = 0.006
+DEFAULT_PRICE_TTS_PER_M = 0.60
 DEFAULT_USAGE_TOP_USERS = 20
 
 
@@ -83,6 +89,7 @@ class AdminStore:
             "prompt_tokens INTEGER NOT NULL DEFAULT 0, "
             "completion_tokens INTEGER NOT NULL DEFAULT 0, "
             "duration_s REAL, "
+            "units REAL, "
             "category TEXT, "
             "user_id TEXT, "
             "session_id TEXT, "
@@ -122,6 +129,21 @@ class AdminStore:
             "CREATE INDEX IF NOT EXISTS idx_usage_category ON usage(category)"
         )
         self.conn.commit()
+        self._migrate_usage_units()
+
+    def _migrate_usage_units(self):
+        """Add the generic non-token unit count (voice seconds/characters).
+
+        Lazy ALTER, so a usage table written by an older build opens untouched
+        and simply reads NULL (no units) for its rows.
+        """
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(usage)").fetchall()
+        }
+        if "units" not in cols:
+            self.conn.execute("ALTER TABLE usage ADD COLUMN units REAL")
+            self.conn.commit()
 
     def list_workspaces(self):
         rows = self.conn.execute(
@@ -378,18 +400,23 @@ class AdminStore:
         prompt_tokens=0,
         completion_tokens=0,
         duration_s=None,
+        units=None,
         category=None,
         user_id=None,
         session_id=None,
         request_id=None,
     ):
-        """Append one LLM-call usage row. Best-effort, never raises."""
+        """Append one metered usage row. Best-effort, never raises.
+
+        `units` is the generic non-token meter: seconds of audio for kind
+        "stt", characters for kind "tts". Token-based kinds leave it None.
+        """
         try:
             with self._lock:
                 self.conn.execute(
                     "INSERT INTO usage (at, kind, model, prompt_tokens, "
-                    "completion_tokens, duration_s, category, user_id, "
-                    "session_id, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "completion_tokens, duration_s, units, category, user_id, "
+                    "session_id, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         _now(),
                         kind,
@@ -397,6 +424,7 @@ class AdminStore:
                         int(prompt_tokens or 0),
                         int(completion_tokens or 0),
                         duration_s,
+                        units,
                         category,
                         user_id,
                         session_id,
@@ -406,6 +434,16 @@ class AdminStore:
                 self.conn.commit()
         except sqlite3.Error:
             pass
+
+    @staticmethod
+    def _nonneg_float(value, default):
+        try:
+            parsed = float(value)
+            if parsed < 0:
+                raise ValueError
+            return parsed
+        except (TypeError, ValueError):
+            return default
 
     def get_rates(self):
         rows = self.conn.execute("SELECT key, value FROM settings").fetchall()
@@ -425,6 +463,14 @@ class AdminStore:
         return {
             "price_input_per_m": price_in,
             "price_output_per_m": price_out,
+            # Voice rates are env-driven (not admin-editable): they track the
+            # provider's published price rather than a negotiated token rate.
+            "price_stt_per_min": self._nonneg_float(
+                os.environ.get("VOICE_STT_PRICE_PER_MIN"), DEFAULT_PRICE_STT_PER_MIN
+            ),
+            "price_tts_per_m": self._nonneg_float(
+                os.environ.get("VOICE_TTS_PRICE_PER_M"), DEFAULT_PRICE_TTS_PER_M
+            ),
         }
 
     def set_rates(self, price_input_per_m, price_output_per_m):
@@ -443,10 +489,26 @@ class AdminStore:
         return self.get_rates()
 
     @staticmethod
-    def _usage_cost(rates, prompt_tokens, completion_tokens):
+    def _usage_cost(rates, *, kind=None, prompt_tokens=0, completion_tokens=0,
+                    duration_s=None, units=None):
+        """Cost of one usage row.
+
+        Token kinds (rewrite/answer/stream/...) price per 1M tokens; the voice
+        kinds meter non-token units — "stt" per minute of audio (duration_s),
+        "tts" per 1M characters (units). Both are linear in their units, so
+        per-row costs sum to the same aggregate cost as the pre-voice formula
+        computed from totals.
+
+        Keyword-only: a positional call would silently misprice a token row by
+        landing in `kind`.
+        """
+        if kind == "stt":
+            return (float(duration_s) if duration_s else 0.0) / 60.0 * rates["price_stt_per_min"]
+        if kind == "tts":
+            return (float(units) if units else 0.0) / 1_000_000 * rates["price_tts_per_m"]
         return (
-            prompt_tokens / 1_000_000 * rates["price_input_per_m"]
-            + completion_tokens / 1_000_000 * rates["price_output_per_m"]
+            (prompt_tokens or 0) / 1_000_000 * rates["price_input_per_m"]
+            + (completion_tokens or 0) / 1_000_000 * rates["price_output_per_m"]
         )
 
     def _usage_rows(self, range_days=None, category=None):
@@ -464,50 +526,76 @@ class AdminStore:
         ).fetchall()
 
     def usage_stats(self, range_days=None, category=None, top_users=DEFAULT_USAGE_TOP_USERS):
-        """Aggregate token usage and estimate cost. All aggregation in Python to
-        stay robust against ISO-8601/offset variants in the stored timestamps."""
+        """Aggregate usage and estimate cost. All aggregation in Python to
+        stay robust against ISO-8601/offset variants in the stored timestamps.
+
+        Cost is accumulated per row because a bucket (workspace, user, day)
+        can mix token kinds with voice kinds, whose rates are not comparable:
+        a bucket's cost is the sum of its rows' costs, each computed by kind.
+        """
         rows = self._usage_rows(range_days=range_days, category=category)
         rates = self.get_rates()
 
         totals = {"calls": len(rows), "prompt_tokens": 0, "completion_tokens": 0,
-                  "duration_s": 0.0}
-        by_kind = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})
-        by_category = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})
-        by_user = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})
-        by_bucket = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0})
+                  "duration_s": 0.0, "units": 0.0,
+                  "input_cost": 0.0, "output_cost": 0.0, "voice_cost": 0.0, "cost": 0.0,
+                  "voice_seconds": 0.0, "voice_chars": 0.0}
+        by_kind = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                                       "duration_s": 0.0, "units": 0.0, "cost": 0.0})
+        by_category = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                                           "duration_s": 0.0, "units": 0.0, "cost": 0.0})
+        by_user = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                                       "duration_s": 0.0, "units": 0.0, "cost": 0.0})
+        by_bucket = defaultdict(lambda: {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                                         "duration_s": 0.0, "units": 0.0, "cost": 0.0})
         hourly = range_days is not None and range_days <= 2
+
+        def add(agg, pt, ct, dur, units, cost):
+            agg["calls"] += 1
+            agg["prompt_tokens"] += pt
+            agg["completion_tokens"] += ct
+            agg["duration_s"] += dur
+            agg["units"] += units
+            agg["cost"] += cost
 
         for r in rows:
             pt, ct = r["prompt_tokens"] or 0, r["completion_tokens"] or 0
+            dur = r["duration_s"] or 0.0
+            units = r["units"] or 0.0
+            kind = r["kind"]
+            cost = self._usage_cost(
+                rates, kind=kind, prompt_tokens=pt, completion_tokens=ct,
+                duration_s=dur, units=units,
+            )
             totals["prompt_tokens"] += pt
             totals["completion_tokens"] += ct
-            totals["duration_s"] += r["duration_s"] or 0.0
-            by_kind[r["kind"]]["calls"] += 1
-            by_kind[r["kind"]]["prompt_tokens"] += pt
-            by_kind[r["kind"]]["completion_tokens"] += ct
+            totals["duration_s"] += dur
+            totals["units"] += units
+            totals["cost"] += cost
+            if kind == "stt":
+                totals["voice_cost"] += cost
+                totals["voice_seconds"] += dur
+            elif kind == "tts":
+                totals["voice_cost"] += cost
+                totals["voice_chars"] += units
+            else:
+                totals["input_cost"] += pt / 1_000_000 * rates["price_input_per_m"]
+                totals["output_cost"] += ct / 1_000_000 * rates["price_output_per_m"]
+            add(by_kind[kind], pt, ct, dur, units, cost)
             cat = r["category"] or "(unknown)"
-            by_category[cat]["calls"] += 1
-            by_category[cat]["prompt_tokens"] += pt
-            by_category[cat]["completion_tokens"] += ct
+            add(by_category[cat], pt, ct, dur, units, cost)
             uid = r["user_id"] or "(anonymous)"
-            by_user[uid]["calls"] += 1
-            by_user[uid]["prompt_tokens"] += pt
-            by_user[uid]["completion_tokens"] += ct
+            add(by_user[uid], pt, ct, dur, units, cost)
             try:
                 dt = datetime.fromisoformat(r["at"])
             except (TypeError, ValueError):
                 dt = None
             if dt is not None:
                 bucket = dt.strftime("%Y-%m-%d %H:00") if hourly else dt.strftime("%Y-%m-%d")
-                by_bucket[bucket]["calls"] += 1
-                by_bucket[bucket]["prompt_tokens"] += pt
-                by_bucket[bucket]["completion_tokens"] += ct
+                add(by_bucket[bucket], pt, ct, dur, units, cost)
 
-        totals["input_cost"] = self._usage_cost(rates, totals["prompt_tokens"], 0)
-        totals["output_cost"] = self._usage_cost(rates, 0, totals["completion_tokens"])
-        totals["cost"] = totals["input_cost"] + totals["output_cost"]
         totals["avg_tokens_per_call"] = (
-            round((totals["prompt_tokens"] + totals["completion_tokens"]) / totals["calls"]) 
+            round((totals["prompt_tokens"] + totals["completion_tokens"]) / totals["calls"])
             if totals["calls"] else 0
         )
         totals["avg_cost_per_call"] = (
@@ -515,8 +603,7 @@ class AdminStore:
         )
 
         def deco(agg):
-            return [{"key": k, **v, "cost": self._usage_cost(rates, v["prompt_tokens"], v["completion_tokens"])}
-                    for k, v in agg.items()]
+            return [{"key": k, **v} for k, v in agg.items()]
 
         return {
             "rates": rates,
@@ -530,7 +617,7 @@ class AdminStore:
                 key=lambda d: -d["cost"],
             )[:top_users],
             "series": [
-                {"bucket": k, **v, "cost": self._usage_cost(rates, v["prompt_tokens"], v["completion_tokens"])}
+                {"bucket": k, **v}
                 for k, v in sorted(by_bucket.items())
             ],
         }
@@ -545,6 +632,7 @@ class AdminStore:
                 "prompt_tokens": r["prompt_tokens"],
                 "completion_tokens": r["completion_tokens"],
                 "duration_s": r["duration_s"],
+                "units": r["units"],
                 "category": r["category"],
                 "user_id": r["user_id"],
                 "session_id": r["session_id"],

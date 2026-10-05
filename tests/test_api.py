@@ -64,11 +64,31 @@ def test_chat_creates_session_and_returns_answer(client):
     body = res.json()
     assert res.status_code == 200
     assert body["answer"] == "answer to: moons?"
-    assert body["sources"] == ["jupiter.txt"]
+    assert [s["source"] for s in body["sources"]] == ["jupiter.txt"]
     assert store.history(body["session_id"]) == [
         {"role": "user", "content": "moons?"},
         {"role": "assistant", "content": "answer to: moons?"},
     ]
+
+
+def test_chat_sources_are_verifiable_objects(client):
+    c, _, _ = client
+    body = c.post("/chat", json={"question": "moons?"}).json()
+    ref = body["sources"][0]
+    assert ref["url"] == "/documents/download?source=jupiter.txt"
+    assert ref["chunk_id"] == "c1"
+    assert ref["chunk_index"] == 0
+    assert ref["similarity"] == pytest.approx(0.6, abs=1e-4)
+
+
+def test_chat_persists_sources_with_the_answer(client):
+    c, _, store = client
+    sid = c.post("/chat", json={"question": "moons?"}).json()["session_id"]
+    messages = store.messages(sid)
+    assert messages[-1]["sources"][0]["source"] == "jupiter.txt"
+    assert messages[-1]["sources"][0]["url"].endswith("source=jupiter.txt")
+    # The prompt history must stay citation-free: sources cost context window.
+    assert "sources" not in store.history(sid)[-1]
 
 
 def test_chat_reuses_session_history(client):
@@ -152,6 +172,14 @@ def test_stream_emits_sources_event(client):
     assert "jupiter.txt" in res.text
 
 
+def test_stream_persists_sources_with_the_answer(client):
+    c, _, store = client
+    res = c.post("/chat/stream", json={"question": "moons?"})
+    assert '"url": "/documents/download?source=jupiter.txt"' in res.text
+    messages = store.messages(res.headers["X-Session-ID"])
+    assert messages[-1]["sources"][0]["chunk_id"] == "c1"
+
+
 def test_list_and_load_sessions(client):
     c, _, store = client
     sid = store.new_id()
@@ -165,8 +193,8 @@ def test_list_and_load_sessions(client):
     assert listing["sessions"][0]["last_message"] == "hi there"
     loaded = c.get(f"/sessions/{sid}").json()
     assert loaded["messages"] == [
-        {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "hi there"},
+        {"role": "user", "content": "hello", "sources": []},
+        {"role": "assistant", "content": "hi there", "sources": []},
     ]
 
 
