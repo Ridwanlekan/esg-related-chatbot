@@ -123,6 +123,34 @@ class AdminStore:
             "created_at TEXT NOT NULL, "
             "PRIMARY KEY (filename, category))"
         )
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS library_docs ("
+            "filename TEXT PRIMARY KEY, "
+            "subject TEXT, "
+            "jurisdiction TEXT, "
+            "effective_date TEXT, "
+            "version TEXT, "
+            "size INTEGER NOT NULL DEFAULT 0, "
+            "created_at TEXT NOT NULL, "
+            "actor TEXT)"
+        )
+        # Section 3.4: assignment is the only access control, and each act is
+        # recorded with who made it and when, so the audit log can answer which
+        # content an organisation was given. Scoped per organisation rather than
+        # per workspace so an org's full content set is one query.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS content_assignments ("
+            "organisation_id TEXT NOT NULL, "
+            "category TEXT NOT NULL, "
+            "filename TEXT NOT NULL, "
+            "assigned_at TEXT NOT NULL, "
+            "actor TEXT, "
+            "PRIMARY KEY (organisation_id, category, filename))"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_assignments_org "
+            "ON content_assignments(organisation_id)"
+        )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_at ON usage(at)")
         self.conn.execute(
@@ -130,6 +158,100 @@ class AdminStore:
         )
         self.conn.commit()
         self._migrate_usage_units()
+
+    # ---- master library and content assignment (Section 3.4) ---------------
+
+    def add_library_doc(
+        self, filename, size=0, subject=None, jurisdiction=None,
+        effective_date=None, version=None, actor="",
+    ):
+        """Register a curated master document. Idempotent on filename."""
+        self.conn.execute(
+            "INSERT INTO library_docs (filename, subject, jurisdiction, "
+            "effective_date, version, size, created_at, actor) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(filename) DO UPDATE SET subject=excluded.subject, "
+            "jurisdiction=excluded.jurisdiction, "
+            "effective_date=excluded.effective_date, version=excluded.version, "
+            "size=excluded.size, actor=excluded.actor",
+            (filename, subject, jurisdiction, effective_date, version, size,
+             _now(), actor),
+        )
+        self.conn.commit()
+        return self.get_library_doc(filename)
+
+    def get_library_doc(self, filename):
+        row = self.conn.execute(
+            "SELECT * FROM library_docs WHERE filename = ?", (filename,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_library_docs(self, subject=None):
+        """The curated master library, for the admin console to assign from."""
+        if subject:
+            rows = self.conn.execute(
+                "SELECT * FROM library_docs WHERE subject = ? ORDER BY filename",
+                (subject,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM library_docs ORDER BY filename"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def remove_library_doc(self, filename):
+        cur = self.conn.execute(
+            "DELETE FROM library_docs WHERE filename = ?", (filename,)
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def add_content_assignment(self, organisation_id, category, filename, actor=""):
+        """Record that an organisation was given a document (idempotent)."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO content_assignments "
+            "(organisation_id, category, filename, assigned_at, actor) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (organisation_id, category, filename, _now(), actor),
+        )
+        self.conn.commit()
+
+    def remove_content_assignment(self, organisation_id, category, filename):
+        cur = self.conn.execute(
+            "DELETE FROM content_assignments "
+            "WHERE organisation_id = ? AND category = ? AND filename = ?",
+            (organisation_id, category, filename),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def list_content_assignments(self, organisation_id=None, category=None):
+        if organisation_id and category:
+            rows = self.conn.execute(
+                "SELECT * FROM content_assignments "
+                "WHERE organisation_id = ? AND category = ? ORDER BY filename",
+                (organisation_id, category),
+            ).fetchall()
+        elif organisation_id:
+            rows = self.conn.execute(
+                "SELECT * FROM content_assignments "
+                "WHERE organisation_id = ? ORDER BY category, filename",
+                (organisation_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM content_assignments ORDER BY organisation_id, "
+                "category, filename"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def assigned_filenames(self, organisation_id, category):
+        rows = self.conn.execute(
+            "SELECT filename FROM content_assignments "
+            "WHERE organisation_id = ? AND category = ?",
+            (organisation_id, category),
+        ).fetchall()
+        return [r["filename"] for r in rows]
 
     def _migrate_usage_units(self):
         """Add the generic non-token unit count (voice seconds/characters).

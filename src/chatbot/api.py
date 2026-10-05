@@ -37,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from chatbot import shared_docs, smalltalk, telemetry, voice
+from chatbot import content_library, shared_docs, smalltalk, telemetry, voice
 from chatbot.admin_security import (
     admin_gate_config,
     make_basic_auth_check,
@@ -59,7 +59,7 @@ from chatbot.download_links import (
 from chatbot.ingest import INGEST_PROGRESS
 from chatbot.security import RateLimiter, int_env, make_auth_check, make_rate_limit
 from chatbot.session_store import SessionStore
-from chatbot.users import UserStore, verify_jwt
+from chatbot.users import SAMPLE_ORGANISATION_ID, UserStore, verify_jwt
 from chatbot.workspaces import (
     base_workspace_names,
     default_workspace_config,
@@ -312,6 +312,29 @@ class DocumentDeleteRequest(BaseModel):
     filename: str
 
 
+class OrganisationCreateRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    name: str | None = Field(default=None, max_length=160)
+
+
+class OrganisationDeleteRequest(BaseModel):
+    organisation_id: str = Field(min_length=1, max_length=64)
+    # Must echo the organisation id. See admin_delete_organisation.
+    confirm: str = Field(min_length=1, max_length=64)
+
+
+class ContentAssignRequest(BaseModel):
+    organisation_id: str = Field(min_length=1, max_length=64)
+    categories: list[str] = Field(default_factory=list)
+    filenames: list[str] = Field(min_length=1)
+
+
+class ContentUnassignRequest(BaseModel):
+    organisation_id: str = Field(min_length=1, max_length=64)
+    categories: list[str] = Field(default_factory=list)
+    filenames: list[str] = Field(min_length=1)
+
+
 class SharedLinkRequest(BaseModel):
     filename: str
     categories: list[str] = Field(default_factory=list)
@@ -384,6 +407,20 @@ def create_app(
     if user_store is _DEFAULT:
         user_store = UserStore(DEFAULT_USERS_PATH, secret=auth_secret)
     auth_enabled = user_store is not None
+
+    if user_store is not None and user_store.get_organisation(SAMPLE_ORGANISATION_ID):
+        # Q2: the free tier must work the moment someone signs up, with no
+        # administrator action. Idempotent, so this is safe on every start and
+        # never overwrites an Administrator's later edits to the sample pack.
+        try:
+            seeded = content_library.seed_sample_pack(
+                SAMPLE_ORGANISATION_ID, categories=workspace_names()
+            )
+            if seeded:
+                logger.info("Sample pack seeded for %s: %d document(s).",
+                            SAMPLE_ORGANISATION_ID, len(seeded))
+        except (OSError, ValueError):
+            logger.exception("Sample pack seeding failed; free tier may be empty.")
 
     # Signs and verifies citation download links. With auth on this is AUTH_SECRET,
     # so rotating it revokes every outstanding link. With auth off there is no
@@ -1468,6 +1505,264 @@ def create_app(
         log_audit(request, "shared.delete", "shared_document", filename,
                   ",".join(affected))
         return {"deleted": filename, "detached_from": affected, "reindexed": stats}
+
+    # ---- master library and per-organisation assignment (Section 3.4) ------
+
+    @app.post("/admin/organisations", dependencies=admin_gate_deps)
+    def admin_create_organisation(req: OrganisationCreateRequest, request: Request):
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        try:
+            org = user_store.create_organisation(req.id, req.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        log_audit(request, "org.create", "organisation", org["id"], req.name or "")
+        return org
+
+    @app.get("/admin/organisations", dependencies=admin_gate_deps)
+    def admin_list_organisations():
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        store = app.state.admin_store
+        out = []
+        for org in user_store.list_organisations():
+            entry = dict(org)
+            entry["user_count"] = user_store.count_for_organisation(org["id"])
+            if store is not None:
+                entry["assignments"] = len(store.list_content_assignments(org["id"]))
+            out.append(entry)
+        return {"organisations": out}
+
+    @app.post("/admin/organisations/delete", dependencies=admin_gate_deps)
+    def admin_delete_organisation(req: OrganisationDeleteRequest, request: Request):
+        """Q12: delete an organisation's content immediately, after confirmation.
+
+        Two steps on purpose. `confirm` must be the organisation id, so a
+        mis-click cannot destroy a customer's material: the caller has to echo
+        back what they are deleting.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        if req.confirm != req.organisation_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Confirmation does not match the organisation id. "
+                       "Nothing was deleted.",
+            )
+        org = user_store.get_organisation(req.organisation_id)
+        if org is None:
+            raise HTTPException(status_code=404, detail="Organisation not found")
+        if org["system_owned"]:
+            raise HTTPException(
+                status_code=403,
+                detail=f"'{req.organisation_id}' is system-owned and cannot be deleted.",
+            )
+        removed_files = content_library.purge_organisation(req.organisation_id)
+        store = app.state.admin_store
+        if store is not None:
+            for row in store.list_content_assignments(req.organisation_id):
+                store.remove_content_assignment(
+                    row["organisation_id"], row["category"], row["filename"]
+                )
+        members = user_store.count_for_organisation(req.organisation_id)
+        user_store.delete_organisation(req.organisation_id)
+        log_audit(
+            request, "org.delete", "organisation", req.organisation_id,
+            f"members={members} files_removed={removed_files}",
+        )
+        return {
+            "deleted": req.organisation_id,
+            "members_deleted": members,
+            "content_purged": removed_files,
+        }
+
+    @app.post("/admin/library/upload", dependencies=admin_gate_deps, response_model=dict)
+    async def admin_library_upload(
+        request: Request,
+        subject: str = Form(default=""),
+        jurisdiction: str = Form(default=""),
+        effective_date: str = Form(default=""),
+        version: str = Form(default=""),
+        files: list[UploadFile] = File(default=[]),
+    ):
+        """Upload to the curated master library. Platform Administrators only.
+
+        Uploading here does not serve anyone. Content reaches an organisation
+        only through an explicit assignment, which is the whole of the access
+        control model (Section 3.4).
+        """
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        root = content_library.library_root()
+        root.mkdir(parents=True, exist_ok=True)
+        saved = []
+        for f in files:
+            name = shared_docs.safe_name(f.filename)
+            if not name:
+                continue
+            target = root / name
+            payload = await f.read()
+            tmp = target.with_name(target.name + ".partial")
+            try:
+                tmp.write_bytes(payload)
+                tmp.replace(target)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
+            store.add_library_doc(
+                name, size=len(payload), subject=subject or None,
+                jurisdiction=jurisdiction or None,
+                effective_date=effective_date or None,
+                version=version or None, actor=actor_label(request),
+            )
+            saved.append(name)
+        if not saved:
+            raise HTTPException(status_code=422, detail="No files were uploaded")
+        log_audit(request, "library.upload", "library_document", ",".join(saved),
+                  subject or "")
+        return {"saved_files": saved}
+
+    @app.get("/admin/library", dependencies=admin_gate_deps)
+    def admin_library(subject: str | None = None):
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        docs = store.list_library_docs(subject=subject or None)
+        root = content_library.library_root()
+        for doc in docs:
+            doc["present"] = (root / doc["filename"]).exists()
+            doc["assigned_to"] = [
+                row["organisation_id"]
+                for row in store.list_content_assignments()
+                if row["filename"] == doc["filename"]
+            ]
+        return {"documents": docs, "subjects": sorted(
+            {d["subject"] for d in docs if d["subject"]}
+        )}
+
+    @app.post("/admin/library/assign", dependencies=admin_gate_deps, response_model=dict)
+    async def admin_assign_content(request: Request, req: ContentAssignRequest):
+        """Assign library content to one organisation's workspaces.
+
+        Materialises a served copy per workspace and records the act, so the
+        audit log can answer which content an organisation was given (D12).
+        """
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        org = user_store.get_organisation(req.organisation_id)
+        if org is None:
+            raise HTTPException(status_code=404, detail="Organisation not found")
+        cats = [c for c in dict.fromkeys(req.categories) if c in workspace_names()]
+        if not cats:
+            raise HTTPException(
+                status_code=422, detail="Select at least one valid workspace."
+            )
+        root = content_library.library_root()
+        assigned, skipped = [], []
+        for filename in dict.fromkeys(req.filenames):
+            name = shared_docs.safe_name(filename)
+            source = root / name if name else None
+            if not name or not source.is_file():
+                skipped.append({"filename": filename, "reason": "Not in the library."})
+                continue
+            for cat in cats:
+                try:
+                    dest = content_library.materialise(
+                        req.organisation_id, cat, source, filename=name
+                    )
+                except ValueError as exc:
+                    skipped.append({"filename": name, "category": cat, "reason": str(exc)})
+                    continue
+                store.add_content_assignment(
+                    req.organisation_id, cat, name, actor=actor_label(request)
+                )
+                assigned.append(
+                    {"category": cat, "filename": name, "path": str(dest)}
+                )
+        if not assigned:
+            raise HTTPException(
+                status_code=422, detail="Nothing was assigned. " + str(skipped)
+            )
+        stats = await _reindex(request, cats)
+        log_audit(
+            request, "content.assign", "organisation", req.organisation_id,
+            ",".join(sorted({a["filename"] for a in assigned})),
+        )
+        return {
+            "organisation_id": req.organisation_id,
+            "assigned": assigned,
+            "skipped": skipped,
+            "reindexed": stats,
+        }
+
+    @app.post("/admin/library/unassign", dependencies=admin_gate_deps, response_model=dict)
+    async def admin_unassign_content(request: Request, req: ContentUnassignRequest):
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        cats = [c for c in dict.fromkeys(req.categories) if c in workspace_names()]
+        if not cats:
+            raise HTTPException(
+                status_code=422, detail="Select at least one valid workspace."
+            )
+        removed = []
+        for filename in dict.fromkeys(req.filenames):
+            name = shared_docs.safe_name(filename)
+            if not name:
+                continue
+            for cat in cats:
+                try:
+                    existed = content_library.remove(
+                        req.organisation_id, cat, name
+                    )
+                except ValueError:
+                    existed = False
+                if store.remove_content_assignment(req.organisation_id, cat, name) or existed:
+                    removed.append({"category": cat, "filename": name})
+        stats = await _reindex(request, cats)
+        log_audit(request, "content.unassign", "organisation",
+                  req.organisation_id, ",".join(r["filename"] for r in removed))
+        return {"organisation_id": req.organisation_id, "removed": removed,
+                "reindexed": stats}
+
+    @app.get("/admin/organisations/{organisation_id}/content",
+             dependencies=admin_gate_deps)
+    def admin_organisation_content(organisation_id: str):
+        """What one organisation is currently served, and what it could be given."""
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        if user_store is not None:
+            org = user_store.get_organisation(organisation_id)
+            if org is None:
+                raise HTTPException(status_code=404, detail="Organisation not found")
+        rows = store.list_content_assignments(organisation_id)
+        by_category = {}
+        for row in rows:
+            entry = by_category.setdefault(row["category"], [])
+            served = content_library.list_documents(organisation_id, row["category"])
+            entry.append({
+                "filename": row["filename"],
+                "assigned_at": row["assigned_at"],
+                "actor": row["actor"],
+                # Recorded assignment vs what is actually on disk. A gap means
+                # somebody deleted a served copy outside the console, and the
+                # assignment would otherwise look intact.
+                "present": row["filename"] in served,
+            })
+        return {
+            "organisation_id": organisation_id,
+            "assignments": by_category,
+            "library": store.list_library_docs(),
+            "workspaces": workspace_names(),
+        }
 
     @app.get("/admin/users", dependencies=admin_gate_deps)
     def admin_users(limit: int = 100, offset: int = 0):
