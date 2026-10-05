@@ -258,6 +258,12 @@ class UserResponse(BaseModel):
     email: str
     name: str
     category: str
+    # Absent for tokens minted before organisations existed, so optional to keep
+    # those sessions working rather than failing response validation.
+    organisation_id: str | None = None
+    # Optional for the same reason: tokens predating the membership table carry
+    # no claim, and the server falls back to `category` for those users.
+    workspaces: list[str] = []
     created_at: str
 
 
@@ -270,6 +276,9 @@ class AuthResponse(BaseModel):
 class MeResponse(BaseModel):
     user: UserResponse
     workspace: dict
+    # Every workspace this user may reach, primary first. More than one means
+    # the frontend should offer a switcher; exactly one means it must not.
+    workspaces: list[dict] = []
 
 
 class WorkspaceCreateRequest(BaseModel):
@@ -647,6 +656,8 @@ def create_app(
                 "email": payload.get("email", ""),
                 "name": payload.get("name", ""),
                 "category": payload.get("category", ""),
+                "organisation_id": payload.get("organisation_id"),
+                "workspaces": payload.get("workspaces") or [],
             }
 
     else:
@@ -764,12 +775,47 @@ def create_app(
         store.create(session_id, user_id=user_id)
         return session_id
 
-    def workspace_summary(category):
+    def workspace_summary(category, is_primary=True):
         return {
             "category": category,
+            # Lets the switcher mark the active option without comparing against
+            # a separate field on the response.
+            "is_primary": is_primary,
             "categories": workspace_names(),
             **workspace_meta(category),
         }
+
+    def workspaces_for(user):
+        """Summaries of every workspace a user may reach, primary first.
+
+        A user's primary workspace is `users.category`, which the JWT also
+        carries. Tokens minted before the membership table have no `workspaces`
+        claim, so they fall back to the single category they always had rather
+        than rendering an empty switcher.
+        """
+        categories = user.get("workspaces") or [user.get("category")]
+        primary = user.get("category")
+        seen, ordered = set(), []
+        for cat in categories:
+            if cat and cat not in seen:
+                seen.add(cat)
+                ordered.append(workspace_summary(cat, is_primary=cat == primary))
+        return ordered
+
+    def user_workspaces(user):
+        """Same list, restricted to workspaces the user can actually reach.
+
+        For a live row this intersects the membership table with the configured
+        workspace registry, so a membership pointing at a deleted or misnamed
+        workspace cannot surface a dead switcher option.
+        """
+        summaries = workspaces_for(user)
+        known = set(workspace_names())
+        allowed = [
+            s for s in summaries
+            if s["category"] == user.get("category") or s["category"] in known
+        ]
+        return allowed or [workspace_summary(user.get("category"))]
 
     @app.get("/metrics")
     def metrics(store=store_dep):
@@ -1703,7 +1749,12 @@ def create_app(
         log_audit(request, "auth.signup", "user", user.get("id"),
                   f"email={req.email} category={req.category} invite={bool(req.invite)}")
         token = user_store.token_for(user)
-        return AuthResponse(token=token, user=user, workspace=workspace_summary(user["category"]))
+        return AuthResponse(
+            token=token,
+            user=user,
+            workspace=workspace_summary(user["category"]),
+            workspaces=user_workspaces(user),
+        )
 
     @app.post("/auth/login", response_model=AuthResponse, dependencies=rate_deps)
     def login(req: LoginRequest):
@@ -1715,16 +1766,39 @@ def create_app(
         user_store.mark_login(user["id"])
         user["last_login"] = user_store.get(user["id"])["last_login"]
         token = user_store.token_for(user)
-        return AuthResponse(token=token, user=user, workspace=workspace_summary(user["category"]))
+        return AuthResponse(
+            token=token,
+            user=user,
+            workspace=workspace_summary(user["category"]),
+            workspaces=user_workspaces(user),
+        )
 
     @app.get("/me", response_model=MeResponse)
     def me(user: dict = user_dep):
         profile = user
+        reachable = None
         if user_store is not None:
+            # Re-read from the store rather than trusting the token, so a
+            # membership granted after the token was issued takes effect without
+            # waiting for the token to expire. This also means a revoked
+            # workspace disappears from the switcher on the next /me.
             full = user_store.get(user["id"])
             if full:
                 profile = full
-        return MeResponse(user=profile, workspace=workspace_summary(profile["category"]))
+                reachable = user_store.workspace_categories(user["id"])
+        if not reachable:
+            # No user store, or a user with no membership rows: the token's
+            # claim list, else the single category.
+            reachable = user.get("workspaces") or [profile["category"]]
+        # The store row carries no memberships, so the reachable list is spliced
+        # in before validation. Returning the bare row here is what made every
+        # /me report an empty workspace list.
+        scoped = {**profile, "workspaces": reachable}
+        return MeResponse(
+            user=scoped,
+            workspace=workspace_summary(profile["category"]),
+            workspaces=user_workspaces(scoped),
+        )
 
     @app.post("/chat", response_model=ChatResponse, dependencies=rate_deps)
     async def chat(

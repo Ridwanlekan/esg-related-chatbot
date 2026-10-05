@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from chatbot.api import create_app
 from chatbot.session_store import SessionStore
-from chatbot.users import UserStore
+from chatbot.users import UserStore, sign_jwt
 from chatbot.vector_store import SearchResult
 
 
@@ -82,6 +82,105 @@ class TestAuthFlow:
         assert me["workspace"]["category"] == "hr"
         assert me["workspace"]["label"] == "People & HR"
         assert "hr" in me["workspace"]["categories"]
+
+    def test_signup_lands_in_sample_organisation(self, env):
+        c, _ = env
+        token = signup(c, "free@visitor.com", "finance")
+        assert c.get("/me", headers=auth(token)).json()["user"]["organisation_id"] == "_sample"
+
+    def test_organisation_id_in_signup_response(self, env):
+        c, _ = env
+        res = c.post(
+            "/auth/signup",
+            json={"email": "n@visitor.com", "password": "password123",
+                  "name": "N", "category": "hr"},
+        )
+        assert res.json()["user"]["organisation_id"] == "_sample"
+
+    def test_single_workspace_user_gets_no_switcher(self, env):
+        """Q7: exactly one workspace means the frontend shows no switcher."""
+        c, _ = env
+        token = signup(c, "solo@corp.com", "finance")
+        me = c.get("/me", headers=auth(token)).json()
+        assert [w["category"] for w in me["workspaces"]] == ["finance"]
+        assert me["workspaces"][0]["is_primary"] is True
+
+    def test_multi_workspace_user_sees_all_workspaces(self, env):
+        c, _ = env
+        token = signup(c, "multi@corp.com", "finance")
+        store = c.app.state.user_store
+        user = store.get_by_email("multi@corp.com")
+        store.add_workspace(user["id"], "hr")
+
+        me = c.get("/me", headers=auth(token)).json()
+        assert [w["category"] for w in me["workspaces"]] == ["finance", "hr"]
+        assert [w["is_primary"] for w in me["workspaces"]] == [True, False]
+        assert me["user"]["workspaces"] == ["finance", "hr"]
+
+    def test_membership_change_visible_without_relogin(self, env):
+        """A grant takes effect on the next /me rather than at token expiry."""
+        c, _ = env
+        token = signup(c, "late@corp.com", "finance")
+        store = c.app.state.user_store
+        user = store.get_by_email("late@corp.com")
+        assert c.get("/me", headers=auth(token)).json()["user"]["workspaces"] == ["finance"]
+
+        store.add_workspace(user["id"], "hr")
+        assert c.get("/me", headers=auth(token)).json()["user"]["workspaces"] == ["finance", "hr"]
+
+    def test_revoked_workspace_disappears_from_switcher(self, env):
+        c, _ = env
+        token = signup(c, "revoke@corp.com", "finance")
+        store = c.app.state.user_store
+        user = store.get_by_email("revoke@corp.com")
+        store.add_workspace(user["id"], "hr")
+        assert len(c.get("/me", headers=auth(token)).json()["user"]["workspaces"]) == 2
+
+        store.remove_workspace(user["id"], "finance")
+        assert c.get("/me", headers=auth(token)).json()["user"]["workspaces"] == ["hr"]
+
+    def test_membership_does_not_leak_across_users(self, env):
+        c, _ = env
+        mine = signup(c, "me@corp.com", "finance")
+        theirs = signup(c, "them@corp.com", "hr")
+        store = c.app.state.user_store
+        store.add_workspace(store.get_by_email("me@corp.com")["id"], "hr")
+
+        assert c.get("/me", headers=auth(theirs)).json()["user"]["workspaces"] == ["hr"]
+        assert c.get("/me", headers=auth(mine)).json()["user"]["workspaces"] == ["finance", "hr"]
+
+    def test_membership_in_unconfigured_workspace_hidden(self, env):
+        """A grant to a workspace with no registry entry must not surface."""
+        c, _ = env
+        token = signup(c, "stale@corp.com", "finance")
+        store = c.app.state.user_store
+        user = store.get_by_email("stale@corp.com")
+        # Bypasses add_workspace's validation, mimicking a workspace that was
+        # deleted after the grant was made.
+        store.conn.execute(
+            "INSERT OR IGNORE INTO workspace_memberships "
+            "(user_id, category, role, created_at) VALUES (?, 'legal', 'member', 'now')",
+            (user["id"],),
+        )
+        store.conn.commit()
+
+        me = c.get("/me", headers=auth(token)).json()
+        assert [w["category"] for w in me["workspaces"]] == ["finance"]
+
+    def test_legacy_token_without_workspaces_claim_still_resolves(self, env):
+        """Tokens minted before the membership table fall back to `category`."""
+        c, _ = env
+        signup(c, "old@corp.com", "hr")
+        store = c.app.state.user_store
+        secret = store.secret
+        user_id = store.get_by_email("old@corp.com")["id"]
+        legacy = sign_jwt(
+            secret,
+            {"sub": user_id, "email": "old@corp.com",
+             "name": "Old", "category": "hr", "purpose": "session"},
+        )
+        me = c.get("/me", headers={"authorization": f"Bearer {legacy}"}).json()
+        assert [w["category"] for w in me["workspaces"]] == ["hr"]
 
     def test_missing_or_invalid_token_rejected(self, env):
         c, _ = env
