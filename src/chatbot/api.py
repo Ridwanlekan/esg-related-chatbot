@@ -37,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from chatbot import shared_docs, smalltalk, telemetry
+from chatbot import shared_docs, smalltalk, telemetry, voice
 from chatbot.admin_security import (
     admin_gate_config,
     make_basic_auth_check,
@@ -317,6 +317,10 @@ class SharedUnlinkRequest(BaseModel):
 class CostRatesRequest(BaseModel):
     price_input_per_m: float = Field(ge=0)
     price_output_per_m: float = Field(ge=0)
+
+
+class TTSRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=100_000)
 
 
 class AdminLoginRequest(BaseModel):
@@ -805,6 +809,8 @@ def create_app(
                 "GET /me",
                 "POST /chat",
                 "POST /chat/stream",
+                "POST /voice/stt",
+                "POST /voice/tts",
                 "POST /search",
                 "POST /documents/link",
                 "GET /documents/download",
@@ -1601,13 +1607,13 @@ def create_app(
         writer = csv.writer(buf)
         writer.writerow(
             ["at", "kind", "model", "prompt_tokens", "completion_tokens",
-             "duration_s", "category", "user_id", "session_id", "request_id"]
+             "duration_s", "units", "category", "user_id", "session_id", "request_id"]
         )
         for r in rows:
             writer.writerow(
                 [
                     r["at"], r["kind"], r["model"] or "", r["prompt_tokens"],
-                    r["completion_tokens"], r["duration_s"] or "",
+                    r["completion_tokens"], r["duration_s"] or "", r["units"] or "",
                     r["category"] or "", r["user_id"] or "", r["session_id"] or "",
                     r["request_id"] or "",
                 ]
@@ -1817,6 +1823,101 @@ def create_app(
             event_stream(),
             media_type="text/event-stream",
             headers={"X-Session-ID": session_id},
+        )
+
+    def record_voice_usage(*, kind, model, duration_s=None, units, user):
+        """Meter one voice call into the usage ledger (best-effort)."""
+        store = app.state.admin_store
+        if store is None:
+            return
+        store.record_usage(
+            kind=kind,
+            model=model,
+            duration_s=duration_s,
+            units=units,
+            category=user["category"],
+            user_id=user["id"],
+            request_id=telemetry.get_request_id(),
+        )
+
+    @app.post("/voice/stt", dependencies=rate_deps)
+    async def voice_stt(
+        request: Request,
+        file: UploadFile = File(...),
+        user: dict = user_dep,
+    ):
+        """Multipart audio in (webm/opus, mp4/aac, wav, ogg, mpeg) -> transcript.
+
+        Gated and rate-limited exactly like /chat. The transcript is returned
+        for the caller to review and send through the normal chat pipeline —
+        voice is an adapter, not a pipeline of its own. Audio is metered as
+        kind "stt" in units of seconds.
+        """
+        max_mb = int_env("VOICE_MAX_UPLOAD_MB", 5)
+        max_bytes = max_mb * 1024 * 1024
+        data = await file.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Audio exceeds the {max_mb} MB upload limit",
+            )
+        if not data:
+            raise HTTPException(status_code=422, detail="Empty audio upload")
+        # Some mobile browsers send an empty/generic content type for blob
+        # uploads, so a missing type is accepted only when the filename
+        # extension is on the allowlist.
+        if file.content_type and not voice.mime_allowed(file.content_type):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Unsupported audio content type: {file.content_type}",
+            )
+        if not file.content_type and not voice.filename_allowed(file.filename):
+            raise HTTPException(
+                status_code=422,
+                detail="Unsupported audio file type (no content type given)",
+            )
+        try:
+            provider = voice.get_stt_provider()
+            text, duration = await run_in_threadpool(
+                provider.transcribe, data, file.filename or "audio"
+            )
+        except voice.UndecodableAudio as e:
+            # Allowed extension, unreadable bytes: the recording itself is bad.
+            raise HTTPException(status_code=422, detail=str(e))
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        record_voice_usage(
+            kind="stt", model=voice.stt_model_name(),
+            duration_s=duration, units=duration, user=user,
+        )
+        return {"text": text}
+
+    @app.post("/voice/tts", dependencies=rate_deps)
+    async def voice_tts(req: TTSRequest, user: dict = user_dep):
+        """Text in -> audio bytes out. Metered as kind "tts" in characters.
+
+        The media type comes from the provider: local Kokoro returns WAV,
+        the Azure OpenAI speech endpoint returns mp3. Both play in every
+        browser, so the client just takes whatever arrives.
+        """
+        max_chars = int_env("VOICE_TTS_MAX_CHARS", 4000)
+        if len(req.text) > max_chars:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Text exceeds the {max_chars}-character limit",
+            )
+        try:
+            provider = voice.get_tts_provider()
+            audio = await run_in_threadpool(provider.synthesize, req.text)
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+        record_voice_usage(
+            kind="tts", model=voice.tts_model_name(),
+            units=len(req.text), user=user,
+        )
+        return Response(
+            content=audio,
+            media_type=getattr(provider, "media_type", "audio/mpeg"),
         )
 
     @app.post("/search", response_model=SearchResponse, dependencies=rate_deps)

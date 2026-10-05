@@ -87,8 +87,11 @@ def test_rates_affect_cost_and_defaults():
     assert s.usage_stats()["totals"]["cost"] == pytest.approx(0.40)
     s.set_rates(1.0, 2.0)
     assert s.usage_stats()["totals"]["cost"] == pytest.approx(1.00)
+    # Voice rates are env-driven and ride along with the token rates; they are
+    # reported but never admin-editable (see AdminStore.get_rates).
     assert AdminStore(":memory:").get_rates() == {
         "price_input_per_m": 0.40, "price_output_per_m": 1.60,
+        "price_stt_per_min": 0.006, "price_tts_per_m": 0.60,
     }
 
 
@@ -98,7 +101,10 @@ def test_rates_persist_across_reopen(tmp_path):
     s.set_rates(0.5, 1.5)
     s.close()
     s2 = AdminStore(path)
-    assert s2.get_rates() == {"price_input_per_m": 0.5, "price_output_per_m": 1.5}
+    assert s2.get_rates() == {
+        "price_input_per_m": 0.5, "price_output_per_m": 1.5,
+        "price_stt_per_min": 0.006, "price_tts_per_m": 0.60,
+    }
 
 
 def test_range_filter_and_series_buckets():
@@ -223,7 +229,10 @@ def test_update_cost_rates_and_recompute(usage_env):
     put = c.put("/admin/settings/cost", json={"price_input_per_m": 1.0, "price_output_per_m": 2.0},
                 headers=_admin_auth())
     assert put.status_code == 200
-    assert put.json() == {"price_input_per_m": 1.0, "price_output_per_m": 2.0}
+    # PUT echoes the full effective rate set (voice rates are env-driven and
+    # read-only), matching GET /admin/settings/cost.
+    assert put.json() == {"price_input_per_m": 1.0, "price_output_per_m": 2.0,
+                          "price_stt_per_min": 0.006, "price_tts_per_m": 0.60}
     stats = c.get("/admin/usage?range=all", headers=_admin_auth()).json()
     assert stats["totals"]["cost"] == pytest.approx(1.0 / 1e6 * 2000 + 2.0 / 1e6 * 400)
     bad = c.put("/admin/settings/cost", json={"price_input_per_m": -1, "price_output_per_m": 1},

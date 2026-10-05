@@ -18,6 +18,7 @@ A retrieval-augmented generation (RAG) chatbot platform where each user signs up
 - **Offline retrieval**: semantic search uses a local sentence-transformer model — the OpenAI API is only called to generate the final answer.
 - **Conversational follow-ups**: follow-up questions are rewritten into standalone queries using chat history (`rewrite.py`) so turns like "which is the largest?" retrieve against the right context.
 - **HTTP API + UI**: FastAPI service with streaming (SSE), per-user session memory (SQLite), signup/login UI, and a self-contained browser UI (`/ui`, no CDN).
+- **Voice mode**: a mic button beside the chat input records a question, transcribes it into the composer for review, then reads the answer back aloud. Both halves default to local models with no per-request cost — faster-whisper for STT, Kokoro for TTS — and either can be switched to the Azure OpenAI endpoint with one env var.
 
 ## Project Structure
 
@@ -280,6 +281,28 @@ Interactive docs at `http://localhost:8000/docs`.
 
 What that capability does **not** protect against, since it is a bearer secret in a URL: the browser address bar and history (and any history sync provider), screenshots, copy-paste, and the access log of any proxy in front of the app. This app logs only the route path, never the query string, and serves the file with `Referrer-Policy: no-referrer` so a link clicked inside a PDF cannot leak it onward — but a reverse proxy that logs full request lines will capture the token, and App Service does by default. The one-hour expiry and the one-document scope are what bound that exposure. There is no per-link revocation: the levers are the TTL, moving or deleting the user, or rotating `AUTH_SECRET`, which signs every session and every other citation link out at the same time. Keeping the secret out of the URL entirely needs a service worker that injects the header, which was considered and rejected as disproportionate for this stack.
 
+**Voice mode**: the mic button sits in the composer next to the input, not on the login screen — a credential form should stay keyboard-only, and there is no question to attach audio to before you are in a conversation. The first press records, the second stops and sends the clip to `POST /voice/stt`; the transcript lands **in the composer, unsent**, so a misheard word is cheap to fix instead of becoming an expensive wrong query. Answers are then spoken via `POST /voice/tts`, with a ▶ button on every answer to replay or stop it and a 🔊 toggle beside the mic to mute auto-speak.
+
+Three browser details are worth knowing, because each one is a silent failure otherwise:
+
+- **HTTPS is required** for `getUserMedia` (`localhost` is exempt). The same constraint that applies to the citation links.
+- **Autoplay is unlocked inside the mic press.** Safari will refuse `play()` for audio that arrives long after the gesture that started it, so `primeAudioPlayback()` plays a one-frame silent buffer during the click. Without it the speaker button looks broken on Safari and nowhere else. If playback is refused anyway, the notice tells the user to tap ▶.
+- **The recorded container is negotiated, not assumed.** Chrome and Firefox produce `webm/opus`, Safari produces `mp4/aac`, so `pickRecorderMime()` asks `MediaRecorder.isTypeSupported` and the filename sent to the server matches what was actually recorded. Recording stops at 60 seconds regardless, so a forgotten second tap cannot record or bill indefinitely.
+
+The transcript is never auto-sent, and spoken text is stripped of page citations (`[p. 5-7]`, `(pp. 12-14)`) and truncated — "p. 5-7" is noise aloud, and long RAG answers should be read in summary with the full text on screen.
+
+**Audio handling**: a clip is held in memory for the length of the request and is never written to disk or logged. Local STT is the one exception, and only because faster-whisper needs a seekable path: the bytes go to a temp file that is deleted as soon as transcription returns. Both endpoints are gated exactly like `/chat` (session token, rate limit, workspace entitlement) and size-capped (`VOICE_MAX_UPLOAD_MB`, `VOICE_TTS_MAX_CHARS`). Both are metered into the admin Usage & Cost dashboard — audio seconds and spoken characters, priced by their own rates rather than token rates, because otherwise voice is an unmetered hole in the budget. The voice ledger reuses the same `usage` table via a lazy `ALTER TABLE`, so an existing database opens untouched and reads `NULL` units for old rows.
+
+**Voice defaults are both `local`, and neither needs an Azure deployment.** STT is faster-whisper; TTS is Kokoro v1.0 via `kokoro-onnx`, which returns WAV. Both come from `pip install 'esg-chatbot[voice]'`, and neither wants a system package: faster-whisper decodes through PyAV (whose wheels bundle ffmpeg) and Kokoro takes espeak-ng as a wheel through `espeakng-loader`. Without the extra, `/voice/stt` and `/voice/tts` each return a `503` naming the missing package, the notice tells the user to type instead, and the rest of the app is unaffected.
+
+Weights are handled differently by the two. The faster-whisper `small` model (~484 MB) downloads from HuggingFace on first use and is then baked into the image at build time, like the retrieval models. Kokoro's ~350 MB never downloads at runtime: the `Dockerfile` fetches `kokoro-v1.0.onnx` and `voices-v1.0.bin` into `/app/models/tts` during build, so the container is offline-capable. Locally, fetch them once with the two `curl` commands in `doc/env_example.txt`.
+
+Kokoro runs on CPU at roughly 3–5x real time on Apple silicon, so a 300-character answer synthesises in about 5 seconds. It is loaded once and guarded by a lock, because the ONNX session is not re-entrant and concurrent requests would otherwise thrash the CPU. `VOICE_TTS_VOICE` picks from 54 voices (`af_*`/`am_*` American, `bf_*`/`bm_*` British).
+
+Setting either `VOICE_STT_PROVIDER=openai` or `VOICE_TTS_PROVIDER=openai` moves that half onto the Azure OpenAI endpoint already configured for the LLM, reusing the client from `rag.py` and needing no extra dependency — but it then requires a deployment provisioned in Azure for Whisper or for a TTS model, and the deployment name is what `model` takes. The local defaults exist precisely so that neither half depends on that provisioning. A missing TTS deployment is the one case that previously surfaced as a `500`; it is now a `503` that names the deployment it tried.
+
+One consequence worth knowing before choosing `openai` TTS: Kokoro speaks UK English by default (`VOICE_TTS_LANG`), which suits an ESG reporting audience. The Azure speech voices are US English unless a locale is specified, and `VOICE_TTS_VOICE` for that path takes `alloy`/`nova`/`onyx`/`shimmer` rather than Kokoro's `af_heart` style names.
+
 **Admin UI**: open `http://localhost:8000/admin` — a full admin console with four tabs, protected by the `API_KEY` (entered once in the page, stored in `localStorage`, sent as `Authorization: Bearer <API_KEY>`):
 
 - **Overview** — live totals (workspaces, indexed chunks, users, sessions), per-workspace cards with quick **↑ Upload** and **Re-index** buttons, and a live progress bar while an ingestion run is in progress (polls `/ingest/status`).
@@ -297,6 +320,8 @@ What that capability does **not** protect against, since it is a bearer secret i
 | `POST /chat`        | user   | ask in your workspace; small talk returns day-aware greetings     |
 | `POST /chat/stream` | user   | same, streaming SSE (`data: {"delta": "text"}`, trailing `{"sources": [...]}` event) |
 | `POST /search`      | user   | retrieval only — no LLM call (scoped to your workspace)          |
+| `POST /voice/stt`   | user   | multipart audio (`webm/opus`, `mp4/aac`, `wav`, `ogg`, `mpeg`) → `{"text"}` |
+| `POST /voice/tts`   | user   | `{"text"}` → `audio/wav` (local) or `audio/mpeg` (Azure), capped at `VOICE_TTS_MAX_CHARS` |
 | `POST /documents/link` | user | mint a fresh citation link for a document you can already open |
 | `GET /documents/download?source=` | user | open a cited source document, scoped to your workspace (audit-logged); accepts a session token or a signed `token=` from a citation link |
 | `GET /admin`        | public | admin console HTML page                                          |

@@ -26,6 +26,8 @@ function el(tag) {
     style: {},
     classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
     appendChild(c) { this.children.push(c); return c; },
+    setAttribute() {},
+    getAttribute() { return null; },
     querySelector() { return null; },
     addEventListener() {},
     remove() {},

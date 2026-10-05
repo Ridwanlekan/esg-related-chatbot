@@ -2,7 +2,9 @@ FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    HF_HOME=/app/.hf-cache
+    HF_HOME=/app/.hf-cache \
+    VOICE_TTS_MODEL_PATH=/app/models/tts/kokoro-v1.0.onnx \
+    VOICE_TTS_VOICES_PATH=/app/models/tts/voices-v1.0.bin
 
 WORKDIR /app
 
@@ -13,8 +15,30 @@ COPY data ./data
 RUN pip install -r requirements.txt \
  && pip install . --no-deps
 
-# Optional: audio/video transcription. Requires the ffmpeg binary and the
-# `docling[asr]` extra: docker build --build-arg INSTALL_ASR=true .
+# Local voice STT + TTS: the `voice` extra (faster-whisper + Kokoro), with
+# Kokoro's weights and the whisper model baked in so the container never
+# downloads at runtime. Costs ~350 MB of Kokoro weights and ~490 MB of
+# `small` whisper weights. Build with `--build-arg INSTALL_VOICE=false` to skip
+# both, which leaves /voice/stt and /voice/tts returning a clean 503.
+ARG INSTALL_VOICE=true
+ARG KOKORO_RELEASE=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+RUN if [ "$INSTALL_VOICE" = "true" ]; then \
+      pip install '.[voice]' \
+      && KOKORO_RELEASE="$KOKORO_RELEASE" python -c "\
+import os, urllib.request
+dest = '/app/models/tts'
+os.makedirs(dest, exist_ok=True)
+for name in ('kokoro-v1.0.onnx', 'voices-v1.0.bin'):
+    urllib.request.urlretrieve(
+        f\"{os.environ['KOKORO_RELEASE']}/{name}\", os.path.join(dest, name))" \
+      && HF_HOME=/app/.hf-cache python -c "\
+from faster_whisper import WhisperModel
+WhisperModel('small')"; \
+    fi
+
+# Optional: audio/video transcription of ingested documents. Requires the
+# ffmpeg binary and the `docling[asr]` extra:
+# docker build --build-arg INSTALL_ASR=true .
 ARG INSTALL_ASR=false
 RUN if [ "$INSTALL_ASR" = "true" ]; then \
       apt-get update \
