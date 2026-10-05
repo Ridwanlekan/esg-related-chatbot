@@ -22,18 +22,14 @@ RUN pip install -r requirements.txt \
 # both, which leaves /voice/stt and /voice/tts returning a clean 503.
 ARG INSTALL_VOICE=true
 ARG KOKORO_RELEASE=https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0
+# Each python snippet stays on ONE physical line. A real newline inside
+# python -c "..." ends the RUN instruction in Docker's parser, so the following
+# line is read as its own (invalid) instruction; the `;` separators keep it
+# valid Python. Use `\` only at end of line, never inside the quotes.
 RUN if [ "$INSTALL_VOICE" = "true" ]; then \
       pip install '.[voice]' \
-      && KOKORO_RELEASE="$KOKORO_RELEASE" python -c "\
-import os, urllib.request
-dest = '/app/models/tts'
-os.makedirs(dest, exist_ok=True)
-for name in ('kokoro-v1.0.onnx', 'voices-v1.0.bin'):
-    urllib.request.urlretrieve(
-        f\"{os.environ['KOKORO_RELEASE']}/{name}\", os.path.join(dest, name))" \
-      && HF_HOME=/app/.hf-cache python -c "\
-from faster_whisper import WhisperModel
-WhisperModel('small')"; \
+      && KOKORO_RELEASE="$KOKORO_RELEASE" python -c "import os, urllib.request; d = '/app/models/tts'; os.makedirs(d, exist_ok=True); [urllib.request.urlretrieve(os.environ['KOKORO_RELEASE'] + '/' + n, os.path.join(d, n)) for n in ('kokoro-v1.0.onnx', 'voices-v1.0.bin')]" \
+      && HF_HOME=/app/.hf-cache python -c "from faster_whisper import WhisperModel; WhisperModel('small')"; \
     fi
 
 # Optional: audio/video transcription of ingested documents. Requires the

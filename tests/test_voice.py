@@ -6,6 +6,7 @@ a real browser, and no test writes audio to disk.
 
 import io
 import os
+import sys
 import wave
 from types import SimpleNamespace
 
@@ -57,6 +58,14 @@ class FakeTTS:
     def synthesize(self, text):
         self.seen.append(text)
         return b"ID3-fake-mp3-bytes"
+
+
+@pytest.fixture(autouse=True)
+def _reset_voice_providers():
+    """The provider singletons are module-level; never let one leak between tests."""
+    voice.reset_providers()
+    yield
+    voice.reset_providers()
 
 
 @pytest.fixture
@@ -393,12 +402,43 @@ def test_local_tts_label_tracks_the_chosen_voice(monkeypatch):
     assert voice.tts_model_name() == "kokoro:bm_george"
 
 
+def _kokoro_importable(monkeypatch):
+    """Make `import soundfile` and `from kokoro_onnx import Kokoro` succeed.
+
+    LocalKokoroTTS checks the import *before* it checks the weight files, so a
+    test aiming at the file check has to get past the import first.
+    """
+    monkeypatch.setitem(
+        sys.modules, "kokoro_onnx", SimpleNamespace(Kokoro=lambda *a, **k: None)
+    )
+    monkeypatch.setitem(sys.modules, "soundfile", SimpleNamespace(write=lambda *a: None))
+
+
 def test_local_tts_reports_a_missing_model_file(tmp_path, monkeypatch):
-    """A container built without the weights must 503, not crash on import."""
+    """A container built without the weights must 503, not crash on import.
+
+    Both imports are stubbed so this asserts the same thing whether or not
+    kokoro-onnx happens to be installed. Without the stub it passed only on a
+    developer machine that had the dependency, and failed in CI.
+    """
+    _kokoro_importable(monkeypatch)
     monkeypatch.setenv("VOICE_TTS_PROVIDER", "kokoro")
     monkeypatch.setenv("VOICE_TTS_MODEL_PATH", str(tmp_path / "absent.onnx"))
     monkeypatch.setenv("VOICE_TTS_VOICES_PATH", str(tmp_path / "absent.bin"))
     with pytest.raises(RuntimeError, match="model file is missing"):
+        voice.get_tts_provider()
+
+
+def test_local_tts_reports_a_missing_dependency(monkeypatch):
+    """Without the extra installed, the error must name the install command.
+
+    A sys.modules entry of None makes the import raise ImportError, which is
+    how a machine lacking the `voice` extra behaves.
+    """
+    monkeypatch.setenv("VOICE_TTS_PROVIDER", "kokoro")
+    monkeypatch.setitem(sys.modules, "kokoro_onnx", None)
+    monkeypatch.setitem(sys.modules, "soundfile", None)
+    with pytest.raises(RuntimeError, match="kokoro-onnx is not installed"):
         voice.get_tts_provider()
 
 
