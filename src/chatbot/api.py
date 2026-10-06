@@ -45,6 +45,7 @@ from chatbot.admin_security import (
     verify_totp,
 )
 from chatbot.admin_store import AdminStore, validate_category
+from chatbot import documents as documents_mod
 from chatbot.documents import DocumentNotFound, resolve_document
 from chatbot.download_links import (
     TOKEN_QUERY_PARAM,
@@ -1909,6 +1910,145 @@ def create_app(
         log_audit(request, "library.upload", "library_document", ",".join(saved),
                   subject or "")
         return {"saved_files": saved}
+
+    @app.get("/admin/migrations/legacy-content", dependencies=admin_gate_deps)
+    def admin_legacy_content_scan():
+        """Preview the pre-organisation content a cutover would move (D19)."""
+        docs = content_library.scan_legacy_tree()
+        assigned_names = {
+            row["filename"]
+            for row in app.state.admin_store.list_content_assignments()
+        } if app.state.admin_store is not None else set()
+        unassigned = [d for d in docs if d["filename"] not in assigned_names]
+        orphaned = content_library.orphaned_shared_documents()
+        return {
+            "documents": docs,
+            "count": len(docs),
+            "by_workspace": {
+                cat: sum(1 for d in docs if d["category"] == cat)
+                for cat in sorted({d["category"] for d in docs})
+            },
+            # Turning the legacy fallback off strands any document below that no
+            # organisation has been assigned. Emptiness is the wrong test: the
+            # migration copies rather than moves, so the originals stay on disk
+            # by design and the tree is never empty after a successful run.
+            "fallback_enabled": documents_mod.legacy_fallback_enabled(),
+            "unassigned": unassigned,
+            "orphaned_shared": orphaned,
+            "safe_to_disable_fallback": not unassigned and not orphaned,
+        }
+
+    def _legacy_destinations(item, selected, store, known):
+        """Which workspaces one legacy document should be assigned to.
+
+        A document keeps the workspace it lived in. That is the only mapping that
+        does not invent access: the alternative, giving everything to everything,
+        hands a customer an HR policy because they once had an HR workspace.
+
+        A shared document has no workspace of its own — it came from _shared and
+        was linked into the workspaces recorded in the admin store, so those are
+        its destinations.
+        """
+        from_category = item.get("from_category")
+        if item.get("shared"):
+            targets = [
+                c for c in store.shared_target_categories(item["filename"])
+                if c in known
+            ]
+            return [c for c in targets if not selected or c in selected]
+        if from_category in known:
+            return [from_category] if not selected or from_category in selected else []
+        return []
+
+    @app.post("/admin/migrations/legacy-content", dependencies=admin_gate_deps,
+              response_model=dict)
+    async def admin_migrate_legacy_content(request: Request):
+        """Import the pre-organisation tree into the library and assign it (D19).
+
+        The operator names the organisation that inherits the content. The
+        legacy tree belonged to the deployment rather than to a customer, so
+        there is no correct owner to infer; assigning it to the free tier or to
+        an arbitrary customer would be worse than asking.
+
+        Files are copied, not moved, and the legacy tree is left untouched, so a
+        wrong call here is recoverable by assigning the document elsewhere.
+        """
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        body = await request.json()
+        target = (body.get("organisation_id") or "").strip()
+        if not target:
+            raise HTTPException(
+                status_code=422,
+                detail="Name the organisation that inherits this content.",
+            )
+        _org_or_404(target)
+        if content_library.is_sample(target):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The system sample organisation is the free tier. Legacy "
+                    "content must go to a customer organisation."
+                ),
+            )
+        categories = body.get("categories") or None
+        result = content_library.migrate_legacy_tree(
+            target, categories=categories, actor=actor_label(request)
+        )
+        for item in result["imported"]:
+            store.add_library_doc(
+                item["filename"], size=Path(item["path"]).stat().st_size,
+                subject="legacy-migration", actor=actor_label(request),
+            )
+        # Shared documents came from _shared and belong in every workspace they
+        # were linked into, which the operator has to name because the link map
+        # lives in the admin store rather than in the filesystem.
+        known = workspace_names()
+        cats = (
+            [c for c in categories if c in known]
+            if categories else list(known)
+        )
+        assigned = []
+        touched = []
+        for item in result["imported"]:
+            name = shared_docs.safe_name(item["filename"])
+            source = Path(item["path"])
+            # Each document goes to the workspace it actually lived in. Giving
+            # every legacy document to every workspace would hand a customer an
+            # HR policy because they once had an HR workspace.
+            dest_cats = _legacy_destinations(
+                item, cats, store, known
+            )
+            if not dest_cats:
+                result["skipped"].append(
+                    {"filename": name, "from_category": item["from_category"],
+                     "reason": "No destination workspace."}
+                )
+                continue
+            for cat in dest_cats:
+                try:
+                    dest = content_library.materialise(
+                        target, cat, source, filename=name
+                    )
+                except ValueError as exc:
+                    result["skipped"].append(
+                        {"filename": name, "category": cat, "reason": str(exc)}
+                    )
+                    continue
+                store.add_content_assignment(
+                    target, cat, name, actor=actor_label(request)
+                )
+                assigned.append({"category": cat, "filename": name,
+                                 "path": str(dest)})
+                touched.append(cat)
+        result["assigned"] = assigned
+        stats = await _reindex(request, touched, target) if touched else {}
+        log_audit(
+            request, "migration.legacy_content", "organisation", target,
+            f"{len(result['imported'])} imported, {len(assigned)} assignments",
+        )
+        return {**result, "reindexed": stats}
 
     @app.get("/admin/library", dependencies=admin_gate_deps)
     def admin_library(subject: str | None = None):

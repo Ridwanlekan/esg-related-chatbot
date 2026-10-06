@@ -54,6 +54,7 @@
   input:focus, select:focus { outline: none; border-color: var(--accent); }
   input[type=file] { display: none; }
   .muted { color: var(--muted); font-size: 12px; }
+  .warn { color: var(--warn); font-size: 13px; margin-top: 8px; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
   .checks { display: flex; flex-wrap: wrap; gap: 6px 14px; padding-top: 2px; }
   .checks label { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
@@ -259,6 +260,11 @@
       </div>
       <div class="hint">A paying customer's organisation. Accounts are created into it and given content by explicit assignment.</div>
       <div id="org-list"><div class="muted">Loading…</div></div>
+
+      <div class="toolbar" style="margin-top:14px">
+        <button id="btn-legacy-scan" class="small">Check for pre-organisation content…</button>
+      </div>
+      <div id="legacy-box"><div class="muted"></div></div>
     </div>
 
     <div class="card hidden" id="org-detail-card">
@@ -1856,6 +1862,61 @@ async function unassignContent(filename) {
   } catch (e) { notify("Remove failed: " + e.message, "err"); }
 }
 
+async function scanLegacyContent() {
+  const box = $("legacy-box");
+  try {
+    const res = await api("/admin/migrations/legacy-content", {
+      headers: authHeaders(),
+    });
+    const d = await res.json();
+    box.innerHTML = "";
+    if (!d.count) {
+      box.appendChild(
+        elm("div", "muted", "No pre-organisation content found.")
+      );
+      return;
+    }
+    box.appendChild(
+      elm("div", "warn", d.count + " document(s) predate organisations. They " +
+        "still resolve through a temporary citation fallback.")
+    );
+    const list = document.createElement("div");
+    for (const doc of d.documents) {
+      list.appendChild(
+        elm("div", "ws-chip",
+          doc.filename + " · " + doc.category + (doc.shared ? " (shared)" : ""))
+      );
+    }
+    box.appendChild(list);
+    if (d.orphaned_shared && d.orphaned_shared.length) {
+      for (const o of d.orphaned_shared) {
+        box.appendChild(elm("div", "warn", o.reason));
+      }
+    }
+    if (!selectedOrg) {
+      box.appendChild(
+        elm("div", "muted", "Select an organisation above to inherit this content.")
+      );
+      return;
+    }
+    if (!confirm("Import these " + d.count + " document(s) into the library and " +
+      "assign them to " + selectedOrg.id + "?\n\nEach document keeps the " +
+      "workspace it was already in. Originals are copied, not moved.")) return;
+    const m = await api("/admin/migrations/legacy-content", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({ organisation_id: selectedOrg.id }),
+    });
+    const r = await m.json();
+    const skipped = (r.skipped || []).length;
+    notify("Imported " + r.imported.length + ", assigned " +
+      (r.assigned || []).length + (skipped ? ", " + skipped + " skipped." : "."));
+    await loadOrgContent();
+    await scanLegacyContent();
+  } catch (e) {
+    box.innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+  }
+}
+
 async function uploadToOrganisation() {
   const cat = $("assign-cat").value;
   const input = $("org-upload-file");
@@ -2454,6 +2515,7 @@ $("btn-refresh-orgs").addEventListener("click", loadOrganisations);
 $("btn-create-org").addEventListener("click", createOrganisation);
 $("btn-refresh-org-content").addEventListener("click", loadOrgContent);
 $("btn-org-upload").addEventListener("click", uploadToOrganisation);
+$("btn-legacy-scan").addEventListener("click", scanLegacyContent);
 $("btn-refresh-members").addEventListener("click", loadOrgMembers);
 $("btn-convert-user").addEventListener("click", convertFreeUser);
 $("btn-upload").addEventListener("click", uploadFiles);

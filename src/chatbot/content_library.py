@@ -26,7 +26,7 @@ import shutil
 from pathlib import Path
 
 from chatbot.users import SAMPLE_ORGANISATION_ID
-from chatbot.workspaces import SHARED_DIR_NAME, root_data_dir
+from chatbot.workspaces import SHARED_DIR_NAME, root_data_dir, workspace_names
 
 logger = logging.getLogger("esg.content_library")
 
@@ -207,3 +207,187 @@ def purge_organisation(organisation_id):
             if exc.errno != errno.ENOENT:
                 raise
     return removed
+
+# ---- legacy tree migration (D19) -------------------------------------------
+#
+# A deployment that predates organisations has its documents in the global tree,
+# DATA_DIR/<workspace>/ and DATA_DIR/_shared/. Those files were never anyone's
+# property: they were shared by every user of the deployment. Migrating them
+# means deciding who may now receive them, which is a judgement the operator
+# makes rather than something the migration may assume.
+
+
+def legacy_roots():
+    """(label, path) for each directory of the pre-organisation global tree."""
+    base = Path(root_data_dir())
+    out = []
+    for category in sorted(workspace_names()):
+        out.append((category, base / category))
+    out.append((SHARED_DIR_NAME, base / SHARED_DIR_NAME))
+    return out
+
+
+def scan_legacy_tree():
+    """Every document in the pre-organisation tree, with what is known about it.
+
+    Reports rather than moves. A migration that cannot be previewed is a
+    migration nobody will run on a deployment holding real documents.
+
+    Shared documents are reported once, under their canonical file in
+    _shared/, with the workspaces they are linked into. Walking the workspace
+    folders as well would report the same bytes once per hardlink, which would
+    make the counts meaningless and invite the same document being imported
+    under several names.
+    """
+    # A shared document is one file in _shared/ plus a link in each subscribing
+    # workspace. Report the canonical only: the links are the same bytes, and
+    # listing them would inflate the count and invite the same document being
+    # imported under several names.
+    canonicals = set()
+    docs = []
+    for category, folder in legacy_roots():
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            is_shared = category == SHARED_DIR_NAME
+            if is_shared:
+                canonicals.add(path.name)
+            docs.append(
+                {
+                    "category": category,
+                    "filename": path.name,
+                    "path": str(path),
+                    "shared": is_shared,
+                    "size": path.stat().st_size,
+                }
+            )
+    return [
+        d for d in docs
+        if d["shared"] or d["filename"] not in canonicals
+    ]
+
+
+def orphaned_shared_documents():
+    """Shared documents whose links live outside any registered workspace.
+
+    A shared document is assigned to the workspaces it was linked into, and
+    that link map lives in the admin store. When the links are instead in a
+    folder that is not a workspace, the document has nowhere to go: it stays
+    unmigrated and the citation fallback can never be switched off. Naming those
+    files turns a permanently-unsafe fallback into a task with an owner.
+    """
+    base = Path(root_data_dir())
+    workspaces = set(workspace_names())
+    orphans = []
+    for category, folder in legacy_roots():
+        if category != SHARED_DIR_NAME or not folder.is_dir():
+            continue
+        for path in sorted(folder.iterdir()):
+            if not path.is_file() or path.name.startswith("."):
+                continue
+            try:
+                inode = path.stat().st_ino
+            except OSError:
+                continue
+            linked_in = set()
+            for other in base.glob(f"*/{path.name}"):
+                if other == path or not other.is_file():
+                    continue
+                try:
+                    same = other.stat().st_ino == inode
+                except OSError:
+                    same = False
+                if same and other.parent.name not in workspaces:
+                    linked_in.add(other.parent.name)
+            if linked_in:
+                orphans.append({
+                    "filename": path.name,
+                    "linked_in": sorted(linked_in),
+                    "reason": (
+                        "Linked into " + ", ".join(sorted(linked_in))
+                        + ", which is not a registered workspace. Register it as "
+                        "a workspace, or add the file to the library by hand."
+                    ),
+                })
+    return orphans
+
+
+def _same_content(a, b, chunk=1 << 20):
+    """Byte-compare two files without holding either in memory."""
+    try:
+        if a.stat().st_size != b.stat().st_size:
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                ba, bb = fa.read(chunk), fb.read(chunk)
+                if ba != bb:
+                    return False
+                if not ba:
+                    return True
+    except OSError:
+        return False
+
+
+def import_into_library(source_path, filename=None):
+    """Copy one legacy document into the master library.
+
+    Idempotent by content: re-running a migration must not duplicate a document
+    that is already there, and must not overwrite a curated one with a
+    pre-organisation original. The library filename is derived from the source
+    so the operator recognises it in the console.
+
+    Returns the library path.
+    """
+    src = Path(source_path)
+    name = filename or src.name
+    root = library_root()
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / name
+    if target.is_file():
+        # Never overwrite what is in the library. A same-size match is the
+        # strongest cheap signal that this is the same document seen twice; an
+        # existing file of any other size may well be a curation edit, and a
+        # re-run of the migration must not silently revert it to the original.
+        if target.stat().st_size != src.stat().st_size:
+            return target
+        if _same_content(target, src):
+            return target
+    payload = src.read_bytes()
+    tmp = target.with_name(target.name + ".partial")
+    try:
+        tmp.write_bytes(payload)
+        tmp.replace(target)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def migrate_legacy_tree(target_organisation_id, categories=None, actor=""):
+    """Import the global tree into the library and assign it to one organisation.
+
+    This is the cutover step for D19. It is deliberately explicit about who
+    receives the content rather than inferring it: the legacy tree belonged to
+    the deployment, not to a customer, so the operator names the organisation
+    that inherits it. Documents are copied, never moved, so a mistake here is
+    recoverable from the original tree.
+    """
+    from chatbot import shared_docs
+
+    wanted = set(categories) if categories else None
+    imported, assigned, skipped = [], [], []
+    for doc in scan_legacy_tree():
+        if wanted is not None and doc["category"] not in wanted:
+            skipped.append({**doc, "reason": "Workspace not selected."})
+            continue
+        try:
+            lib_path = import_into_library(doc["path"])
+        except OSError as exc:
+            skipped.append({**doc, "reason": f"Could not import: {exc}"})
+            continue
+        imported.append({"filename": lib_path.name, "path": str(lib_path),
+                         "from_category": doc["category"], "shared": doc["shared"]})
+    return {"imported": imported, "assigned": assigned, "skipped": skipped,
+            "actor": actor}

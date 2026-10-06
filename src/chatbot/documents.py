@@ -114,6 +114,22 @@ def _candidate_paths(category, name):
     return [base / category / name, base / SHARED_DIR_NAME / name]
 
 
+def legacy_fallback_enabled():
+    """Whether citations may still resolve into the pre-organisation tree.
+
+    On by default: a deployment that has not run the legacy migration would
+    otherwise have every pre-existing document stranded at cutover. It is an
+    operator-controlled off switch rather than a code deletion, because the safe
+    moment to remove the fallback is a deployment fact (has the migration run?)
+    and not something the code can decide.
+
+    Set ``ALLOW_LEGACY_CONTENT=0`` only after
+    ``GET /admin/migrations/legacy-content`` reports nothing left to migrate.
+    """
+    raw = os.environ.get("ALLOW_LEGACY_CONTENT", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def resolve_document(category, source, organisation_id=None):
     """Return the absolute path of `source` as seen from `category`'s workspace.
 
@@ -129,15 +145,20 @@ def resolve_document(category, source, organisation_id=None):
     name = _normalize(source)
     if organisation_id:
         # Served copy first: that is the only content this organisation was
-        # actually assigned. The legacy tree is a fallback for material that
-        # predates organisations and has not been migrated into the library yet;
-        # it holds no per-customer content by construction, and dropping it
+        # actually assigned. The legacy tree is a temporary fallback for material
+        # that predates organisations and has not been migrated into the library
+        # yet; it holds no per-customer content by construction, and dropping it
         # without migrating would strand documents on live deployments. Never
         # another organisation's served copy.
         roots = _organisation_roots(organisation_id, category) + _allowed_roots(category)
         candidates = _organisation_candidate_paths(
             organisation_id, category, name
         ) + _candidate_paths(category, name)
+        if not legacy_fallback_enabled():
+            roots = _organisation_roots(organisation_id, category)
+            candidates = _organisation_candidate_paths(
+                organisation_id, category, name
+            )
     else:
         roots = _allowed_roots(category)
         candidates = _candidate_paths(category, name)
