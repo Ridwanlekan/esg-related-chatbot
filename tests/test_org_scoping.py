@@ -307,7 +307,7 @@ class TestOrganisationDownloadEndpoint:
         root = content_library.library_root()
         root.mkdir(parents=True, exist_ok=True)
         (root / "overview_of_esg.pdf").write_bytes(b"%PDF orientation")
-        assign(c, SAMPLE_ORGANISATION_ID, "overview_of_esg.pdf")
+        assert content_library.seed_sample_pack(categories=["finance"])
         res = c.post("/auth/signup", json={
             "email": "free@visitor.com", "password": "password123",
             "name": "V", "category": "finance",

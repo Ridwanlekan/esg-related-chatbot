@@ -615,6 +615,12 @@ class UserStore:
     def count_users(self):
         return self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
 
+    def count_users_in_organisation(self, organisation_id):
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM users WHERE organisation_id = ?",
+            (organisation_id,),
+        ).fetchone()[0]
+
     def count_for_category(self, category):
         cur = self.conn.execute(
             "SELECT COUNT(*) FROM users WHERE category = ?", (category,)

@@ -269,6 +269,13 @@
       </div>
       <div class="hint">Assigning copies the master into the organisation's own storage and re-indexes it. Nobody outside that organisation can reach it.</div>
       <div id="assign-list"><div class="muted">Loading…</div></div>
+
+      <div class="toolbar" style="margin-top:14px">
+        <input type="file" id="org-upload-file" multiple />
+        <button id="btn-org-upload" class="small primary">Upload to this workspace</button>
+      </div>
+      <div class="hint">A new document goes into the master library and is assigned to this organisation only, so it can be given to another customer later. It is not published to anyone else.</div>
+      <div id="org-upload-log"><div class="muted"></div></div>
     </div>
 
     <div class="card hidden" id="org-members-card">
@@ -1849,6 +1856,41 @@ async function unassignContent(filename) {
   } catch (e) { notify("Remove failed: " + e.message, "err"); }
 }
 
+async function uploadToOrganisation() {
+  const cat = $("assign-cat").value;
+  const input = $("org-upload-file");
+  const picked = Array.from(input.files || []);
+  if (!picked.length) { notify("Choose at least one file first.", "warn"); return; }
+  if (!confirm("Upload " + picked.length + " file(s) to " + selectedOrg.id +
+    " / " + cat + "?\n\nEach goes into the master library and is assigned to this " +
+    "organisation only. Other customers are not affected.")) return;
+  const fd = new FormData();
+  fd.append("category", cat);
+  fd.append("organisation_id", selectedOrg.id);
+  for (const f of picked) fd.append("files", f, f.name);
+  const btn = $("btn-org-upload");
+  setBusy(btn, true, "uploading & indexing…");
+  $("org-upload-log").textContent = "";
+  try {
+    const res = await api("/admin/upload", {
+      method: "POST", headers: authHeaders(false), body: fd,
+    });
+    const d = await res.json();
+    const stats = (d.reindexed || {})[cat] || {};
+    const line = "Assigned " + d.saved_files.length + " file(s) to " +
+      selectedOrg.id + " / " + cat + " — " + (stats.chunks_upserted || 0) +
+      " chunks upserted.";
+    $("org-upload-log").textContent = line;
+    notify(line);
+    input.value = "";
+    await loadOrgContent();
+    await loadOrganisations();
+  } catch (e) {
+    $("org-upload-log").textContent = "";
+    notify("Upload failed: " + e.message, "err");
+  } finally { setBusy(btn, false); }
+}
+
 async function createOrganisation() {
   const id = $("org-id").value.trim();
   const name = $("org-name").value.trim();
@@ -2411,6 +2453,7 @@ $("btn-lib-upload").addEventListener("click", uploadLibrary);
 $("btn-refresh-orgs").addEventListener("click", loadOrganisations);
 $("btn-create-org").addEventListener("click", createOrganisation);
 $("btn-refresh-org-content").addEventListener("click", loadOrgContent);
+$("btn-org-upload").addEventListener("click", uploadToOrganisation);
 $("btn-refresh-members").addEventListener("click", loadOrgMembers);
 $("btn-convert-user").addEventListener("click", convertFreeUser);
 $("btn-upload").addEventListener("click", uploadFiles);

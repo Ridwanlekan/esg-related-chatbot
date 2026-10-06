@@ -10,7 +10,12 @@ from fastapi.testclient import TestClient
 
 from chatbot.admin_store import AdminStore
 from chatbot.api import create_app
-from chatbot.content_library import library_root, list_documents, workspace_dir
+from chatbot.content_library import (
+    library_root,
+    list_documents,
+    seed_sample_pack,
+    workspace_dir,
+)
 from chatbot.session_store import SessionStore
 from chatbot.users import UserStore
 
@@ -51,6 +56,18 @@ def make_org(c, org_id="acme", name="Acme Ltd"):
     res = c.post("/admin/organisations", headers=auth(), json={"id": org_id, "name": name})
     assert res.status_code == 200, res.text
     return res.json()
+
+
+def seed_sample(c, filename="overview_of_esg.pdf", categories=("finance",)):
+    """Give the free tier its launch pack the way startup does.
+
+    The generic assignment endpoint now refuses `_sample` outright (it is the
+    shared free tier, and paid content must not reach every free user), so the
+    seeding path is the only supported one and these tests use it.
+    """
+    upload_library(c, filename)
+    placed = seed_sample_pack(categories=list(categories))
+    assert placed, "sample pack was not seeded"
 
 
 def assign(c, org_id, filenames, categories):
@@ -165,8 +182,7 @@ class TestDeleteConfirmation:
 
     def test_sample_pack_survives_a_customer_deletion(self, env):
         c, _ = env
-        upload_library(c, "overview_of_esg.pdf")
-        assign(c, "_sample", ["overview_of_esg.pdf"], ["finance"])
+        seed_sample(c)
         make_org(c)
         c.post("/admin/organisations/delete", headers=auth(),
                json={"organisation_id": "acme", "confirm": "acme"})
@@ -236,11 +252,22 @@ class TestAssignment:
         assert list_documents("acme", "finance") == ["a.pdf"]
         assert list_documents("acme", "hr") == ["a.pdf"]
 
-    def test_assignment_to_sample_organisation(self, env):
+    def test_paid_assignment_to_the_sample_organisation_is_refused(self, env):
+        """`_sample` is the shared free tier.
+
+        Assigning to it would serve the document to every free account in
+        deployment, which is the paid/paying boundary and not something a
+        platform admin should be able to do by accident.
+        """
         c, _ = env
-        upload_library(c, "overview_of_esg.pdf")
-        res = assign(c, "_sample", ["overview_of_esg.pdf"], ["finance"])
-        assert res.status_code == 200
+        upload_library(c, "acme-contract.pdf")
+        res = assign(c, "_sample", ["acme-contract.pdf"], ["finance"])
+        assert res.status_code == 409
+        assert list_documents("_sample", "finance") == []
+
+    def test_sample_organisation_still_serves_the_launch_pack(self, env):
+        c, _ = env
+        seed_sample(c)
         assert list_documents("_sample", "finance") == ["overview_of_esg.pdf"]
 
     def test_one_organisation_never_sees_another(self, env):

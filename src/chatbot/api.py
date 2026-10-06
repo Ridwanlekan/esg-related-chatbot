@@ -321,6 +321,7 @@ class AdminUserUpdateRequest(BaseModel):
 class DocumentDeleteRequest(BaseModel):
     category: str
     filename: str
+    organisation_id: str | None = None
 
 
 class OrganisationCreateRequest(BaseModel):
@@ -1001,9 +1002,16 @@ def create_app(
         return app.state.admin_gate
 
     @app.get("/admin/status", dependencies=admin_gate_deps)
-    def admin_status(request: Request):
-        registry = app.state.workspace_registry
-        config_based = bool(app.state.workspace_config)
+    def admin_status(request: Request, organisation_id: str | None = None):
+        """Workspace and index status, optionally for one organisation.
+
+        Scoped, the counts are that organisation's own served copies and its own
+        index. Reporting the global tree here would tell a platform operator
+        that a customer with nothing assigned has four indexed workspaces.
+        """
+        organisation_id = _org_scope(organisation_id)
+        registry = app.state.workspace_registry if not organisation_id else None
+        config_based = bool(app.state.workspace_config) and not organisation_id
         cats = (
             list(registry)
             if registry
@@ -1013,16 +1021,17 @@ def create_app(
         total_chunks = 0
         for cat in cats:
             meta = workspace_meta(cat)
-            if config_based:
-                db = Path(index_dir()) / f"vectors_{cat}.sqlite3"
+            if organisation_id or config_based:
+                db = _scope_index_path(cat, organisation_id)
                 chunks = sources = 0
                 if db.exists():
                     try:
                         conn = sqlite3.connect(db)
                         chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
                         sources = conn.execute(
-                            "SELECT COUNT(DISTINCT source) FROM chunks"
-                        ).fetchone()[0]
+                            "SELECT DISTINCT source FROM chunks"
+                        ).fetchall()
+                        sources = len(sources)
                         conn.close()
                     except sqlite3.Error:
                         pass
@@ -1034,7 +1043,7 @@ def create_app(
                     chunks = 0
                 sources = 0
             total_chunks += chunks or 0
-            data = Path(root_data_dir()) / cat
+            data = _scope_data_dir(cat, organisation_id)
             files = sorted(p.name for p in data.iterdir()) if data.is_dir() else []
             statuses.append(
                 {
@@ -1052,10 +1061,21 @@ def create_app(
         totals = {
             "workspaces": len(cats),
             "chunks": total_chunks,
-            "users": user_store.count_users() if user_store is not None else 0,
+            "users": (
+                user_store.count_users_in_organisation(organisation_id)
+                if organisation_id and user_store is not None
+                else (user_store.count_users() if user_store is not None else 0)
+            ),
             "sessions": app.state.session_store.count(),
         }
-        return {"totals": totals, "workspaces": statuses, "progress": INGEST_PROGRESS.snapshot()}
+        payload = {
+            "totals": totals,
+            "workspaces": statuses,
+            "progress": INGEST_PROGRESS.snapshot(),
+        }
+        if organisation_id:
+            payload["organisation_id"] = organisation_id
+        return payload
 
     @app.get("/admin/workspaces", dependencies=admin_gate_deps)
     def admin_workspaces(get_store: AdminStore = admin_store_dep):
@@ -1193,8 +1213,48 @@ def create_app(
         )
         return {"deleted": category, "purged": removed}
 
-    def _vector_stats(cat):
-        db = Path(index_dir()) / f"vectors_{cat}.sqlite3"
+    def _org_scope(organisation_id):
+        """Resolve an organisation scope, or None when none was asked for.
+
+        An absent organisation means the legacy global workspace tree, which is
+        what every pre-organisation deployment and every existing console
+        request means. When one is given, every read and write below is confined
+        to that organisation's served copies and its own index, so the console
+        cannot show one customer's documents under another's name.
+        """
+        if not organisation_id:
+            return None
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        org = user_store.get_organisation(organisation_id)
+        if org is None:
+            raise HTTPException(status_code=404, detail="Organisation not found")
+        try:
+            content_library.organisation_dir(organisation_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid organisation.")
+        return organisation_id
+
+    def _scope_data_dir(cat, organisation_id):
+        """Where a workspace's documents live for this scope."""
+        if organisation_id:
+            try:
+                return content_library.workspace_dir(organisation_id, cat)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid workspace.")
+        return Path(root_data_dir()) / cat
+
+    def _scope_index_path(cat, organisation_id):
+        """The index a workspace is read from for this scope."""
+        if organisation_id:
+            try:
+                return content_library.index_dir_for(organisation_id, cat)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid workspace.")
+        return Path(index_dir()) / f"vectors_{cat}.sqlite3"
+
+    def _vector_stats(cat, organisation_id=None):
+        db = _scope_index_path(cat, organisation_id)
         if not db.exists():
             return set(), 0
         try:
@@ -1209,25 +1269,41 @@ def create_app(
         except sqlite3.Error:
             return set(), 0
 
-    def _indexed_sources(cat):
-        return _vector_stats(cat)[0]
+    def _indexed_sources(cat, organisation_id=None):
+        return _vector_stats(cat, organisation_id)[0]
 
     @app.get("/admin/documents", dependencies=admin_gate_deps)
-    def admin_documents(limit: int = 100, offset: int = 0, category: str | None = None):
+    def admin_documents(
+        limit: int = 100,
+        offset: int = 0,
+        category: str | None = None,
+        organisation_id: str | None = None,
+    ):
+        """Documents, optionally scoped to one organisation.
+
+        Scoped is the honest default for a multi-tenant console: without it this
+        endpoint describes the global tree, which for a deployment that has moved
+        to organisations is nobody's content at all. Left in place unscoped for
+        pre-organisation deployments, where the global tree is real.
+        """
         limit = max(1, min(limit, 500))
         offset = max(0, offset)
-        registry = app.state.workspace_registry
+        organisation_id = _org_scope(organisation_id)
+        registry = app.state.workspace_registry if not organisation_id else None
+        known = list(registry) if registry else workspace_names()
         if category is not None:
-            if category not in (list(registry) if registry else workspace_names()):
+            if category not in known:
                 raise HTTPException(status_code=404, detail="Unknown workspace")
             cats = [category]
         else:
-            cats = list(registry) if registry else workspace_names()
+            cats = known
         groups = []
-        shared_map = _shared_targets_by_path(app.state.admin_store)
+        shared_map = (
+            _shared_targets_by_path(app.state.admin_store) if not organisation_id else {}
+        )
         for cat in cats:
-            indexed = _indexed_sources(cat)
-            folder = Path(root_data_dir()) / cat
+            indexed = _indexed_sources(cat, organisation_id)
+            folder = _scope_data_dir(cat, organisation_id)
             all_files = []
             if folder.is_dir():
                 for p in sorted(folder.iterdir()):
@@ -1254,7 +1330,10 @@ def create_app(
                     "has_more": offset + len(page) < len(all_files),
                 }
             )
-        return {"documents": groups, "limit": limit, "offset": offset}
+        payload = {"documents": groups, "limit": limit, "offset": offset}
+        if organisation_id:
+            payload["organisation_id"] = organisation_id
+        return payload
 
     def _shared_conflict(store, category, name):
         """Explain why writing `name` into `category` would damage a shared doc.
@@ -1280,6 +1359,78 @@ def create_app(
             f"uploading over it would rewrite the shared copy."
         )
 
+    async def _upload_into_organisation(
+        request, organisation_id, category, files
+    ):
+        """Library upload followed by assignment, for one workspace.
+
+        Split out of the unscoped upload so an organisation write and a global
+        write cannot drift apart: the organisation path gets the atomic library
+        write, the assignment record and the organisation's own reindex, and
+        falls out of the same rules about what is refused.
+        """
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        _org_or_404(organisation_id)
+        if content_library.is_sample(organisation_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The system sample organisation is the shared free tier; paid "
+                    "content cannot be uploaded into it."
+                ),
+            )
+        started = time.time()
+        root = content_library.library_root()
+        root.mkdir(parents=True, exist_ok=True)
+        stored, assigned, skipped = [], [], []
+        for f in files:
+            name = shared_docs.safe_name(f.filename)
+            if not name:
+                continue
+            payload = await f.read()
+            target = root / name
+            tmp = target.with_name(target.name + ".partial")
+            try:
+                tmp.write_bytes(payload)
+                tmp.replace(target)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
+            store.add_library_doc(
+                name, size=len(payload), actor=actor_label(request)
+            )
+            stored.append(name)
+            try:
+                dest = content_library.materialise(
+                    organisation_id, category, target, filename=name
+                )
+            except ValueError as exc:
+                skipped.append({"filename": name, "reason": str(exc)})
+                continue
+            store.add_content_assignment(
+                organisation_id, category, name, actor=actor_label(request)
+            )
+            assigned.append({"category": category, "filename": name, "path": str(dest)})
+        if not stored:
+            raise HTTPException(status_code=422, detail="No files were uploaded")
+        stats = await _reindex(request, [category], organisation_id)
+        log_audit(
+            request, "content.assign", "organisation", organisation_id,
+            ",".join(sorted({a["filename"] for a in assigned})),
+        )
+        return {
+            "organisation_id": organisation_id,
+            "saved_files": stored,
+            "assigned": assigned,
+            "skipped": skipped,
+            "reindexed": stats,
+            "duration_seconds": round(time.time() - started, 1),
+        }
+
     @app.post(
         "/admin/upload",
         dependencies=admin_gate_deps,
@@ -1289,10 +1440,23 @@ def create_app(
         request: Request,
         category: str = Form(...),
         files: list[UploadFile] = File(default=[]),
+        organisation_id: str | None = Form(default=None),
     ):
+        """Upload documents, unscoped or into one organisation's workspace.
+
+        Scoped, this does not write straight into the served copy. A served copy
+        with no assignment behind it is content nobody can see and nobody can
+        revoke, so an organisation upload goes into the master library and is
+        then assigned, exactly as the two-step console flow would. One rule for
+        how content reaches a customer: it is assigned, never dropped in place.
+        """
         if category not in workspace_names():
             raise HTTPException(status_code=422, detail="Unknown workspace")
         store = app.state.admin_store
+        if organisation_id:
+            return await _upload_into_organisation(
+                request, organisation_id, category, files
+            )
         for f in files:
             name = os.path.basename((f.filename or "").replace("\\", "/"))
             if not name:
@@ -1323,12 +1487,55 @@ def create_app(
             "duration_seconds": round(time.time() - started, 1),
         }
 
+    async def _delete_from_organisation(request, req):
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        _org_or_404(req.organisation_id)
+        name = shared_docs.safe_name(req.filename)
+        if not name:
+            raise HTTPException(status_code=404, detail="Document not found")
+        try:
+            existed = content_library.remove(
+                req.organisation_id, req.category, name
+            )
+        except ValueError:
+            existed = False
+        unassigned = store.remove_content_assignment(
+            req.organisation_id, req.category, name
+        )
+        if not existed and not unassigned:
+            raise HTTPException(status_code=404, detail="Document not found")
+        stats = await _reindex(request, [req.category], req.organisation_id)
+        log_audit(
+            request, "content.unassign", "organisation", req.organisation_id,
+            f"{req.category}/{name}",
+        )
+        return {
+            "organisation_id": req.organisation_id,
+            "deleted": name,
+            "workspace": req.category,
+            "assignment_removed": unassigned,
+            "served_copy_removed": existed,
+            "stale_chunks_removed": (stats.get(req.category) or {})
+            .get("stale_chunks_removed", 0),
+        }
+
     @app.post("/admin/documents/delete", dependencies=admin_gate_deps)
     async def admin_delete_document(
         req: DocumentDeleteRequest, request: Request
     ):
+        """Delete a document, unscoped or from one organisation's workspace.
+
+        Scoped, this removes the served copy *and* the assignment. Unlinking the
+        file alone would leave the assignment behind, so the console would keep
+        offering to grant the customer a document that is no longer there, and
+        the audit trail would claim content the customer never received.
+        """
         if req.category not in workspace_names():
             raise HTTPException(status_code=422, detail="Unknown workspace")
+        if req.organisation_id:
+            return await _delete_from_organisation(request, req)
         folder = Path(root_data_dir()) / req.category
         name = os.path.basename(req.filename.replace("\\", "/"))
         conflict = _shared_conflict(app.state.admin_store, req.category, name)
@@ -1736,6 +1943,15 @@ def create_app(
         org = user_store.get_organisation(req.organisation_id)
         if org is None:
             raise HTTPException(status_code=404, detail="Organisation not found")
+        if content_library.is_sample(req.organisation_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The system sample organisation is the shared free tier; paid "
+                    "content cannot be assigned to it. Create a customer "
+                    "organisation and convert the account instead."
+                ),
+            )
         cats = [c for c in dict.fromkeys(req.categories) if c in workspace_names()]
         if not cats:
             raise HTTPException(
