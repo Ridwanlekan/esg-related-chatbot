@@ -61,6 +61,7 @@ from chatbot.ingest import INGEST_PROGRESS
 from chatbot.security import RateLimiter, int_env, make_auth_check, make_rate_limit
 from chatbot.session_store import SessionStore
 from chatbot.users import (
+    ORG_ROLE_ADMIN,
     ORG_ROLE_OWNER,
     ORG_ROLES,
     SAMPLE_ORGANISATION_ID,
@@ -358,6 +359,32 @@ class OwnershipTransferRequest(BaseModel):
     organisation_id: str = Field(min_length=1, max_length=64)
     from_user_id: str = Field(min_length=1, max_length=64)
     to_user_id: str = Field(min_length=1, max_length=64)
+
+
+# Self-service models. None of these carry an organisation id: the caller's own
+# account decides which organisation they are acting on, so there is no field to
+# point at somebody else's.
+
+class OrgMemberCreateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=200)
+    name: str = Field(default="", max_length=160)
+    category: str = Field(default="finance", max_length=64)
+    workspaces: list[str] = Field(default_factory=list)
+
+
+class OrgSelfRoleRequest(BaseModel):
+    role: str = Field(default="", max_length=20)
+
+
+class OrgSelfWorkspacesRequest(BaseModel):
+    categories: list[str] = Field(default_factory=list)
+    revoke: list[str] = Field(default_factory=list)
+    category: str | None = Field(default=None, max_length=64)
+
+
+class OrgSelfTransferRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=64)
 
 
 class OrgMembershipRequest(BaseModel):
@@ -2211,6 +2238,234 @@ def create_app(
             raise HTTPException(status_code=404, detail="Organisation not found")
         return org
 
+    # ---- organisation self-service (Section 3.3) ----------------------------
+    #
+    # Q11 gives Organisation Admin the right to manage their own people and
+    # workspaces. These routes exist so they do not need the platform key to do
+    # it. Two rules hold across all of them:
+    #
+    #   The organisation comes from the caller's own account, never from the
+    #   request. There is no organisation_id parameter to get wrong, so there is
+    #   no way to address another customer's seats by editing a body.
+    #
+    #   Authority is re-read from the store on every call rather than trusted from
+    #   the token. A token issued while someone was an admin outlives their
+    #   demotion, so a demoted admin's existing token must stop working here.
+
+    def _caller_organisation(caller):
+        """The caller's own organisation, or 403 if they have no usable account.
+
+        Free-tier accounts live in the system sample organisation, which has no
+        owner and is not a customer: there is nobody there to hand authority to.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        org_id = (caller or {}).get("organisation_id")
+        if not org_id:
+            raise HTTPException(
+                status_code=403, detail="Your account has no organisation."
+            )
+        return _org_or_404(org_id)
+
+    def _require_org_manager(caller, allow_owner_only=False):
+        """Authorise an organisation admin (Q11). Returns (organisation, role)."""
+        org = _caller_organisation(caller)
+        role = user_store.org_role(caller["id"])
+        if role not in (ORG_ROLE_OWNER, ORG_ROLE_ADMIN):
+            raise HTTPException(
+                status_code=403,
+                detail="Only an organisation owner or admin can do this.",
+            )
+        if allow_owner_only and role != ORG_ROLE_OWNER:
+            raise HTTPException(
+                status_code=403, detail="Only the organisation owner can do this."
+            )
+        return org, role
+
+    def _member_in_caller_org(caller, user_id):
+        """Resolve a target user, refusing anyone outside the caller's org.
+
+        Without this an admin could pass any user id and edit another
+        organisation's seats, since the ids are not secret.
+        """
+        target = user_store.get(user_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        if target["organisation_id"] != caller["organisation_id"]:
+            raise HTTPException(
+                status_code=404, detail="User not found"
+            )
+        return target
+
+    @app.get("/org/members")
+    def org_members(caller: dict = user_dep):
+        """Everyone in the caller's organisation, with role and workspaces.
+
+        The same shape the platform console gets, so "who here can do what" is
+        one question rather than two lists to reconcile by eye.
+        """
+        org, role = _require_org_manager(caller)
+        roles = {r["user_id"]: r["role"] for r in user_store.org_roles_for(org["id"])}
+        members = []
+        for u in user_store.list_users_in_organisation(org["id"], limit=500):
+            u["org_role"] = roles.get(u["id"])
+            u["workspaces"] = [
+                m["category"] for m in user_store.memberships(u["id"])
+            ]
+            u["primary_workspace"] = u["category"]
+            members.append(u)
+        return {
+            "organisation": org,
+            "your_role": role,
+            "members": members,
+            "available_workspaces": workspace_names(),
+        }
+
+    @app.post("/org/members")
+    def org_create_member(req: OrgMemberCreateRequest, request: Request,
+                          caller: dict = user_dep):
+        """Add a seat to the caller's organisation.
+
+        A customer may add their own people (Q11) but may not introduce content
+        (Q1: there is no customer-side upload path at all). Creating an account
+        here is a seat, not a document.
+        """
+        org, _role = _require_org_manager(caller)
+        try:
+            user = user_store.create_user(
+                req.email, req.password, req.name, req.category,
+                organisation_id=org["id"],
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        added = []
+        for cat in dict.fromkeys(req.workspaces or [req.category]):
+            try:
+                user_store.add_workspace(user["id"], cat)
+                added.append(cat)
+            except ValueError:
+                # A bad workspace name must not leave a half-provisioned seat
+                # behind, so undo the account rather than reporting success.
+                user_store.delete_user(user["id"])
+                raise HTTPException(
+                    status_code=422, detail=f"Unknown workspace: {cat}"
+                )
+        log_audit(
+            request, "org.member_create", "user", user["id"],
+            f"org={org['id']} actor_role={user_store.org_role(caller['id'])}",
+        )
+        user["workspaces"] = user_store.workspace_categories(user["id"])
+        return user
+
+    @app.delete("/org/members/{user_id}")
+    def org_remove_member(user_id: str, request: Request, caller: dict = user_dep):
+        """Remove a seat from the caller's organisation."""
+        org, role = _require_org_manager(caller)
+        target = _member_in_caller_org(caller, user_id)
+        if target["id"] == caller["id"]:
+            raise HTTPException(
+                status_code=409,
+                detail="You cannot remove your own seat. Ask the owner to do it.",
+            )
+        if user_store.org_role(user_id) == ORG_ROLE_OWNER:
+            raise HTTPException(
+                status_code=409,
+                detail="The owner's seat cannot be removed; transfer ownership "
+                       "instead.",
+            )
+        if not user_store.delete_user(user_id):
+            raise HTTPException(status_code=404, detail="User not found")
+        log_audit(
+            request, "org.member_remove", "user", user_id,
+            f"org={org['id']} actor_role={role}",
+        )
+        return {"removed": user_id}
+
+    @app.post("/org/members/{user_id}/role")
+    def org_set_member_role(user_id: str, req: OrgSelfRoleRequest, request: Request,
+                            caller: dict = user_dep):
+        """Grant or revoke an organisation role inside the caller's organisation."""
+        org, role = _require_org_manager(caller)
+        target = _member_in_caller_org(caller, user_id)
+        wanted = (req.role or "").strip().lower()
+        if wanted == ORG_ROLE_OWNER:
+            raise HTTPException(
+                status_code=409,
+                detail="Ownership is transferred, not granted. Use the transfer "
+                       "endpoint.",
+            )
+        if target["id"] == caller["id"] and wanted == "":
+            raise HTTPException(
+                status_code=409, detail="You cannot remove your own admin role."
+            )
+        try:
+            if wanted:
+                user_store.set_org_role(org["id"], user_id, wanted)
+            else:
+                user_store.revoke_org_role(org["id"], user_id)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        log_audit(
+            request, "org.role_change", "user", user_id,
+            f"org={org['id']} role={wanted or 'none'} actor_role={role}",
+        )
+        return {"user_id": user_id, "role": wanted or None}
+
+    @app.post("/org/members/{user_id}/workspaces")
+    def org_set_member_workspaces(user_id: str, req: OrgSelfWorkspacesRequest,
+                                  request: Request, caller: dict = user_dep):
+        """Grant or revoke workspace access for a seat (Q11)."""
+        org, role = _require_org_manager(caller)
+        target = _member_in_caller_org(caller, user_id)
+        cats = [c for c in dict.fromkeys(req.categories)]
+        unknown = [c for c in cats if c not in workspace_names()]
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail="Unknown workspace: " + ", ".join(unknown),
+            )
+        granted, revoked = [], []
+        try:
+            for cat in cats:
+                user_store.add_workspace(user_id, cat)
+                granted.append(cat)
+            for cat in req.revoke:
+                if cat not in workspace_names():
+                    raise HTTPException(
+                        status_code=422, detail="Unknown workspace: " + cat
+                    )
+                user_store.remove_workspace(user_id, cat)
+                revoked.append(cat)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        if req.category and req.category in user_store.workspace_categories(user_id):
+            user_store.update_user(user_id, category=req.category)
+        log_audit(
+            request, "org.workspace_access", "user", user_id,
+            f"org={org['id']} granted={','.join(granted)} "
+            f"revoked={','.join(revoked)} actor_role={role}",
+        )
+        return {
+            "user_id": user_id,
+            "workspaces": user_store.workspace_categories(user_id),
+        }
+
+    @app.post("/org/transfer-ownership")
+    def org_transfer_ownership(req: OrgSelfTransferRequest, request: Request,
+                               caller: dict = user_dep):
+        """Move the single owner seat. Owner only (Q9)."""
+        org, _role = _require_org_manager(caller, allow_owner_only=True)
+        target = _member_in_caller_org(caller, req.user_id)
+        try:
+            user_store.transfer_ownership(org["id"], caller["id"], target["id"])
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        log_audit(
+            request, "org.transfer_ownership", "user", target["id"],
+            f"org={org['id']} from={caller['id']}",
+        )
+        return {"organisation_id": org["id"], "owner": target["id"]}
+
     @app.get("/admin/organisations/{organisation_id}/members",
              dependencies=admin_gate_deps)
     def admin_organisation_members(organisation_id: str):
@@ -2275,11 +2530,10 @@ def create_app(
                     detail="An organisation must keep exactly one owner. "
                            "Transfer ownership before revoking this role.",
                 )
-        user_store.conn.execute(
-            "DELETE FROM org_roles WHERE organisation_id = ? AND user_id = ?",
-            (req.organisation_id, req.user_id),
-        )
-        user_store.conn.commit()
+        try:
+            user_store.revoke_org_role(req.organisation_id, req.user_id)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
         log_audit(
             request, "org.role.revoke", "organisation", req.organisation_id,
             f"user={req.user_id} role={req.role}",

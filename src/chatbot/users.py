@@ -351,6 +351,31 @@ class UserStore:
         self.conn.commit()
         return role
 
+    def revoke_org_role(self, organisation_id, user_id):
+        """Remove an org-level role. Refuses to leave an organisation ownerless.
+
+        Q9 makes ownership singular, and an organisation with no owner cannot be
+        administered by anyone, so the last owner's role is not removable. The
+        caller must transfer ownership first, which is a single store operation
+        and never leaves the organisation with two owners or none.
+        """
+        if self.org_role(user_id) == ORG_ROLE_OWNER:
+            remaining = [
+                r for r in self.org_roles_for(organisation_id)
+                if r["role"] == ORG_ROLE_OWNER and r["user_id"] != user_id
+            ]
+            if not remaining:
+                raise ValueError(
+                    "An organisation must keep exactly one owner. Transfer "
+                    "ownership before revoking this role."
+                )
+        cur = self.conn.execute(
+            "DELETE FROM org_roles WHERE organisation_id = ? AND user_id = ?",
+            (organisation_id, user_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
     def transfer_ownership(self, organisation_id, from_user_id, to_user_id):
         """Move the single owner seat (Q9). One call, so there is never a moment
         with two owners or none."""
