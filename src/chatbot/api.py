@@ -65,6 +65,7 @@ from chatbot.workspaces import (
     default_workspace_config,
     index_dir,
     make_workspace_bot,
+    organisation_workspace_config,
     reload_extra_workspaces,
     root_data_dir,
     system_prompt_for,
@@ -438,6 +439,10 @@ def create_app(
         default_workspace_config() if bot is None and not workspaces else {}
     )
     app.state.category_bots = {}
+    # Per-organisation bots, keyed by (organisation_id, workspace). Empty unless
+    # auth is on; the cache exists so a workspace's live vector-store handle
+    # survives between requests instead of being rebuilt each time.
+    app.state.org_bots = {}
     if config_cors:
         app.add_middleware(
             CORSMiddleware,
@@ -765,7 +770,37 @@ def create_app(
 
     admin_store_dep = Depends(get_admin_store)
 
-    def get_bot(request: Request, category: str):
+    def get_org_bot(request: Request, organisation_id: str, category: str):
+        """A workspace bot bound to one organisation's own data dir and index.
+
+        Per-organisation scoping (Section 3.4) is only real if the index is
+        per-organisation too: two organisations both holding a "finance"
+        workspace would otherwise share one vector store, and one could retrieve
+        the other's material. Resolved through organisation_workspace_config so
+        the bot's data_dir is that organisation's served copy.
+
+        Explicitly injected registries (an app handed ``bot=`` or ``workspaces=``)
+        keep winning, the same precedence get_bot() has always used: a caller that
+        supplies its own bots is supplying them for every organisation.
+        """
+        app_ = request.app
+        if app_.state.bot is not None or app_.state.workspace_registry:
+            return get_bot(request, category)
+        if category not in workspace_names():
+            raise HTTPException(status_code=403, detail=f"Unknown workspace: {category}")
+        key = (organisation_id, category)
+        cached = app_.state.org_bots.get(key)
+        if cached is None:
+            cached = make_workspace_bot(
+                category,
+                organisation_workspace_config(organisation_id, category),
+            )
+            app_.state.org_bots[key] = cached
+        return cached
+
+    def get_bot(request: Request, category: str, organisation_id: str | None = None):
+        if organisation_id:
+            return get_org_bot(request, organisation_id, category)
         app_ = request.app
         if category and category in app_.state.workspace_registry:
             return app_.state.workspace_registry[category]
@@ -799,6 +834,9 @@ def create_app(
         # rest so live vector-store handles survive unrelated changes.
         app_.state.category_bots = {
             cat: b for cat, b in app_.state.category_bots.items() if cat in conf
+        }
+        app_.state.org_bots = {
+            key: b for key, b in app_.state.org_bots.items() if key[1] in conf
         }
         app_.state.workspace_config = conf
 
@@ -1288,12 +1326,17 @@ def create_app(
             for t in store.all_shared_targets()
         }
 
-    async def _reindex(request, categories):
-        """Re-index each workspace once; returns per-category ingest stats."""
+    async def _reindex(request, categories, organisation_id=None):
+        """Re-index each workspace once; returns per-category ingest stats.
+
+        Pass `organisation_id` after an assignment change so the index that moves
+        is the one the customer's users actually query, rather than the
+        category-global workspace index.
+        """
         results = {}
         for cat in dict.fromkeys(categories):
             try:
-                bot = get_bot(request, cat)
+                bot = get_bot(request, cat, organisation_id)
             except HTTPException:
                 continue
             if bot is None:
@@ -1690,7 +1733,7 @@ def create_app(
             raise HTTPException(
                 status_code=422, detail="Nothing was assigned. " + str(skipped)
             )
-        stats = await _reindex(request, cats)
+        stats = await _reindex(request, cats, req.organisation_id)
         log_audit(
             request, "content.assign", "organisation", req.organisation_id,
             ",".join(sorted({a["filename"] for a in assigned})),
@@ -1726,7 +1769,7 @@ def create_app(
                     existed = False
                 if store.remove_content_assignment(req.organisation_id, cat, name) or existed:
                     removed.append({"category": cat, "filename": name})
-        stats = await _reindex(request, cats)
+        stats = await _reindex(request, cats, req.organisation_id)
         log_audit(request, "content.unassign", "organisation",
                   req.organisation_id, ",".join(r["filename"] for r in removed))
         return {"organisation_id": req.organisation_id, "removed": removed,
@@ -2104,7 +2147,7 @@ def create_app(
     ):
         session_id = resolve_session(request, req.session_id, user["id"], store)
         history = store.history(session_id, limit=req.history_limit)
-        bot = get_bot(request, user["category"])
+        bot = get_bot(request, user["category"], user.get("organisation_id"))
         tz = tz_offset_minutes(request)
         reply = smalltalk.handle(req.question, user["name"], user["category"], tz)
         sources = []
@@ -2144,7 +2187,7 @@ def create_app(
     ):
         session_id = resolve_session(request, req.session_id, user["id"], store)
         history = store.history(session_id, limit=req.history_limit)
-        bot = get_bot(request, user["category"])
+        bot = get_bot(request, user["category"], user.get("organisation_id"))
         tz = tz_offset_minutes(request)
         reply = smalltalk.handle(req.question, user["name"], user["category"], tz)
 
@@ -2295,7 +2338,7 @@ def create_app(
         request: Request,
         user: dict = user_dep,
     ):
-        bot = get_bot(request, user["category"])
+        bot = get_bot(request, user["category"], user.get("organisation_id"))
         try:
             results = await run_in_threadpool(
                 bot.retrieve, question=req.question, k=req.k, source=req.source
@@ -2326,7 +2369,9 @@ def create_app(
         re-issues one without reloading the conversation.
         """
         try:
-            resolve_document(user["category"], req.source)
+            resolve_document(
+                user["category"], req.source, user.get("organisation_id")
+            )
         except DocumentNotFound:
             raise HTTPException(status_code=404, detail="Document not found")
         mint = citation_token_for(user)
@@ -2404,7 +2449,12 @@ def create_app(
         if not effective:
             raise HTTPException(status_code=404, detail="Document not found")
         try:
-            path = resolve_document(identity["category"], effective)
+            # The organisation comes from the live user record, not the token, so
+            # moving a user between organisations immediately invalidates links
+            # already in their browser history.
+            path = resolve_document(
+                identity["category"], effective, identity.get("organisation_id")
+            )
         except DocumentNotFound:
             raise HTTPException(status_code=404, detail="Document not found")
         log_audit(
