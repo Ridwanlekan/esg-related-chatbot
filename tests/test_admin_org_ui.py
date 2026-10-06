@@ -1,0 +1,178 @@
+"""The Organisations tab has to match the API it drives, and the destructive
+paths have to stay guarded.
+
+These are source-level checks on admin.html, in the same spirit as
+test_admin_ui.py: the failure this prevents is a console that renders a
+plausible screen wired to endpoints that do not exist, or a delete that fires
+on one stray click. Behaviour that can be tested through HTTP is tested through
+HTTP in test_content_assignment.py; what is left here is the wiring itself.
+"""
+
+import re
+from pathlib import Path
+
+ADMIN = (Path(__file__).resolve().parents[1] / "src/chatbot/static/admin.html").read_text()
+
+
+def _fn(name):
+    match = re.search(rf"async function {name}\(.*?\n\}}", ADMIN, re.S)
+    assert match, f"{name}() not found"
+    return match.group(0)
+
+
+def _sync_fn(name):
+    match = re.search(rf"function {name}\(.*?\n\}}", ADMIN, re.S)
+    assert match, f"{name}() not found"
+    return match.group(0)
+
+
+def test_organisations_tab_is_registered():
+    assert 'id="tab-organisations"' in ADMIN
+    assert 'id="view-organisations"' in ADMIN
+    assert '["tab-organisations", "view-organisations"]' in ADMIN
+
+
+def test_switching_to_the_tab_loads_both_halves():
+    """The tab is useless if it opens empty, and the two halves load separately."""
+    body = _sync_fn("showTab")
+    assert 'name === "tab-organisations"' in body
+    assert "loadLibrary()" in body
+    assert "loadOrganisations()" in body
+
+
+def test_every_element_the_tab_touches_exists_in_the_markup():
+    """A $("...") with no matching id renders an empty screen, not an error."""
+    section = re.search(
+        r'<section id="view-organisations".*?</section>', ADMIN, re.S
+    ).group(0)
+    body = ADMIN.split('/* ---------------- organisations and master library ---------------- */')[1]
+    body = body.split("/* ---------------- workspaces ---------------- */")[0]
+    # $("...") with a hyphen is an element id; without one it is elm("tag", ...)
+    # building a DOM node, which is not looked up in the markup.
+    ids = set(re.findall(r'\$?\("([a-z0-9]+-[a-z0-9-]+)"\)', body)) | set(
+        re.findall(r'\$?\("([a-z0-9]+-[a-z0-9-]+)"\)', section)
+    )
+    declared = set(re.findall(r'id="([a-z0-9-]+)"', ADMIN))
+    missing = {i for i in ids if i not in declared}
+    assert not missing, f"admin tab references ids that do not exist: {sorted(missing)}"
+
+
+class TestEndpointsMatchTheApi:
+    def test_library_upload_posts_to_the_real_endpoint(self):
+        body = _fn("uploadLibrary")
+        assert '"/admin/library/upload"' in body
+        assert 'method: "POST"' in body
+
+    def test_library_list_reads_the_real_endpoint(self):
+        assert 'api("/admin/library"' in ADMIN
+
+    def test_assignment_posts_both_organisation_and_files(self):
+        """Assigning without the filename would silently assign nothing."""
+        body = _fn("assignContent")
+        assert '"/admin/library/assign"' in body
+        assert "organisation_id: selectedOrg.id" in body
+        assert "filenames: files" in body
+        assert "categories: [cat]" in body
+
+    def test_unassignment_names_the_workspace_too(self):
+        body = _fn("unassignContent")
+        assert '"/admin/library/unassign"' in body
+        assert "categories: [cat]" in body
+        assert "filenames: [filename]" in body
+
+    def test_organisation_content_is_read_per_organisation(self):
+        body = _fn("loadOrgContent")
+        assert '"/admin/organisations/"' in body
+        assert "encodeURIComponent(selectedOrg.id)" in body
+        assert '"/content"' in body
+
+    def test_create_and_delete_use_the_organisation_endpoints(self):
+        assert '"/admin/organisations"' in _fn("createOrganisation")
+        assert '"/admin/organisations/delete"' in _fn("deleteOrganisation")
+
+
+class TestDestructivePaths:
+    def test_organisation_delete_states_what_is_permanently_lost(self):
+        body = _fn("deleteOrganisation")
+        assert "cannot be undone" in body
+        assert "Permanently delete" in body
+        assert "Master documents in the library are kept" in body
+        # pluralisation must not print "1 users"
+        assert '(n === 1 ? "" : "s")' in body
+
+    def test_organisation_delete_confirms_before_the_request(self):
+        """The server re-checks with the echoed id; the console must not skip
+        straight to the call on one stray click."""
+        body = _fn("deleteOrganisation")
+        first = body.index("confirm(")
+        call = body.index('"/admin/organisations/delete"')
+        assert first < call, "the confirmation must come before the request"
+        assert body.count("confirm(") >= 2, "one prompt is not a two-step confirm"
+
+    def test_delete_sends_the_id_as_confirmation(self):
+        body = _fn("deleteOrganisation")
+        assert "organisation_id: org.id" in body
+        assert "confirm: org.id" in body
+
+    def test_system_organisations_offer_no_delete_button(self):
+        """_sample holds the free tier's shared content; it must not be
+        deletable from the console at all, not merely refused server-side."""
+        body = _sync_fn("renderOrganisations")
+        assert "if (!o.system_owned)" in body
+        assert "deleteOrganisation(o)" in body
+
+    def test_unassignment_confirms_that_users_lose_it(self):
+        body = _fn("unassignContent")
+        assert "Users lose it immediately" in body
+
+
+class TestHonestRendering:
+    def test_a_missing_master_file_is_reported(self):
+        """A registered master whose file is gone would fail to assign with no
+        explanation in the list."""
+        body = _sync_fn("renderLibrary")
+        assert "!d.present" in body
+        assert "missing from the library" in body
+
+    def test_a_missing_served_copy_is_reported(self):
+        body = _sync_fn("renderOrgContent")
+        assert "!r.present" in body
+        assert "file missing from storage" in body
+
+    def test_the_assign_button_states_its_workspace(self):
+        body = _sync_fn("renderOrgContent")
+        assert '"Assign to "' in body
+
+    def test_library_shows_which_organisations_hold_each_document(self):
+        body = _sync_fn("renderLibrary")
+        assert "assigned_to" in body
+        assert "not assigned" in body
+
+    def test_already_assigned_checkboxes_are_disabled(self):
+        """Re-assigning what is already there would look like a no-op that
+        actually reindexed."""
+        body = _sync_fn("renderOrgContent")
+        assert "have.has(d.filename)" in body
+        assert "cb.disabled = cb.checked" in body
+
+
+class TestCreateUserOrganisation:
+    def test_create_user_can_target_an_organisation(self):
+        """Paid accounts are created into a customer organisation (Q22)."""
+        body = _fn("createUser")
+        assert "payload.organisation_id = org" in body
+
+    def test_blank_organisation_stays_the_free_path(self):
+        body = _fn("createUser")
+        assert 'if (org) payload.organisation_id = org' in body
+
+    def test_console_offers_the_free_path_as_the_default(self):
+        body = _fn("loadOrgOptions")
+        assert "Free (sample) — self-service" in body
+        assert 'sel.value = ""' in body
+
+
+def test_upload_makes_no_one_able_to_see_the_document():
+    """The toast must not imply an upload is already live."""
+    body = _fn("uploadLibrary")
+    assert "Assign it to an organisation to make it visible" in body

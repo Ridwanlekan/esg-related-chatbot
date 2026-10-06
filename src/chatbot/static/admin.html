@@ -200,6 +200,7 @@
 
   <div class="tabs">
     <button id="tab-overview" class="active">Overview</button>
+    <button id="tab-organisations">Organisations</button>
     <button id="tab-documents">Documents</button>
     <button id="tab-workspaces">Workspaces</button>
     <button id="tab-users">Users</button>
@@ -225,6 +226,49 @@
       <div id="workspaces"><div class="muted">Enter the admin API key and refresh to see workspace status.</div></div>
       <div class="err-text" id="err" style="color:var(--err);font-size:13px;margin-top:10px;min-height:16px"></div>
       <div id="log" class="hidden"></div>
+    </div>
+  </section>
+
+  <section id="view-organisations" class="hidden">
+    <div class="card">
+      <h2>Master library <span class="muted">(curated originals — serves nobody until assigned)</span></h2>
+      <div class="row-form">
+        <div class="field"><label>Subject</label><input id="lib-subject" placeholder="e.g. climate-disclosure"></div>
+        <div class="field"><label>Jurisdiction</label><input id="lib-jurisdiction" placeholder="e.g. HK"></div>
+        <div class="field"><label>Effective date</label><input id="lib-effective" placeholder="2026-01-01"></div>
+        <div class="field"><label>Version</label><input id="lib-version" placeholder="v1"></div>
+      </div>
+      <div class="dropzone" id="lib-dz">
+        <strong>Drop master documents here</strong>
+        <small>PDF, DOCX, XLSX… these are the originals. Assign them to an organisation below.</small>
+        <small id="lib-dz-files">No files chosen yet.</small>
+      </div>
+      <input id="lib-file-input" type="file" multiple>
+      <div class="hint">Uploading registers a master copy only. No user sees anything until you assign it on purpose.</div>
+      <div class="field"><button id="btn-lib-upload" class="primary">Add to library</button></div>
+      <div id="library-list"><div class="muted">Loading…</div></div>
+    </div>
+
+    <div class="card">
+      <h2>Organisations</h2>
+      <div class="toolbar">
+        <input id="org-id" placeholder="id, e.g. acme-ltd">
+        <input id="org-name" placeholder="Display name">
+        <button id="btn-create-org" class="primary">Create</button>
+        <button id="btn-refresh-orgs" class="small">Refresh</button>
+      </div>
+      <div class="hint">A paying customer's organisation. Accounts are created into it and given content by explicit assignment.</div>
+      <div id="org-list"><div class="muted">Loading…</div></div>
+    </div>
+
+    <div class="card hidden" id="org-detail-card">
+      <h2>Content for <span id="org-detail-name"></span></h2>
+      <div class="toolbar">
+        <select id="assign-cat"></select>
+        <button id="btn-refresh-org-content" class="small">Refresh</button>
+      </div>
+      <div class="hint">Assigning copies the master into the organisation's own storage and re-indexes it. Nobody outside that organisation can reach it.</div>
+      <div id="assign-list"><div class="muted">Loading…</div></div>
     </div>
   </section>
 
@@ -316,8 +360,10 @@
         <div class="field"><label>Password (min 8)</label><input id="user-pass" type="password"></div>
         <div class="field"><label>Name</label><input id="user-name"></div>
         <div class="field"><label>Category</label><select id="user-cat"></select></div>
+        <div class="field"><label>Organisation</label><select id="user-org"></select></div>
         <div class="field"><button id="btn-create-user" class="primary">Create</button></div>
       </div>
+      <div class="hint">A customer organisation creates paying accounts directly into its own organisation. Leave on <em>Free (sample)</em> for a self-service account.</div>
     </div>
     <div class="card">
       <h2>Users <span class="muted" id="user-total"></span></h2>
@@ -423,6 +469,7 @@ let sharedState = { documents: [], workspaces: [] };
 
 const tabs = [
   ["tab-overview", "view-overview"],
+  ["tab-organisations", "view-organisations"],
   ["tab-documents", "view-documents"],
   ["tab-workspaces", "view-workspaces"],
   ["tab-users", "view-users"],
@@ -445,6 +492,7 @@ function showTab(name) {
     $(btn).classList.toggle("active", btn === name);
     $(view).classList.toggle("hidden", btn !== name);
   }
+  if (name === "tab-organisations") { loadLibrary(); loadOrganisations(); }
   if (name === "tab-documents") { loadDocuments(); loadCategories(); loadSharedDocuments(); }
   if (name === "tab-workspaces") { loadWorkspaces(); loadInvites(); loadCategories(); }
   if (name === "tab-users") loadUsers();
@@ -856,6 +904,7 @@ async function loadCategories() {
     $("up-cat").innerHTML = opts;
     $("user-cat").innerHTML = opts;
     $("invite-cat").innerHTML = opts;
+    await loadOrgOptions();
     const boxes = ws
       .map((w) => {
         const c = esc(w.category);
@@ -871,6 +920,31 @@ async function loadCategories() {
 }
 
 /* ---------------- shared documents ---------------- */
+
+async function loadOrgOptions() {
+  const sel = $("user-org");
+  if (!sel) return;
+  const current = sel.value;
+  try {
+    const res = await api("/admin/organisations", { headers: authHeaders() });
+    const orgs = (await res.json()).organisations || [];
+    const byId = new Map(orgs.map((o) => [o.id, o]));
+    // Default to the free self-service path, so the common case needs no choice
+    // made at all (Q22).
+    const sample = orgs.find((o) => o.system_owned) || null;
+    sel.innerHTML =
+      '<option value="">Free (sample) — self-service</option>' +
+      orgs.filter((o) => !o.system_owned).map((o) =>
+        '<option value="' + esc(o.id) + '">' +
+        esc(o.name || o.id) + " — paying customer</option>").join("");
+    if (sample && !current) sel.value = "";
+    if (current && byId.has(current)) sel.value = current;
+  } catch (e) {
+    // The console must still create free accounts when organisations are
+    // unavailable, so leave the default option in place rather than failing.
+    console.error("loadOrgOptions failed:", e);
+  }
+}
 
 const STATE_TAG = {
   ok: ["ok", "linked"],
@@ -1268,7 +1342,350 @@ const privatePicker = wireDropzone("dropzone", "file-input", "dz-files", "_dropF
 const sharedPicker = wireDropzone(
   "shared-dz", "shared-file-input", "shared-dz-files", "_sharedDropFiles"
 );
+const libraryPicker = wireDropzone(
+  "lib-dz", "lib-file-input", "lib-dz-files", "_libDropFiles"
+);
 function fmtFileSize(f) { return fmtSize(f.size); }
+
+/* ---------------- organisations and master library ---------------- */
+
+let orgCache = [];
+let libraryCache = [];
+let selectedOrg = null;
+let orgContentCache = { assignments: {}, library: [], workspaces: [] };
+
+async function loadLibrary() {
+  const box = $("library-list");
+  try {
+    const res = await api("/admin/library", { headers: authHeaders() });
+    libraryCache = (await res.json()).documents || [];
+    renderLibrary();
+  } catch (e) {
+    box.innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+  }
+}
+
+function renderLibrary() {
+  const box = $("library-list");
+  box.innerHTML = "";
+  if (!libraryCache.length) {
+    box.appendChild(
+      elm("div", "muted",
+        "The master library is empty. Add a document above, then assign it to an " +
+        "organisation below.")
+    );
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "table";
+  table.innerHTML =
+    "<thead><tr><th>Document</th><th>Subject</th><th>Jurisdiction</th>" +
+    "<th>Effective</th><th>Version</th><th>Size</th><th>Assigned to</th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  for (const d of libraryCache) {
+    const tr = document.createElement("tr");
+    const name = elm("td", "", d.filename);
+    if (!d.present) {
+      // A registered master whose file is gone would silently fail to assign.
+      name.appendChild(
+        elm("div", "muted", "File missing from the library — re-upload to restore.")
+      );
+    }
+    tr.appendChild(name);
+    tr.appendChild(elm("td", "", d.subject || "—"));
+    tr.appendChild(elm("td", "", d.jurisdiction || "—"));
+    tr.appendChild(elm("td", "", d.effective_date || "—"));
+    tr.appendChild(elm("td", "", d.version || "—"));
+    tr.appendChild(elm("td", "", fmtSize(d.size)));
+    const assigned = d.assigned_to || [];
+    tr.appendChild(elm("td", "",
+      assigned.length ? assigned.join(", ") : "not assigned"));
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  box.appendChild(table);
+}
+
+async function uploadLibrary() {
+  const files = libraryPicker.files();
+  if (!files.length) { notify("Choose at least one file to add.", "warn"); return; }
+  const fd = new FormData();
+  const optional = {
+    subject: "lib-subject", jurisdiction: "lib-jurisdiction",
+    effective_date: "lib-effective", version: "lib-version",
+  };
+  for (const [field, id] of Object.entries(optional)) {
+    const v = $(id).value.trim();
+    if (v) fd.append(field, v);
+  }
+  for (const f of files) fd.append("files", f, f.name);
+  const btn = $("btn-lib-upload");
+  setBusy(btn, true, "uploading…");
+  try {
+    const res = await api("/admin/library/upload",
+      { method: "POST", headers: authHeaders(false), body: fd });
+    const d = await res.json();
+    notify("Added " + d.saved_files.join(", ") +
+      " to the library. Assign it to an organisation to make it visible.");
+    libraryPicker.reset();
+    ["lib-subject", "lib-jurisdiction", "lib-effective", "lib-version"]
+      .forEach((id) => ($(id).value = ""));
+    await loadLibrary();
+    if (selectedOrg) await loadOrgContent();
+  } catch (e) { notify("Upload failed: " + e.message, "err"); }
+  finally { setBusy(btn, false); }
+}
+
+async function loadOrganisations() {
+  try {
+    const res = await api("/admin/organisations", { headers: authHeaders() });
+    orgCache = (await res.json()).organisations || [];
+    renderOrganisations();
+  } catch (e) {
+    $("org-list").innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+  }
+}
+
+function renderOrganisations() {
+  const box = $("org-list");
+  box.innerHTML = "";
+  if (!orgCache.length) {
+    box.appendChild(
+      elm("div", "muted", "No organisations yet. Create one above for a paying customer.")
+    );
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "table";
+  table.innerHTML =
+    "<thead><tr><th>Organisation</th><th>Users</th><th>Documents</th>" +
+    "<th>Type</th><th></th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  for (const o of orgCache) {
+    const tr = document.createElement("tr");
+    const name = elm("td", "", o.name || o.id);
+    name.appendChild(elm("div", "muted", o.id));
+    tr.appendChild(name);
+    tr.appendChild(elm("td", "", String(o.user_count == null ? 0 : o.user_count)));
+    tr.appendChild(elm("td", "", String(o.assignments == null ? 0 : o.assignments)));
+    tr.appendChild(elm("td", "", o.system_owned ? "system" : "customer"));
+    const actions = elm("td");
+    const open = elm("button", "small", "Content");
+    open.onclick = () => selectOrganisation(o);
+    actions.appendChild(open);
+    if (!o.system_owned) {
+      const del = elm("button", "small danger", "Delete");
+      del.onclick = () => deleteOrganisation(o);
+      actions.appendChild(del);
+    } else {
+      const why = elm("span", "muted", " protected");
+      why.style.marginLeft = "8px";
+      why.title = "The shared free-tier organisation cannot be deleted.";
+      actions.appendChild(why);
+    }
+    tr.appendChild(actions);
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  box.appendChild(table);
+}
+
+function selectOrganisation(org) {
+  selectedOrg = org;
+  $("org-detail-card").classList.remove("hidden");
+  $("org-detail-name").textContent = org.name || org.id;
+  loadOrgContent();
+}
+
+function assignedFilenames() {
+  const out = [];
+  for (const rows of Object.values(orgContentCache.assignments || {})) {
+    for (const r of rows) out.push(r.filename);
+  }
+  return new Set(out);
+}
+
+function renderOrgContent() {
+  const box = $("assign-list");
+  box.innerHTML = "";
+  const cat = $("assign-cat").value;
+  const have = assignedFilenames();
+  const available = orgContentCache.library.filter((d) => d.present);
+
+  const picker = document.createElement("div");
+  picker.className = "doc-group";
+  picker.appendChild(elm("h3", "", "Assign from the master library"));
+  const chips = elm("div", "checks");
+  for (const d of available) {
+    const label = elm("label", "ws-chip");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = d.filename;
+    cb.checked = have.has(d.filename);
+    cb.disabled = cb.checked;
+    if (cb.checked) cb.title = "Already assigned in some workspace.";
+    label.appendChild(cb);
+    label.appendChild(elm("span", "tag", d.subject || d.filename));
+    chips.appendChild(label);
+  }
+  if (!available.length) {
+    chips.appendChild(
+      elm("div", "muted", "The library is empty. Add a master document first.")
+    );
+  }
+  picker.appendChild(chips);
+  const actions = elm("div", "toolbar");
+  actions.style.marginTop = "8px";
+  const go = elm("button", "small primary", "Assign to " + (cat || "workspace"));
+  go.disabled = !cat;
+  go.onclick = () => assignContent();
+  actions.appendChild(go);
+  picker.appendChild(actions);
+  box.appendChild(picker);
+
+  const rows = (orgContentCache.assignments || {})[cat] || [];
+  if (!cat) return;
+  const served = document.createElement("div");
+  served.className = "doc-group";
+  served.appendChild(elm("h3", "", "Served in " + cat + " (" + rows.length + ")"));
+  if (!rows.length) {
+    served.appendChild(
+      elm("div", "muted", "Nothing assigned to this workspace yet.")
+    );
+  }
+  for (const r of rows) {
+    const line = elm("div", "ws-chip");
+    line.appendChild(elm("span", "tag", r.filename));
+    if (!r.present) {
+      // The assignment record survived but the file did not; say so rather than
+      // showing a healthy-looking chip.
+      line.appendChild(
+        elm("span", "muted",
+          " · file missing from storage — reassign to restore")
+      );
+    }
+    const x = elm("button", "", "×");
+    x.title = "Remove from " + selectedOrg.id + " / " + cat;
+    x.onclick = () => unassignContent(r.filename);
+    line.appendChild(x);
+    served.appendChild(line);
+  }
+  box.appendChild(served);
+}
+
+async function loadOrgContent() {
+  if (!selectedOrg) return;
+  const res = await api("/admin/organisations/" +
+    encodeURIComponent(selectedOrg.id) + "/content", { headers: authHeaders() });
+  const data = await res.json();
+  orgContentCache = {
+    assignments: data.assignments || {},
+    library: data.library || [],
+    workspaces: data.workspaces || [],
+  };
+  const sel = $("assign-cat");
+  const current = sel.value;
+  sel.innerHTML = "";
+  for (const w of orgContentCache.workspaces) {
+    sel.appendChild(new Option(w, w));
+  }
+  if (orgContentCache.workspaces.includes(current)) sel.value = current;
+  sel.onchange = renderOrgContent;
+  renderOrgContent();
+}
+
+async function assignContent() {
+  const cat = $("assign-cat").value;
+  const files = Array.from(
+    $("assign-list").querySelectorAll("input[type=checkbox]:not(:disabled):checked")
+  ).map((i) => i.value);
+  if (!files.length) { notify("Tick at least one document to assign.", "warn"); return; }
+  if (!confirm("Give " + files.join(", ") + " to " + selectedOrg.id + " in " + cat + "?")) return;
+  try {
+    const res = await api("/admin/library/assign", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        organisation_id: selectedOrg.id,
+        categories: [cat],
+        filenames: files,
+      }),
+    });
+    const d = await res.json();
+    const skipped = (d.skipped || []).map((s) => s.filename + " (" + s.reason + ")");
+    notify("Assigned " + (d.assigned || []).length + " document(s) to " +
+      selectedOrg.id + "." + (skipped.length ? " Skipped: " + skipped.join("; ") : ""));
+    await loadOrgContent();
+    await loadOrganisations();
+  } catch (e) { notify("Assign failed: " + e.message, "err"); }
+}
+
+async function unassignContent(filename) {
+  const cat = $("assign-cat").value;
+  if (!confirm("Remove " + filename + " from " + selectedOrg.id + " / " + cat +
+    "? Users lose it immediately.")) return;
+  try {
+    const res = await api("/admin/library/unassign", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        organisation_id: selectedOrg.id,
+        categories: [cat],
+        filenames: [filename],
+      }),
+    });
+    notify("Removed " + filename + " from " + selectedOrg.id + ".");
+    await loadOrgContent();
+    await loadOrganisations();
+  } catch (e) { notify("Remove failed: " + e.message, "err"); }
+}
+
+async function createOrganisation() {
+  const id = $("org-id").value.trim();
+  const name = $("org-name").value.trim();
+  if (!id) { notify("An organisation id is required.", "err"); return; }
+  try {
+    const res = await api("/admin/organisations", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({ id: id, name: name || null }),
+    });
+    const d = await res.json();
+    notify("Created organisation " + (d.name || d.id) + ".");
+    $("org-id").value = $("org-name").value = "";
+    await loadOrganisations();
+  } catch (e) { notify("Create failed: " + e.message, "err"); }
+}
+
+async function deleteOrganisation(org) {
+  const n = org.user_count || 0;
+  const docs = org.assignments || 0;
+  const what =
+    "Permanently delete " + (org.name || org.id) + "?\n\n" +
+    "This cannot be undone. It removes:\n" +
+    "· " + n + " user account" + (n === 1 ? "" : "s") + "\n" +
+    "· " + docs + " content assignment" + (docs === 1 ? "" : "s") + " and every served copy\n" +
+    "· that organisation's search index\n\n" +
+    "Master documents in the library are kept.";
+  if (!confirm(what)) return;
+  // The server requires the id back as confirmation, so a mis-click on the
+  // prompt above cannot reach the destructive call.
+  if (!confirm("Type-safe check: this destroys " + n +
+    " account(s) and " + docs + " document(s) for good. Continue?")) return;
+  try {
+    const res = await api("/admin/organisations/delete", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({ organisation_id: org.id, confirm: org.id }),
+    });
+    const d = await res.json();
+    notify("Deleted " + org.id + ": " + d.members_deleted +
+      " account(s) removed.");
+    if (selectedOrg && selectedOrg.id === org.id) {
+      selectedOrg = null;
+      $("org-detail-card").classList.add("hidden");
+      $("assign-list").innerHTML = "";
+    }
+    await loadOrganisations();
+    await loadLibrary();
+  } catch (e) { notify("Delete failed: " + e.message, "err"); }
+}
 
 /* ---------------- workspaces ---------------- */
 
@@ -1637,13 +2054,17 @@ async function createUser() {
     name: $("user-name").value.trim(),
     category: $("user-cat").value,
   };
+  // Absent means the free self-service path; the server decides the sample org.
+  const org = $("user-org") ? $("user-org").value : "";
+  if (org) payload.organisation_id = org;
   if (!payload.email || !payload.password || !payload.name) { notify("Email, password and name are required.", "err"); return; }
   try {
     const res = await api("/admin/users", {
       method: "POST", headers: authHeaders(), body: JSON.stringify(payload),
     });
     const d = await res.json();
-    notify("Created " + d.email + " (" + d.category + ").");
+    notify("Created " + d.email + " (" + d.category + ", " +
+      (d.organisation_id || "free") + ").");
     $("user-email").value = $("user-pass").value = $("user-name").value = "";
     loadUsers();
     refreshStatus();
@@ -1771,6 +2192,10 @@ async function viewTranscript(sid) {
 
 $("btn-refresh").addEventListener("click", refreshStatus);
 $("btn-reindex-all").addEventListener("click", () => reindex(null, $("btn-reindex-all")));
+$("btn-lib-upload").addEventListener("click", uploadLibrary);
+$("btn-refresh-orgs").addEventListener("click", loadOrganisations);
+$("btn-create-org").addEventListener("click", createOrganisation);
+$("btn-refresh-org-content").addEventListener("click", loadOrgContent);
 $("btn-upload").addEventListener("click", uploadFiles);
 $("btn-shared-upload").addEventListener("click", uploadShared);
 $("btn-refresh-shared").addEventListener("click", loadSharedDocuments);

@@ -300,6 +300,10 @@ class AdminUserCreateRequest(BaseModel):
     password: str = Field(min_length=8, max_length=256)
     name: str = Field(min_length=1, max_length=120)
     category: str = Field(min_length=1, max_length=40)
+    # Omitted means the free self-service path: the account lands in the shared
+    # sample organisation on the launch pack (Q22, Section 3.5). A paying
+    # account is created by an Administrator directly into its organisation.
+    organisation_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class AdminUserUpdateRequest(BaseModel):
@@ -1823,12 +1827,16 @@ def create_app(
             raise HTTPException(status_code=503, detail="User accounts are disabled")
         try:
             user = user_store.create_user(
-                req.email, req.password, req.name, req.category
+                req.email, req.password, req.name, req.category,
+                organisation_id=req.organisation_id,
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
         user["session_count"] = app.state.session_store.count(user_id=user["id"])
-        log_audit(request, "user.create", "user", user.get("id"), req.email)
+        log_audit(
+            request, "user.create", "user", user.get("id"),
+            f"{req.email} org={user.get('organisation_id')}",
+        )
         return user
 
     @app.patch("/admin/users/{user_id}", dependencies=admin_gate_deps)
