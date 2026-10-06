@@ -11,6 +11,7 @@ import sqlite3
 import time
 import urllib.parse
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
@@ -37,7 +38,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from chatbot import content_library, shared_docs, smalltalk, telemetry, voice
+from chatbot import (
+    content_library,
+    email_sender,
+    shared_docs,
+    smalltalk,
+    telemetry,
+    voice,
+)
 from chatbot.admin_security import (
     admin_gate_config,
     make_basic_auth_check,
@@ -60,12 +68,15 @@ from chatbot.download_links import (
 from chatbot.ingest import INGEST_PROGRESS
 from chatbot.security import RateLimiter, int_env, make_auth_check, make_rate_limit
 from chatbot.session_store import SessionStore
+from chatbot import users as users_mod
 from chatbot.users import (
     ORG_ROLE_ADMIN,
     ORG_ROLE_OWNER,
     ORG_ROLES,
     SAMPLE_ORGANISATION_ID,
     UserStore,
+    max_free_accounts,
+    verification_required,
     verify_jwt,
 )
 from chatbot.workspaces import (
@@ -89,6 +100,10 @@ DEFAULT_SESSIONS_PATH = os.path.join(INDEX_DIR, "sessions.sqlite3")
 DEFAULT_USERS_PATH = os.path.join(INDEX_DIR, "users.sqlite3")
 UI_FILE = Path(__file__).with_name("static") / "ui.html"
 ADMIN_FILE = Path(__file__).with_name("static") / "admin.html"
+# Landing page for the email-confirmation link (D18). Separate from the app UI
+# because the person following the link has usually not signed in on this
+# device, so there is no session to show them the app with.
+VERIFY_FILE = Path(__file__).with_name("static") / "verify.html"
 DEFAULT_WORKSPACES_DB = os.path.join(INDEX_DIR, "workspaces.sqlite3")
 
 _DEFAULT = object()
@@ -274,12 +289,27 @@ class UserResponse(BaseModel):
     # no claim, and the server falls back to `category` for those users.
     workspaces: list[str] = []
     created_at: str
+    # D18: absent on rows predating the column and on tokens minted before it
+    # existed, so it stays optional rather than breaking those sessions.
+    email_verified: bool | None = None
 
 
 class AuthResponse(BaseModel):
     token: str
     user: UserResponse
     workspace: dict
+    # Present only when the account still needs to confirm its address. Carries
+    # the link when mail could not actually be sent, so a deployment without an
+    # SMTP relay is not locked out of its own product.
+    verification: dict | None = None
+
+
+class VerificationRequest(BaseModel):
+    token: str = Field(min_length=8, max_length=2048)
+
+
+class ResendVerificationRequest(BaseModel):
+    pass
 
 
 class MeResponse(BaseModel):
@@ -288,6 +318,10 @@ class MeResponse(BaseModel):
     # Every workspace this user may reach, primary first. More than one means
     # the frontend should offer a switcher; exactly one means it must not.
     workspaces: list[dict] = []
+    # D18. Non-null only while the address is unconfirmed, and the frontend
+    # should then block the composer and offer a resend rather than letting the
+    # user discover the block by asking a question.
+    verification: dict | None = None
 
 
 class WorkspaceCreateRequest(BaseModel):
@@ -955,6 +989,110 @@ def create_app(
         ]
         return allowed or [workspace_summary(user.get("category"))]
 
+    def _cooldown_elapsed(sent_at_iso):
+        """Whether the resend cooldown has passed, treating bad input as elapsed."""
+        try:
+            sent = datetime.fromisoformat(sent_at_iso)
+        except (TypeError, ValueError):
+            return True
+        if sent.tzinfo is None:
+            sent = sent.replace(tzinfo=timezone.utc)
+        return (
+            datetime.now(timezone.utc) - sent
+        ).total_seconds() >= users_mod.VERIFICATION_RESEND_COOLDOWN_SECONDS
+
+    def require_verified(user):
+        """Block an unconfirmed account from spending model time.
+
+        D18 asks whether a user must confirm an address before the sample
+        workspace opens. The answer here is yes, applied only to the free
+        self-service path: a paid or invited account was vouched for by someone
+        who set it up, and a customer must never be locked out of a product
+        they have already bought.
+
+        Placed at the endpoints that actually serve content rather than in
+        `require_user`, so an unverified user can still reach `/me` and the
+        resend endpoint, which is what lets them recover.
+        """
+        if user_store is None or not verification_required():
+            return
+        if user.get("organisation_id") != SAMPLE_ORGANISATION_ID:
+            return
+        if user_store.is_verified(user["id"]):
+            return
+        raise HTTPException(
+            status_code=403,
+            detail="Confirm your email address to start asking questions.",
+        )
+
+    def public_base_url(request: Request):
+        """The origin a verification link should point at.
+
+        Prefers an explicit setting so a link is correct behind a proxy or a
+        public hostname the app cannot infer from its own request.
+        """
+        configured = app.state.admin_store.get_setting("public_base_url") if (
+            app.state.admin_store is not None
+        ) else None
+        if configured:
+            return configured
+        return str(request.base_url).rstrip("/")
+
+    def public_base_url_from_settings(admin_store):
+        """Fallback origin for calls with no request in hand."""
+        configured = (
+            admin_store.get_setting("public_base_url") if admin_store else None
+        )
+        return configured or "http://localhost:8000"
+
+    def _issue_and_send_verification(user, request=None):
+        """Mint a verification token and get the message away.
+
+        A send failure is swallowed deliberately. The account exists and the
+        user can resend, so failing the whole signup over a mail outage would
+        turn a transient problem into a lost account. The token is minted
+        first and the plaintext is only returned when sending fell back to the
+        outbox, where an operator can act on it.
+        """
+        token = user_store.issue_verification_token(user["id"])
+        sender = email_sender.build_sender(app.state.admin_store)
+        base_url = public_base_url(request) if request is not None else None
+        result = {"sent": False, "verified": bool(user.get("email_verified_at"))}
+        if base_url is None:
+            # No request in hand (internal call path): still record the mail so
+            # the link is recoverable, using the stored host if there is one.
+            base_url = public_base_url_from_settings(app.state.admin_store)
+        try:
+            delivered = email_sender.send_verification_email(
+                sender, user["email"], base_url, token
+            )
+            # "Sent" means the message is retrievable: transmitted by a relay,
+            # or written to the outbox. Both count, because both let the user
+            # confirm.
+            result["sent"] = bool(delivered)
+        except Exception as exc:  # pragma: no cover - exercised via sender failure
+            logger.warning(
+                "verification mail failed for %s: %s; falling back to outbox",
+                user.get("id"), exc,
+            )
+            if app.state.admin_store is not None:
+                app.state.admin_store.record_email(
+                    user["email"],
+                    email_sender.verification_subject(base_url),
+                    email_sender.verification_body(base_url, token),
+                    html_body=email_sender.verification_html(base_url, token),
+                )
+            result["sent"] = False
+            if base_url:
+                # The message now exists in the outbox, so the link is still
+                # recoverable and can be handed over directly.
+                result["link"] = f"{base_url.rstrip('/')}/verify-email?token={token}"
+        if sender.name() == "outbox" and base_url and "link" not in result:
+            # Surface the link so a no-SMTP deployment can onboard the user
+            # without reading the database.
+            result["link"] = f"{base_url.rstrip('/')}/verify-email?token={token}"
+        return result
+
     @app.get("/metrics")
     def metrics(store=store_dep):
         total_chunks = 0
@@ -1019,6 +1157,13 @@ def create_app(
     @app.get("/ui", response_class=HTMLResponse)
     def ui():
         return UI_FILE.read_text() if UI_FILE.exists() else "<h1>UI not found</h1>"
+
+    @app.get("/verify-email", response_class=HTMLResponse)
+    def verify_email_page():
+        return (
+            VERIFY_FILE.read_text() if VERIFY_FILE.exists()
+            else "<h1>Verification page not found</h1>"
+        )
 
     @app.get("/admin", response_class=HTMLResponse)
     def admin():
@@ -2335,6 +2480,9 @@ def create_app(
             user = user_store.create_user(
                 req.email, req.password, req.name, req.category,
                 organisation_id=org["id"],
+                # The org admin vouched for this person, matching the platform
+                # console. D18 gates self-service, not customer-managed seats.
+                verified=True,
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
@@ -2663,6 +2811,10 @@ def create_app(
             user = user_store.create_user(
                 req.email, req.password, req.name, req.category,
                 organisation_id=req.organisation_id,
+                # Someone who can reach this endpoint set the account up, so it
+                # is vouched for: no address confirmation on a seat an operator
+                # created deliberately (D18 governs self-service only).
+                verified=True,
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
@@ -2871,6 +3023,78 @@ def create_app(
                   f"max_uses={req.max_uses} ttl_hours={req.ttl_hours}")
         return invite
 
+    # ---- D18: verification and free-account administration -----------------
+
+    class VerificationOverrideRequest(BaseModel):
+        verified: bool = True
+
+    @app.get("/admin/verifications", dependencies=admin_gate_deps)
+    def admin_list_verifications(
+        limit: int = 100, offset: int = 0, organisation_id: str | None = None
+    ):
+        """Pending confirmations plus the free-account position.
+
+        The cap is reported alongside the queue so an operator can see both
+        problems in one place: accounts waiting, and accounts available.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        pending = user_store.list_unverified(
+            organisation_id=organisation_id, limit=limit, offset=offset
+        )
+        cap = max_free_accounts()
+        used = user_store.count_users_in_organisation(SAMPLE_ORGANISATION_ID)
+        return {
+            "pending": pending,
+            "count": user_store.count_unverified(organisation_id),
+            "verification_required": verification_required(),
+            "free_accounts": {
+                "used": used,
+                "limit": cap,
+                "remaining": max(0, cap - used) if cap else 0,
+            },
+        }
+
+    @app.post("/admin/users/{user_id}/verify", dependencies=admin_gate_deps)
+    def admin_set_verified(user_id: str, req: VerificationOverrideRequest):
+        """Mark an address confirmed (or not) by hand.
+
+        The escape hatch for a user who cannot receive mail, and the only way
+        to revoke a confirmation we sent to the wrong person.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        if not user_store.get(user_id):
+            raise HTTPException(status_code=404, detail="User not found")
+        return user_store.set_verified(user_id, verified=req.verified)
+
+    @app.get("/admin/emails", dependencies=admin_gate_deps)
+    def admin_list_emails(limit: int = 50, offset: int = 0):
+        """Outbox, newest first. Only populated when no SMTP relay is set."""
+        if app.state.admin_store is None:
+            raise HTTPException(status_code=503, detail="Admin store is disabled")
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        store = app.state.admin_store
+        return {
+            "emails": store.list_emails(limit=limit, offset=offset),
+            "count": store.count_emails(),
+            "pending": store.count_emails(include_consumed=False),
+            "smtp_configured": email_sender.smtp_configured(),
+        }
+
+    @app.post("/admin/emails/{email_id}/consume", dependencies=admin_gate_deps)
+    def admin_consume_email(email_id: int):
+        """Mark an outbox message dealt with."""
+        if app.state.admin_store is None:
+            raise HTTPException(status_code=503, detail="Admin store is disabled")
+        row = app.state.admin_store.consume_email(email_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Message not found")
+        return dict(row)
+
     @app.get("/admin/invites", dependencies=admin_gate_deps)
     def admin_list_invites():
         store = app.state.admin_store
@@ -2916,8 +3140,31 @@ def create_app(
                 invite_meta = admin_store.peek_invite(req.invite)
             except ValueError as e:
                 raise HTTPException(status_code=403, detail=str(e))
+        # D18: Q22 keeps self-registration open, so the free tier is capped at
+        # the account count rather than the other way round. Checked only for
+        # the free path -- an invite or a paid seat is not metered against it,
+        # and the cap exists to bound unverified self-service spend, not to
+        # ration paying customers.
+        cap = max_free_accounts()
+        if invite_meta is None and user_store is not None:
+            existing = user_store.count_users_in_organisation(SAMPLE_ORGANISATION_ID)
+            if existing >= cap:
+                log_audit(request, "auth.signup_capped", "user", None,
+                          f"email={req.email} cap={cap}")
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Free sign-up is temporarily full. Please try again "
+                        "later or contact us."
+                    ),
+                )
         try:
-            user = user_store.create_user(req.email, req.password, req.name, req.category)
+            # An invited account was vouched for by whoever issued the invite,
+            # so it starts verified; a self-service signup does not.
+            user = user_store.create_user(
+                req.email, req.password, req.name, req.category,
+                verified=invite_meta is not None,
+            )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
         if invite_meta is not None:
@@ -2926,15 +3173,85 @@ def create_app(
             except ValueError as e:
                 user_store.delete_user(user["id"])
                 raise HTTPException(status_code=403, detail=str(e))
+        verification = None
+        if not user.get("email_verified_at"):
+            verification = _issue_and_send_verification(user, request)
         log_audit(request, "auth.signup", "user", user.get("id"),
-                  f"email={req.email} category={req.category} invite={bool(req.invite)}")
+                  f"email={req.email} category={req.category} invite={bool(req.invite)} "
+                  f"verified={bool(user.get('email_verified_at'))}")
         token = user_store.token_for(user)
         return AuthResponse(
             token=token,
             user=user,
             workspace=workspace_summary(user["category"]),
             workspaces=user_workspaces(user),
+            verification=verification,
         )
+
+    @app.post("/auth/verify-email")
+    def verify_email(req: VerificationRequest, request: Request):
+        """Confirm an address from a token in the link.
+
+        No auth required: the token is the credential, which is why it is
+        single-use and signed with its own purpose claim.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        try:
+            user_id = user_store.verify_email(req.token)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        log_audit(request, "auth.verify_email", "user", user_id, "")
+        if app.state.admin_store is not None:
+            # Ties the message in the outbox to the action taken on it, so the
+            # pending list empties when the user follows the link themselves.
+            for row in app.state.admin_store.list_emails(limit=200):
+                if f"?token={req.token}" in (row["body"] or "") and not row["consumed_at"]:
+                    app.state.admin_store.consume_email(row["id"])
+                    break
+        user = user_store.get(user_id)
+        return {
+            "verified": True,
+            "email": user["email"] if user else None,
+            "message": "Your email address is confirmed.",
+        }
+
+    @app.post("/auth/resend-verification", dependencies=rate_deps)
+    def resend_verification(request: Request, user: dict = user_dep):
+        """Send the confirmation again, with a per-user cooldown.
+
+        Auth is required so this cannot be used to mail-bomb an address, and
+        the response never reveals whether the account exists.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        full = user_store.get(user["id"])
+        if not full:
+            raise HTTPException(status_code=404, detail="Account not found")
+        if full.get("email_verified_at"):
+            return {"sent": False, "verified": True,
+                    "message": "That address is already confirmed."}
+        status = user_store.verification_status(full["id"]) or {}
+        sent_at = status.get("sent_at")
+        if sent_at and not _cooldown_elapsed(sent_at):
+            return {
+                "sent": False,
+                "verified": False,
+                "message": "A confirmation email was sent recently. Try again shortly.",
+            }
+        result = _issue_and_send_verification(full, request)
+        log_audit(request, "auth.resend_verification", "user", full["id"],
+                  f"sent={result.get('sent')}")
+        return {
+            "sent": bool(result.get("sent")),
+            "verified": False,
+            "message": (
+                "Confirmation email sent."
+                if result.get("sent")
+                else "Could not send mail right now. Try again shortly."
+            ),
+            "link": result.get("link"),
+        }
 
     @app.post("/auth/login", response_model=AuthResponse, dependencies=rate_deps)
     def login(req: LoginRequest):
@@ -2946,11 +3263,17 @@ def create_app(
         user_store.mark_login(user["id"])
         user["last_login"] = user_store.get(user["id"])["last_login"]
         token = user_store.token_for(user)
+        # Report the same state as /me, so a user returning on another device
+        # learns they must confirm before asking anything.
+        verification = None
+        if not user.get("email_verified_at"):
+            verification = user_store.verification_status(user["id"])
         return AuthResponse(
             token=token,
             user=user,
             workspace=workspace_summary(user["category"]),
             workspaces=user_workspaces(user),
+            verification=verification,
         )
 
     @app.get("/me", response_model=MeResponse)
@@ -2974,10 +3297,14 @@ def create_app(
         # in before validation. Returning the bare row here is what made every
         # /me report an empty workspace list.
         scoped = {**profile, "workspaces": reachable}
+        verification = None
+        if user_store is not None and not profile.get("email_verified_at"):
+            verification = user_store.verification_status(profile["id"])
         return MeResponse(
             user=scoped,
             workspace=workspace_summary(profile["category"]),
             workspaces=user_workspaces(scoped),
+            verification=verification,
         )
 
     @app.post("/chat", response_model=ChatResponse, dependencies=rate_deps)
@@ -2987,6 +3314,7 @@ def create_app(
         user: dict = user_dep,
         store=store_dep,
     ):
+        require_verified(user)
         session_id = resolve_session(request, req.session_id, user["id"], store)
         history = store.history(session_id, limit=req.history_limit)
         bot = get_bot(request, user["category"], user.get("organisation_id"))
@@ -3027,6 +3355,7 @@ def create_app(
         user: dict = user_dep,
         store=store_dep,
     ):
+        require_verified(user)
         session_id = resolve_session(request, req.session_id, user["id"], store)
         history = store.history(session_id, limit=req.history_limit)
         bot = get_bot(request, user["category"], user.get("organisation_id"))
@@ -3107,6 +3436,7 @@ def create_app(
         voice is an adapter, not a pipeline of its own. Audio is metered as
         kind "stt" in units of seconds.
         """
+        require_verified(user)
         max_mb = int_env("VOICE_MAX_UPLOAD_MB", 5)
         max_bytes = max_mb * 1024 * 1024
         data = await file.read(max_bytes + 1)
@@ -3154,6 +3484,7 @@ def create_app(
         the Azure OpenAI speech endpoint returns mp3. Both play in every
         browser, so the client just takes whatever arrives.
         """
+        require_verified(user)
         max_chars = int_env("VOICE_TTS_MAX_CHARS", 4000)
         if len(req.text) > max_chars:
             raise HTTPException(
@@ -3180,6 +3511,7 @@ def create_app(
         request: Request,
         user: dict = user_dep,
     ):
+        require_verified(user)
         bot = get_bot(request, user["category"], user.get("organisation_id"))
         try:
             results = await run_in_threadpool(
@@ -3210,6 +3542,7 @@ def create_app(
         right for the common case but goes stale in a long-lived session. This
         re-issues one without reloading the conversation.
         """
+        require_verified(user)
         try:
             resolve_document(
                 user["category"], req.source, user.get("organisation_id")

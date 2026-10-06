@@ -79,7 +79,7 @@ def tts():
 
 
 @pytest.fixture
-def voice_env(tmp_path, monkeypatch, stt, tts):
+def voice_env(tmp_path, monkeypatch, stt, tts, verified_signup):
     monkeypatch.setattr(voice, "get_stt_provider", lambda: stt)
     monkeypatch.setattr(voice, "get_tts_provider", lambda: tts)
     monkeypatch.setenv("VOICE_STT_MODEL", "small")
@@ -94,12 +94,8 @@ def voice_env(tmp_path, monkeypatch, stt, tts):
     )
     c = TestClient(app)
     c.admin_store = admin_store
-    res = c.post("/auth/signup", json={
-        "email": "u@corp.com", "password": "password123", "name": "User",
-        "category": "finance",
-    })
-    assert res.status_code == 200, res.text
-    c.token = res.json()["token"]
+    res = verified_signup(c)
+    c.token = res["token"]
     return c
 
 

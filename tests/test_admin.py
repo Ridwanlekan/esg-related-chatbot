@@ -392,14 +392,13 @@ class TestAuditLog:
 class TestAdminTranscripts:
     def test_sessions_and_transcript(self, admin_env):
         c, _, _ = admin_env
-        c.post(
+        signup = c.post(
             "/auth/signup",
             json={"email": "t@corp.com", "password": "password123", "name": "T", "category": "finance"},
-        )
-        tok = c.post(
-            "/auth/login",
-            json={"email": "t@corp.com", "password": "password123"},
-        ).json()["token"]
+        ).json()
+        # Confirmed, so the transcript exists: /chat is behind the D18 gate.
+        c.app.state.user_store.set_verified(signup["user"]["id"])
+        tok = signup["token"]
         c.post(
             "/chat",
             headers={"authorization": f"Bearer {tok}"},

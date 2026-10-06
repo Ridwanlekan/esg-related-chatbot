@@ -21,6 +21,17 @@ _SCRUB = {
     "ADMIN_TOTP_SECRET",
     "TRUSTED_PROXY_IPS",
     "FORWARDED_ALLOW_IPS",
+    # D18 knobs: a developer's real SMTP relay or cap must not change test
+    # behaviour, and EMAIL_VERIFICATION_REQUIRED is scrubbed so the gate is off
+    # unless a test asks for it (accounts are otherwise unverified at signup).
+    "MAX_FREE_ACCOUNTS",
+    "EMAIL_VERIFICATION_REQUIRED",
+    "VERIFICATION_TOKEN_TTL_HOURS",
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_USER",
+    "SMTP_PASSWORD",
+    "SMTP_FROM",
 }
 
 
@@ -40,3 +51,32 @@ def _reset_extra_workspaces():
     workspaces.clear_extra_workspaces()
     yield
     workspaces.clear_extra_workspaces()
+
+
+@pytest.fixture
+def verified_signup():
+    """Sign up and confirm the address, returning the auth payload.
+
+    Signup now leaves a free account unconfirmed (D18), which blocks the
+    content endpoints. Suites that use the public signup path only to obtain a
+    working token should use this rather than reaching past the gate, so each
+    one keeps testing what it means to test.
+    """
+    def _signup(client, email="u@corp.com", category="finance", name="User",
+                password="password123", invite=None, **extra):
+        payload = {
+            "email": email,
+            "password": password,
+            "name": name,
+            "category": category,
+            **extra,
+        }
+        if invite:
+            payload["invite"] = invite
+        res = client.post("/auth/signup", json=payload)
+        assert res.status_code == 200, res.text
+        user_id = res.json()["user"]["id"]
+        client.app.state.user_store.set_verified(user_id)
+        return res.json()
+
+    return _signup

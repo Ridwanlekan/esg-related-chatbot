@@ -376,6 +376,33 @@
   </section>
 
   <section id="view-users" class="hidden">
+    <div class="card" id="free-account-card">
+      <h2>Free accounts <span class="muted" id="free-account-count"></span></h2>
+      <div id="free-account-meter"></div>
+      <div class="hint">
+        Self-service signups stop when the cap is reached
+        (<code id="free-account-limit"></code>). Raising it is
+        <code>MAX_FREE_ACCOUNTS</code>, which needs a restart.
+      </div>
+    </div>
+    <div class="card" id="verification-card">
+      <h2>Pending email confirmations <span class="muted" id="verify-total"></span></h2>
+      <div class="hint">
+        Free self-service accounts cannot ask questions until they confirm.
+        Confirm one by hand if the address can never receive mail.
+      </div>
+      <div id="verify-list"><div class="muted">Loading…</div></div>
+      <div class="actions"><button id="btn-refresh-verify" class="small">Refresh</button></div>
+    </div>
+    <div class="card" id="outbox-card" style="display:none">
+      <h2>Outbox <span class="muted" id="outbox-total"></span></h2>
+      <div class="hint">
+        No SMTP relay is configured, so confirmation mail is stored here
+        instead of being sent. Open the link to onboard someone by hand.
+      </div>
+      <div id="outbox-list"><div class="muted">Loading…</div></div>
+      <div class="actions"><button id="btn-refresh-outbox" class="small">Refresh</button></div>
+    </div>
     <div class="card">
       <h2>Create user</h2>
       <div class="row-form">
@@ -518,7 +545,7 @@ function showTab(name) {
   if (name === "tab-organisations") { loadLibrary(); loadOrganisations(); }
   if (name === "tab-documents") { loadDocuments(); loadCategories(); loadSharedDocuments(); }
   if (name === "tab-workspaces") { loadWorkspaces(); loadInvites(); loadCategories(); }
-  if (name === "tab-users") loadUsers();
+  if (name === "tab-users") { loadUsers(); loadVerifications(); loadOutbox(); }
   if (name === "tab-audit") loadAudit();
   if (name === "tab-usage") loadUsage();
   if (name === "tab-overview") refreshStatus();
@@ -2252,6 +2279,64 @@ let userCache = [];
 let userTotal = 0;
 const USER_PAGE = 50;
 
+// ---- D18: free-account cap, confirmations and the outbox ----
+// Shown on the Users tab because that is where an operator goes to find an
+// account. The cap meter is the one number that says "self-signup is closing".
+async function loadVerifications() {
+  try {
+    const res = await api("/admin/verifications", { headers: authHeaders() });
+    const data = await res.json();
+    const free = data.free_accounts || {};
+    $("free-account-count").textContent = free.used + " of " + free.limit + " used";
+    $("free-account-limit").textContent = free.limit;
+    const pct = free.limit ? Math.min(100, Math.round((free.used / free.limit) * 100)) : 100;
+    $("free-account-meter").innerHTML =
+      '<div class="bar-row"><div class="bl">Free accounts</div>' +
+      '<div class="bar-track"><div class="bar-fill" style="width:' + pct + '%"></div></div>' +
+      '<div class="bv">' + free.remaining + " remaining</div></div>";
+    $("verify-total").textContent = data.count ? "· " + data.count : "";
+    if (!data.pending.length) {
+      $("verify-list").innerHTML = '<div class="muted">Nothing waiting.</div>';
+      return;
+    }
+    $("verify-list").innerHTML = data.pending.map((u) =>
+      '<div class="bar-row">' +
+      '<div class="bl" title="' + esc(u.email) + '">' + esc(u.name || u.email) + "</div>" +
+      '<div class="bl" style="flex:1">' + esc(u.email) + "</div>" +
+      '<div class="bv">joined ' + esc((u.created_at || "").slice(0, 10)) + "</div>" +
+      '<button class="small" data-verify-user="' + esc(u.id) + '">Confirm</button>' +
+      "</div>").join("");
+  } catch (e) {
+    $("verify-list").innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+  }
+}
+
+async function loadOutbox() {
+  try {
+    const res = await api("/admin/emails", { headers: authHeaders() });
+    const data = await res.json();
+    $("outbox-card").style.display = data.count ? "" : "none";
+    $("outbox-total").textContent = data.pending ? "· " + data.pending + " pending" : "";
+    if (!data.emails.length) {
+      $("outbox-list").innerHTML = '<div class="muted">Empty.</div>';
+      return;
+    }
+    $("outbox-list").innerHTML = data.emails.map((m) => {
+      const m2 = esc(m.body).match(/https?:\/\/\S+verify-email\?token=\S+/);
+      const link = m2 ? m2[0].replace(/&amp;/g, "&") : "";
+      return '<div class="bar-row">' +
+        '<div class="bl" style="flex:1">' + esc(m.to_address) + "</div>" +
+        '<div class="bv">' + esc((m.created_at || "").slice(0, 16).replace("T", " ")) + "</div>" +
+        (link ? '<a class="small" href="' + esc(link) + '" target="_blank">Open link</a>' : "") +
+        (m.consumed_at ? '<span class="muted">done</span>'
+          : '<button class="small" data-consume-email="' + esc(m.id) + '">Mark done</button>') +
+        "</div>";
+    }).join("");
+  } catch (e) {
+    $("outbox-list").innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+  }
+}
+
 async function loadUsers(more = false) {
   const offset = more ? userCache.length : 0;
   try {
@@ -2526,6 +2611,33 @@ $("btn-create-user").addEventListener("click", createUser);
 $("btn-refresh-docs").addEventListener("click", loadDocuments);
 $("btn-refresh-ws").addEventListener("click", loadWorkspaces);
 $("btn-refresh-users").addEventListener("click", () => loadUsers(false));
+$("btn-refresh-verify").addEventListener("click", loadVerifications);
+$("btn-refresh-outbox").addEventListener("click", loadOutbox);
+
+// Confirming or consuming from the list rather than opening a row keeps the
+// common case one click, and both reload the panel they changed.
+$("view-users").addEventListener("click", async (e) => {
+  const v = e.target.closest("[data-verify-user]");
+  if (v) {
+    e.preventDefault();
+    v.disabled = true;
+    try {
+      await api("/admin/users/" + encodeURIComponent(v.dataset.verifyUser) + "/verify",
+        { method: "POST", headers: authHeaders(), body: JSON.stringify({ verified: true }) });
+    } catch (err) { v.disabled = false; alert(err.message); }
+    loadVerifications();
+    return;
+  }
+  const m = e.target.closest("[data-consume-email]");
+  if (m) {
+    e.preventDefault();
+    try {
+      await api("/admin/emails/" + encodeURIComponent(m.dataset.consumeEmail) + "/consume",
+        { method: "POST", headers: authHeaders() });
+    } catch (err) { alert(err.message); }
+    loadOutbox();
+  }
+});
 $("btn-more-users").addEventListener("click", () => loadUsers(true));
 $("btn-create-invite").addEventListener("click", createInvite);
 $("btn-refresh-audit").addEventListener("click", () => loadAudit(false));

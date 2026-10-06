@@ -48,11 +48,13 @@ def _build(api_key=None, open_users=True, secret="test-secret", **kw):
 
 
 def _token(client):
+    """A confirmed account: these tests are about tokens, not the D18 gate."""
     res = client.post(
         "/auth/signup",
         json={"email": "u@corp.com", "password": "password123", "name": "U", "category": "finance"},
     )
     assert res.status_code == 200
+    client.app.state.user_store.set_verified(res.json()["user"]["id"])
     return res.json()["token"]
 
 

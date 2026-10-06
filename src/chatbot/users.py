@@ -8,7 +8,7 @@ import re
 import secrets
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from chatbot.workspaces import workspace_names
 
@@ -36,6 +36,63 @@ SAMPLE_ORGANISATION_NAME = "Sample"
 # organisations existed (Phase 3 migration).
 DEFAULT_ORGANISATION_ID = "_default"
 DEFAULT_ORGANISATION_NAME = "Default"
+
+# --- D18: free-account verification and cap ---
+# Q22 keeps free self-registration open, so the cost is unbounded unless we
+# bound it. The agreed control is email verification (which removes the
+# throwaway-address abuse case) plus a cap on how many free accounts may exist
+# at once. The cap is generous because the direct cost of a fully-used free
+# account is small; it exists to stop the tail, not to ration a scarce resource.
+DEFAULT_MAX_FREE_ACCOUNTS = 500
+VERIFICATION_TOKEN_TTL_HOURS = 48
+# A resend must not become a way to mail-bomb an address, and re-minting the
+# token invalidates the previous link, so the window is enforced per user.
+VERIFICATION_RESEND_COOLDOWN_SECONDS = 60
+
+
+def _token_hash(token):
+    """Digest of a bearer token, for storing instead of the token itself."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _shift_iso(iso, seconds):
+    """iso + a cooldown, for telling the frontend when a resend is allowed."""
+    try:
+        return (
+            datetime.fromisoformat(iso) + timedelta(seconds=seconds)
+        ).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
+def max_free_accounts():
+    """The free-account cap. 0 means closed, not unlimited.
+
+    A cap that could be switched off by setting it to zero would make the
+    worst possible configuration the easiest one to write, so zero is read as
+    "stop self-registration" and anything negative is clamped to it. The
+    default is generous; the value exists to bound the tail, not to ration a
+    scarce resource.
+    """
+    raw = os.environ.get("MAX_FREE_ACCOUNTS", str(DEFAULT_MAX_FREE_ACCOUNTS))
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_FREE_ACCOUNTS
+
+
+def verification_required():
+    """Whether an unverified address may open the sample workspace.
+
+    Defaults to on. `EMAIL_VERIFICATION_REQUIRED=0` exists so a deployment that
+    has not finished SMTP can run the gate closed rather than not at all.
+    """
+    return os.environ.get("EMAIL_VERIFICATION_REQUIRED", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 # Membership role within one workspace. This is deliberately NOT the Section 3.3
 # role set: org-level roles (owner/admin) belong to the organisation, and the
@@ -131,7 +188,27 @@ def _row_to_user(row):
         "organisation_id": row["organisation_id"] if "organisation_id" in keys else None,
         "created_at": row["created_at"],
         "last_login": row["last_login"] if "last_login" in keys else None,
+        "email_verified_at": row["email_verified_at"]
+        if "email_verified_at" in keys
+        else None,
     }
+
+
+def _with_verified_flag(user):
+    """Expose verification as a boolean for the API layer.
+
+    Absent on rows predating the column, hence None rather than False: None
+    means "unknown, do not gate", False means "known unconfirmed, gate it".
+    """
+    if not user:
+        return user
+    user = dict(user)
+    user["email_verified"] = (
+        bool(user["email_verified_at"])
+        if user.get("email_verified_at") is not None
+        else None
+    )
+    return user
 
 
 def _row_to_organisation(row):
@@ -208,6 +285,23 @@ class UserStore:
             # Lazy ALTER so a users table written by an older build opens
             # untouched, then backfill so no row is left organisation-less.
             self.conn.execute("ALTER TABLE users ADD COLUMN organisation_id TEXT")
+        if "email_verified_at" not in cols:
+            # Added for D18. Existing accounts are grandfathered as verified at
+            # their creation time: they already have access, and requiring
+            # verification now would lock out accounts that were fine
+            # yesterday. Only accounts created *after* this column exists are
+            # left unverified, which is why the backfill runs in this branch
+            # rather than on every start.
+            self.conn.execute("ALTER TABLE users ADD COLUMN email_verified_at TEXT")
+            self.conn.execute(
+                "UPDATE users SET email_verified_at = COALESCE(created_at, ?) "
+                "WHERE email_verified_at IS NULL",
+                (_now(),),
+            )
+        if "verification_token_hash" not in cols:
+            self.conn.execute("ALTER TABLE users ADD COLUMN verification_token_hash TEXT")
+        if "verification_sent_at" not in cols:
+            self.conn.execute("ALTER TABLE users ADD COLUMN verification_sent_at TEXT")
         self.conn.commit()
         self._ensure_system_organisations()
         self._ensure_memberships()
@@ -470,7 +564,8 @@ class UserStore:
     def categories(self):
         return workspace_names()
 
-    def create_user(self, email, password, name, category, organisation_id=None):
+    def create_user(self, email, password, name, category, organisation_id=None,
+                    verified=False):
         email = (email or "").strip().lower()
         name = (name or "").strip()
         category = (category or "").strip().lower()
@@ -491,12 +586,13 @@ class UserStore:
             raise ValueError(f"Unknown organisation: {org_id}")
         salt, digest = _hash_password(password)
         user_id = secrets.token_hex(16)
+        verified_at = _now() if verified else None
         try:
             self.conn.execute(
                 "INSERT INTO users (id, email, name, category, organisation_id, "
-                "password_hash, salt, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (user_id, email, name, category, org_id, digest, salt, _now()),
+                "password_hash, salt, created_at, email_verified_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, email, name, category, org_id, digest, salt, _now(), verified_at),
             )
             self.conn.commit()
         except sqlite3.IntegrityError:
@@ -599,13 +695,13 @@ class UserStore:
         row = self.conn.execute(
             "SELECT * FROM users WHERE id = ?", (user_id,)
         ).fetchone()
-        return _row_to_user(row) if row else None
+        return _with_verified_flag(_row_to_user(row)) if row else None
 
     def get_by_email(self, email):
         row = self.conn.execute(
             "SELECT * FROM users WHERE email = ?", ((email or "").strip().lower(),)
         ).fetchone()
-        return _row_to_user(row) if row else None
+        return _with_verified_flag(_row_to_user(row)) if row else None
 
     def verify(self, email, password):
         row = self.conn.execute(
@@ -636,6 +732,130 @@ class UserStore:
             "UPDATE users SET last_login = ? WHERE id = ?", (_now(), user_id)
         )
         self.conn.commit()
+
+    # ---- email verification (D18) -----------------------------------------
+
+    def is_verified(self, user_id):
+        row = self.conn.execute(
+            "SELECT email_verified_at FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return bool(row and row[0])
+
+    def issue_verification_token(self, user_id, ttl_hours=None):
+        """Mint a verification token and remember only its hash.
+
+        The plaintext is returned once, for the email body. Storing a digest
+        rather than the token means a copy of the database cannot be used to
+        verify anyone's address; a lost link is recoverable by asking for a
+        fresh one, which overwrites this row anyway.
+        """
+        hours = ttl_hours or int(
+            os.environ.get("VERIFICATION_TOKEN_TTL_HOURS", VERIFICATION_TOKEN_TTL_HOURS)
+        )
+        token = sign_jwt(
+            self.secret,
+            {
+                "sub": user_id,
+                "purpose": "email_verification",
+                # sign_jwt stamps whole seconds, so two tokens minted in the
+                # same second would be byte-identical. That matters here:
+                # reissuing is meant to invalidate the previous link, and
+                # without a nonce it would silently return the same one.
+                "jti": secrets.token_urlsafe(9),
+            },
+            ttl_seconds=hours * 3600,
+        )
+        self.conn.execute(
+            "UPDATE users SET verification_token_hash = ?, verification_sent_at = ? "
+            "WHERE id = ?",
+            (_token_hash(token), _now(), user_id),
+        )
+        self.conn.commit()
+        return token
+
+    def verify_email(self, token):
+        """Consume a verification token.
+
+        Returns the user id, or raises ValueError with a message the caller can
+        surface. Expiry and signature are checked before the token hash is
+        compared, and the hash is cleared on success so a link works once.
+        """
+        payload = verify_jwt(self.secret, token or "")
+        if not payload or payload.get("purpose") != "email_verification":
+            raise ValueError("That verification link is not valid.")
+        user_id = payload.get("sub")
+        row = self.conn.execute(
+            "SELECT verification_token_hash, email_verified_at FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("That verification link is not valid.")
+        if row["email_verified_at"]:
+            raise ValueError("That address is already verified.")
+        if not row["verification_token_hash"]:
+            raise ValueError("That verification link has been replaced. Request a new one.")
+        if not hmac.compare_digest(row["verification_token_hash"], _token_hash(token)):
+            raise ValueError("That verification link is not valid.")
+        self.conn.execute(
+            "UPDATE users SET email_verified_at = ?, verification_token_hash = NULL "
+            "WHERE id = ?",
+            (_now(), user_id),
+        )
+        self.conn.commit()
+        return user_id
+
+    def verification_status(self, user_id):
+        """What the frontend needs to explain a blocked account."""
+        row = self.conn.execute(
+            "SELECT email_verified_at, verification_sent_at FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        verified_at, sent_at = row[0], row[1]
+        resend_after = None
+        if sent_at:
+            resend_after = _shift_iso(sent_at, VERIFICATION_RESEND_COOLDOWN_SECONDS)
+        return {
+            "verified": bool(verified_at),
+            "verified_at": verified_at,
+            "sent_at": sent_at,
+            # Surfaced rather than enforced in the UI, so a user who waits past
+            # the cooldown is not told to email support.
+            "resend_available_at": resend_after,
+        }
+
+    def set_verified(self, user_id, verified=True):
+        """Administrative override, for a user who cannot receive mail."""
+        self.conn.execute(
+            "UPDATE users SET email_verified_at = ?, verification_token_hash = NULL "
+            "WHERE id = ?",
+            (_now() if verified else None, user_id),
+        )
+        self.conn.commit()
+        return self.get(user_id)
+
+    def list_unverified(self, organisation_id=None, limit=100, offset=0):
+        """Unverified accounts for the admin console, oldest first."""
+        sql = (
+            "SELECT id, email, name, organisation_id, created_at, verification_sent_at "
+            "FROM users WHERE email_verified_at IS NULL"
+        )
+        params = []
+        if organisation_id:
+            sql += " AND organisation_id = ?"
+            params.append(organisation_id)
+        sql += " ORDER BY created_at ASC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        return [dict(r) for r in self.conn.execute(sql, params).fetchall()]
+
+    def count_unverified(self, organisation_id=None):
+        sql = "SELECT COUNT(*) FROM users WHERE email_verified_at IS NULL"
+        params = []
+        if organisation_id:
+            sql += " AND organisation_id = ?"
+            params.append(organisation_id)
+        return self.conn.execute(sql, params).fetchone()[0]
 
     def count_users(self):
         return self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]

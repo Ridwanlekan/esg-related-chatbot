@@ -60,6 +60,21 @@
   #voice-notice {
     padding: 6px 20px 0; font-size: 12px; color: #fbbf24; min-height: 18px;
   }
+  /* D18: the free tier is gated on confirming an address. Blocking the
+     composer here, rather than letting /chat answer 403, is the difference
+     between an explanation and a broken-looking product. */
+  #verify-notice {
+    margin: 10px 20px 0; padding: 10px 14px; border-radius: 10px;
+    background: rgba(251, 191, 36, .1); border: 1px solid rgba(251, 191, 36, .4);
+    display: flex; gap: 12px; align-items: center; justify-content: space-between;
+    flex-wrap: wrap;
+  }
+  #verify-notice .verify-text { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+  #verify-notice .verify-text span { color: var(--muted); font-size: 12px; }
+  #verify-notice .verify-actions { display: flex; gap: 8px; align-items: center; }
+  #verify-notice a { font-size: 12px; color: #fbbf24; }
+  #verify-notice button { font-size: 12px; padding: 5px 10px; }
+  #verify-notice.error { background: rgba(248, 113, 113, .1); border-color: rgba(248, 113, 113, .4); }
   #mic { min-width: 42px; font-size: 15px; }
   #voice-auto { min-width: 42px; font-size: 15px; }
   #voice-auto.off { opacity: .4; }
@@ -179,6 +194,16 @@
   <section id="chat">
     <div id="messages"></div>
     <div id="voice-notice"></div>
+    <div id="verify-notice" class="hidden">
+      <div class="verify-text">
+        <strong>Confirm your email address</strong>
+        <span id="verify-detail">We sent you a link. Open it to start asking questions.</span>
+      </div>
+      <div class="verify-actions">
+        <a id="verify-link" class="hidden" href="#">Open confirmation link</a>
+        <button id="verify-resend">Resend email</button>
+      </div>
+    </div>
     <div id="composer">
       <textarea id="input" rows="1" placeholder="Ask about your workspace documents…"></textarea>
       <button id="voice-auto" title="Read answers aloud">🔊</button>
@@ -229,6 +254,8 @@ function authHeaders(json) {
 
 function showAuth() { $("chat-view").classList.add("hidden"); $("auth-view").classList.remove("hidden"); }
 function showChat() { $("auth-view").classList.add("hidden"); $("chat-view").classList.remove("hidden"); }
+// Applied at signup and on every /me, so confirming in another tab unlocks the
+// composer here without a reload.
 
 function setSession(id) {
   sessionId = id;
@@ -330,12 +357,12 @@ async function submitAuth(endpoint) {
     token = data.token;
     localStorage.setItem(TOKEN_KEY, token);
     me = data;
-    enterChat();
+    enterChat(data.verification);
   } catch (e) { setAuthError(e.message); }
   finally { setBusy(btn, false); }
 }
 
-async function enterChat() {
+async function enterChat(verification) {
   try {
     const res = await api("/me", { headers: authHeaders(), auth: true });
     if (!res.ok) throw new Error("failed to load profile");
@@ -343,6 +370,9 @@ async function enterChat() {
     $("workspace-title").textContent = (me.workspace.emoji || "🤖") + " " + me.workspace.label;
     $("user-badge").textContent = me.user.name + " · " + me.workspace.category.toUpperCase();
     showChat();
+    // /me is authoritative; the signup payload only fills the gap on first run
+    // so a no-SMTP deployment can show the link it just returned.
+    renderVerification(me.verification, verification);
     setSession(null);
     clearMessages();
     addMsg("bot", welcome());
@@ -1068,6 +1098,59 @@ $("tab-signup").addEventListener("click", () => setActiveTab("signup"));
 $("login-btn").addEventListener("click", () => submitAuth("login"));
 $("signup-btn").addEventListener("click", () => submitAuth("signup"));
 $("signup-cat").addEventListener("change", (e) => selectCat(e.target.value));
+
+// ---- D18 email verification -----------------------------------------------
+// The server refuses /chat for an unconfirmed free account. This keeps the
+// promise at the composer: the control is visibly unavailable and says why,
+// instead of the user pressing Send and reading a permission error.
+function renderVerification(info, extra) {
+  const notice = $("verify-notice");
+  if (!info || info.verified) {
+    notice.classList.add("hidden");
+    $("input").disabled = false;
+    $("input").placeholder = "Ask about your workspace documents…";
+    $("mic").disabled = false;
+    $("search-q").disabled = false;
+    return;
+  }
+  notice.classList.remove("hidden");
+  notice.classList.remove("error");
+  const link = (extra && extra.link) || null;
+  const anchor = $("verify-link");
+  if (link) { anchor.href = link; anchor.classList.remove("hidden"); }
+  else { anchor.classList.add("hidden"); }
+  $("input").disabled = true;
+  $("input").placeholder = "Confirm your email address to ask questions…";
+  $("mic").disabled = true;
+  $("search-q").disabled = true;
+  if (info.resend_available_at) {
+    $("verify-resend").disabled = false;
+  }
+}
+
+$("verify-resend").addEventListener("click", async () => {
+  const btn = $("verify-resend");
+  setBusy(btn, true, "Sending…");
+  try {
+    const res = await api("/auth/resend-verification", {
+      method: "POST", headers: authHeaders(), auth: true,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { $("verify-detail").textContent = data.detail || "Could not send. Try again shortly."; return; }
+    $("verify-notice").classList.remove("error");
+    if (data.link) {
+      $("verify-link").href = data.link;
+      $("verify-link").classList.remove("hidden");
+      $("verify-detail").textContent =
+        "Email could not be sent. Use this link to confirm your address.";
+    } else {
+      $("verify-detail").textContent = data.message || "Check your inbox for the link.";
+    }
+  } catch (e) {
+    $("verify-notice").classList.add("error");
+    $("verify-detail").textContent = e.message;
+  } finally { setBusy(btn, false); }
+});
 ["login-email", "login-password"].forEach((id) =>
   $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") submitAuth("login"); }));
 ["signup-name", "signup-email", "signup-password"].forEach((id) =>

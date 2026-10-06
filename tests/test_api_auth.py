@@ -54,11 +54,13 @@ def env(tmp_path):
 
 
 def signup(client, email, category, name="Test User", password="password123"):
+    """A confirmed account, so these tests are not all about the D18 gate."""
     res = client.post(
         "/auth/signup",
         json={"email": email, "password": password, "name": name, "category": category},
     )
     assert res.status_code == 200, res.text
+    client.app.state.user_store.set_verified(res.json()["user"]["id"])
     return res.json()["token"]
 
 

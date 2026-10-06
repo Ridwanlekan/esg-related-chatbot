@@ -156,8 +156,63 @@ class AdminStore:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_usage_category ON usage(category)"
         )
+        # Outgoing mail (D18). Present so a deployment without an SMTP relay can
+        # still complete verification by hand instead of blocking signups.
+        # `consumed_at` is set when someone acts on the message, which is the
+        # event that matters for onboarding, not when it is read.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS email_outbox ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "to_address TEXT NOT NULL, "
+            "subject TEXT NOT NULL, "
+            "body TEXT NOT NULL, "
+            "html_body TEXT, "
+            "created_at TEXT NOT NULL, "
+            "consumed_at TEXT)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_email_outbox_created "
+            "ON email_outbox(created_at)"
+        )
         self.conn.commit()
         self._migrate_usage_units()
+
+    # ---- outbox (D18) ------------------------------------------------------
+
+    def record_email(self, to_address, subject, body, html_body=None):
+        cursor = self.conn.execute(
+            "INSERT INTO email_outbox (to_address, subject, body, html_body, "
+            "created_at) VALUES (?, ?, ?, ?, ?)",
+            (to_address, subject, body, html_body, _now()),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def list_emails(self, limit=50, offset=0, include_consumed=True):
+        """Newest first, so the message a new signup awaits sits at the top."""
+        sql = "SELECT * FROM email_outbox"
+        if not include_consumed:
+            sql += " WHERE consumed_at IS NULL"
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        return [dict(r) for r in self.conn.execute(sql, (limit, offset)).fetchall()]
+
+    def count_emails(self, include_consumed=False):
+        sql = "SELECT COUNT(*) FROM email_outbox"
+        if not include_consumed:
+            sql += " WHERE consumed_at IS NULL"
+        return self.conn.execute(sql).fetchone()[0]
+
+    def consume_email(self, email_id):
+        """Mark a message dealt with, so it drops off the pending list."""
+        self.conn.execute(
+            "UPDATE email_outbox SET consumed_at = ? "
+            "WHERE id = ? AND consumed_at IS NULL",
+            (_now(), email_id),
+        )
+        self.conn.commit()
+        return self.conn.execute(
+            "SELECT * FROM email_outbox WHERE id = ?", (email_id,)
+        ).fetchone()
 
     # ---- master library and content assignment (Section 3.4) ---------------
 
@@ -566,6 +621,22 @@ class AdminStore:
             return parsed
         except (TypeError, ValueError):
             return default
+
+    def get_setting(self, key, default=None):
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        return row[0] if row and row[0] is not None else default
+
+    def set_setting(self, key, value):
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(value)),
+            )
+            self.conn.commit()
+        return self.get_setting(key)
 
     def get_rates(self):
         rows = self.conn.execute("SELECT key, value FROM settings").fetchall()

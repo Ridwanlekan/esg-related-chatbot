@@ -174,10 +174,12 @@ def _admin_auth():
 
 
 def _signup(c, email="u@corp.com", category="finance"):
+    """A confirmed account: metering is not a test of the D18 gate."""
     res = c.post("/auth/signup", json={
         "email": email, "password": "password123", "name": "User", "category": category,
     })
     assert res.status_code == 200, res.text
+    c.app.state.user_store.set_verified(res.json()["user"]["id"])
     return res.json()["token"]
 
 
