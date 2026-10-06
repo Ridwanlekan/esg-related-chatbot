@@ -156,6 +156,65 @@ class TestHonestRendering:
         assert "cb.disabled = cb.checked" in body
 
 
+class TestSeatManagementUi:
+    def test_members_panel_loads_with_the_organisation(self):
+        """Opening an organisation must not show its content with a blank
+        people list beside it."""
+        body = _sync_fn("selectOrganisation")
+        assert "loadOrgContent()" in body
+        assert "loadOrgMembers()" in body
+
+    def test_members_are_read_from_the_members_endpoint(self):
+        body = _fn("loadOrgMembers")
+        assert '"/admin/organisations/"' in body
+        assert '"/members"' in body
+
+    def test_workspace_toggles_call_both_directions(self):
+        body = _sync_fn("orgMemberRow")
+        assert '"add"' in body
+        assert '"remove"' in body
+
+    def test_a_refused_workspace_change_is_reverted_in_the_ui(self):
+        """The server will not strand a seat with no workspace; if the console
+        left the box ticked it would claim access the user does not have."""
+        body = _sync_fn("orgMemberRow")
+        assert "cb.checked = !cb.checked" in body
+        assert "Change refused" in body
+
+    def test_role_changes_use_the_role_endpoint(self):
+        body = _sync_fn("changeRole")
+        assert '"/admin/organisations/role"' in body
+
+    def test_revoking_an_owner_is_not_offered(self):
+        """Q9: the single owner is transferred, never simply removed."""
+        body = _sync_fn("orgMemberRow")
+        assert 'm.org_role === "owner"' in body
+        assert "transferOwnership(m.id" in body
+        assert 'if (m.org_role) {' in body
+
+    def test_transfer_names_both_parties(self):
+        body = _sync_fn("transferOwnership")
+        assert "becomes an admin" in body
+        assert "from_user_id: fromUserId" in body
+        assert "to_user_id: toUserId" in body
+
+    def test_transfer_needs_a_confirmation(self):
+        body = _sync_fn("transferOwnership")
+        assert body.index("confirm(") < body.index('"/admin/organisations/transfer-ownership"')
+
+    def test_conversion_states_what_is_kept_and_lost(self):
+        """Q1: the person keeps their account and history, and must be told what
+        access they lose."""
+        body = _fn("convertFreeUser")
+        assert "keep their account and conversation history" in body
+        assert "lose access to any workspace not listed" in body
+
+    def test_conversion_uses_the_move_endpoint(self):
+        body = _fn("convertFreeUser")
+        assert '"/admin/organisations/move"' in body
+        assert "workspaces: cats" in body
+
+
 class TestCreateUserOrganisation:
     def test_create_user_can_target_an_organisation(self):
         """Paid accounts are created into a customer organisation (Q22)."""

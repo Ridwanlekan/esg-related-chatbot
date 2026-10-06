@@ -420,12 +420,25 @@ class UserStore:
         return org
 
     def set_user_organisation(self, user_id, organisation_id):
-        """Move a user into another organisation, honouring the merge guard."""
+        """Move a user into another organisation, honouring the merge guard.
+
+        Clears their org-level role on the way out. Content is organisation-scoped,
+        so a role left behind would let a former owner keep administering the
+        organisation they just left, and org_roles_for() would keep listing them
+        among its members. Workspace memberships survive the move: they name
+        workspaces, not organisations, and are re-pointed by the caller if the
+        workspaces the new organisation uses differ.
+        """
         self.merge_guard(organisation_id)
         cur = self.conn.execute(
             "UPDATE users SET organisation_id = ? WHERE id = ?",
             (organisation_id, user_id),
         )
+        if cur.rowcount:
+            self.conn.execute(
+                "DELETE FROM org_roles WHERE user_id = ? AND organisation_id != ?",
+                (user_id, organisation_id),
+            )
         self.conn.commit()
         return cur.rowcount > 0
 
@@ -586,7 +599,8 @@ class UserStore:
         if category:
             where, params = "WHERE category = ?", [category]
         rows = self.conn.execute(
-            f"SELECT id, email, name, category, created_at, last_login FROM users {where} "
+            f"SELECT id, email, name, category, organisation_id, created_at, "
+            f"last_login FROM users {where} "
             "ORDER BY created_at DESC LIMIT ? OFFSET ?",
             params + [limit, offset],
         ).fetchall()

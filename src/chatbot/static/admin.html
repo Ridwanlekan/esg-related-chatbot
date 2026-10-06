@@ -270,6 +270,16 @@
       <div class="hint">Assigning copies the master into the organisation's own storage and re-indexes it. Nobody outside that organisation can reach it.</div>
       <div id="assign-list"><div class="muted">Loading…</div></div>
     </div>
+
+    <div class="card hidden" id="org-members-card">
+      <h2>People in <span id="org-members-name"></span></h2>
+      <div class="hint">One owner per organisation. Everyone else is either an admin or a plain member, and a member only sees the workspaces ticked here.</div>
+      <div class="toolbar">
+        <button id="btn-convert-user" class="small">Move a free account here…</button>
+        <button id="btn-refresh-members" class="small">Refresh</button>
+      </div>
+      <div id="org-members-list"><div class="muted">Loading…</div></div>
+    </div>
   </section>
 
   <section id="view-documents" class="hidden">
@@ -1353,6 +1363,7 @@ let orgCache = [];
 let libraryCache = [];
 let selectedOrg = null;
 let orgContentCache = { assignments: {}, library: [], workspaces: [] };
+let orgMembersCache = { members: [], available_workspaces: [], org_roles: [] };
 
 async function loadLibrary() {
   const box = $("library-list");
@@ -1494,7 +1505,10 @@ function selectOrganisation(org) {
   selectedOrg = org;
   $("org-detail-card").classList.remove("hidden");
   $("org-detail-name").textContent = org.name || org.id;
+  $("org-members-card").classList.remove("hidden");
+  $("org-members-name").textContent = org.name || org.id;
   loadOrgContent();
+  loadOrgMembers();
 }
 
 function assignedFilenames() {
@@ -1594,6 +1608,203 @@ async function loadOrgContent() {
   renderOrgContent();
 }
 
+/* ---- seats, roles, workspace access ---- */
+
+function roleLabel(role) {
+  if (role === "owner") return "Owner";
+  if (role === "admin") return "Admin";
+  return "Member";
+}
+
+async function loadOrgMembers() {
+  if (!selectedOrg) return;
+  const box = $("org-members-list");
+  try {
+    const res = await api("/admin/organisations/" +
+      encodeURIComponent(selectedOrg.id) + "/members", { headers: authHeaders() });
+    orgMembersCache = await res.json();
+    renderOrgMembers();
+  } catch (e) {
+    box.innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+  }
+}
+
+function renderOrgMembers() {
+  const box = $("org-members-list");
+  box.innerHTML = "";
+  const members = orgMembersCache.members || [];
+  if (!members.length) {
+    box.appendChild(elm("div", "muted",
+      "No accounts yet. Create one into this organisation from the Users tab."));
+    return;
+  }
+  const table = document.createElement("table");
+  table.className = "table";
+  table.innerHTML =
+    "<thead><tr><th>Person</th><th>Role</th><th>Workspaces</th><th></th></tr></thead>";
+  const tbody = document.createElement("tbody");
+  for (const m of members) {
+    tbody.appendChild(orgMemberRow(m));
+  }
+  table.appendChild(tbody);
+  box.appendChild(table);
+}
+
+function orgMemberRow(m) {
+  const tr = document.createElement("tr");
+  const who = elm("td", "", m.name || m.email);
+  who.appendChild(elm("div", "muted", m.email));
+  tr.appendChild(who);
+
+  const roleCell = elm("td");
+  const sel = document.createElement("select");
+  const none = new Option("Member", "");
+  sel.appendChild(none);
+  for (const r of orgMembersCache.org_roles || []) {
+    sel.appendChild(new Option(roleLabel(r), r));
+  }
+  sel.value = m.org_role || "";
+  sel.onchange = () => changeRole(m, sel.value);
+  roleCell.appendChild(sel);
+  tr.appendChild(roleCell);
+
+  const wsCell = elm("td", "checks");
+  for (const w of orgMembersCache.available_workspaces || []) {
+    const label = elm("label", "ws-chip");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = (m.workspaces || []).includes(w);
+    cb.onchange = async () => {
+      try {
+        await api("/admin/organisations/workspaces/" + (cb.checked ? "add" : "remove"), {
+          method: "POST", headers: authHeaders(),
+          body: JSON.stringify({
+            organisation_id: selectedOrg.id, user_id: m.id, category: w,
+          }),
+        });
+        notify(m.email + (cb.checked ? " can now use " : " can no longer use ") + w + ".");
+        await loadOrgMembers();
+      } catch (e) {
+        // The server refuses to strand a seat with no workspace; put the box back.
+        notify("Change refused: " + e.message, "err");
+        cb.checked = !cb.checked;
+      }
+    };
+    label.appendChild(cb);
+    label.appendChild(elm("span", "tag", w));
+    wsCell.appendChild(label);
+  }
+  tr.appendChild(wsCell);
+
+  const actions = elm("td");
+  if (m.org_role === "owner") {
+    const owners = (orgMembersCache.members || []).filter((x) => x.org_role === "owner");
+    if (owners.length === 1) {
+      const sel2 = document.createElement("select");
+      sel2.appendChild(new Option("Transfer ownership…", ""));
+      for (const other of members) {
+        if (other.id !== m.id) sel2.appendChild(new Option(other.email, other.id));
+      }
+      sel2.onchange = () => transferOwnership(m.id, sel2.value);
+      actions.appendChild(sel2);
+    }
+  } else if (m.org_role) {
+    const revoke = elm("button", "small danger", "Revoke");
+    revoke.onclick = () => revokeRole(m);
+    actions.appendChild(revoke);
+  } else {
+    const promote = elm("button", "small", "Make admin");
+    promote.onclick = () => changeRole(m, "admin");
+    actions.appendChild(promote);
+  }
+  tr.appendChild(actions);
+  return tr;
+}
+
+async function changeRole(m, role) {
+  try {
+    await api("/admin/organisations/role", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        organisation_id: selectedOrg.id, user_id: m.id, role: role,
+      }),
+    });
+    notify(role ? m.email + " is now " + roleLabel(role) + "." : m.email + " is now a member.");
+    await loadOrgMembers();
+  } catch (e) {
+    notify("Role change refused: " + e.message, "err");
+    await loadOrgMembers();
+  }
+}
+
+async function revokeRole(m) {
+  if (!confirm("Revoke " + m.email + "'s " + roleLabel(m.org_role) +
+    " role in " + selectedOrg.id + "?")) return;
+  try {
+    await api("/admin/organisations/role/revoke", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        organisation_id: selectedOrg.id, user_id: m.id, role: m.org_role,
+      }),
+    });
+    notify("Revoked " + m.email + "'s role.");
+    await loadOrgMembers();
+  } catch (e) { notify("Revoke refused: " + e.message, "err"); }
+}
+
+async function transferOwnership(fromUserId, toUserId) {
+  if (!toUserId) return;
+  const to = (orgMembersCache.members || []).find((m) => m.id === toUserId);
+  if (!confirm("Make " + to.email + " the owner of " + selectedOrg.id +
+    "?\n\nThe current owner becomes an admin.")) return;
+  try {
+    await api("/admin/organisations/transfer-ownership", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        organisation_id: selectedOrg.id, from_user_id: fromUserId,
+        to_user_id: toUserId,
+      }),
+    });
+    notify(to.email + " now owns " + selectedOrg.id + ".");
+    await loadOrgMembers();
+  } catch (e) { notify("Transfer refused: " + e.message, "err"); }
+}
+
+async function convertFreeUser() {
+  const email = prompt("Email of the free account to move into " + selectedOrg.id + ":");
+  if (!email) return;
+  const found = (orgMembersCache.members || []).find(
+    (m) => (m.email || "").toLowerCase() === email.trim().toLowerCase()
+  );
+  const all = await api("/admin/users?limit=500&offset=0", { headers: authHeaders() });
+  const user = (await all.json()).users.find(
+    (u) => (u.email || "").toLowerCase() === email.trim().toLowerCase()
+  );
+  if (!user) { notify("No account with that email.", "err"); return; }
+  const ws = prompt(
+    "Workspaces to give them (comma separated, e.g. finance,hr):",
+    (found ? (found.workspaces || []) : ["finance"]).join(",")
+  );
+  if (!ws) return;
+  const cats = ws.split(",").map((s) => s.trim()).filter(Boolean);
+  if (!confirm("Move " + user.email + " into " + selectedOrg.id + " with " +
+    cats.join(", ") + "?\n\nThey keep their account and conversation history, and " +
+    "lose access to any workspace not listed.")) return;
+  try {
+    const res = await api("/admin/organisations/move", {
+      method: "POST", headers: authHeaders(),
+      body: JSON.stringify({
+        organisation_id: selectedOrg.id, user_id: user.id, workspaces: cats,
+      }),
+    });
+    const d = await res.json();
+    notify(d.user.email + " moved from " + d.from_organisation + " to " +
+      d.to_organisation + ".");
+    await loadOrgMembers();
+    await loadOrganisations();
+  } catch (e) { notify("Move refused: " + e.message, "err"); }
+}
+
 async function assignContent() {
   const cat = $("assign-cat").value;
   const files = Array.from(
@@ -1680,7 +1891,9 @@ async function deleteOrganisation(org) {
     if (selectedOrg && selectedOrg.id === org.id) {
       selectedOrg = null;
       $("org-detail-card").classList.add("hidden");
+      $("org-members-card").classList.add("hidden");
       $("assign-list").innerHTML = "";
+      $("org-members-list").innerHTML = "";
     }
     await loadOrganisations();
     await loadLibrary();
@@ -1970,7 +2183,7 @@ function renderUsers(q) {
   const table = document.createElement("table");
   table.className = "table";
   const thead = document.createElement("thead");
-  thead.innerHTML = "<tr><th>Name</th><th>Email</th><th>Category</th><th>Sessions</th><th>Last login</th><th>Created</th><th></th></tr>";
+  thead.innerHTML = "<tr><th>Name</th><th>Email</th><th>Organisation</th><th>Category</th><th>Sessions</th><th>Last login</th><th>Created</th><th></th></tr>";
   table.appendChild(thead);
   const tbody = document.createElement("tbody");
   for (const u of users) tbody.appendChild(userRow(u));
@@ -1984,6 +2197,8 @@ function userRow(u) {
   tdName.innerHTML = esc(u.name) + '<div class="muted">' + u.id.slice(0, 8) + "</div>";
   tr.appendChild(tdName);
   tr.appendChild(elm("td", "", u.email));
+  const org = u.organisation_id === "_sample" ? "free (sample)" : (u.organisation_id || "—");
+  tr.appendChild(elm("td", "", org));
   tr.appendChild(elm("td", "", u.category));
   tr.appendChild(elm("td", "pillcount", String(u.session_count)));
 
@@ -2196,6 +2411,8 @@ $("btn-lib-upload").addEventListener("click", uploadLibrary);
 $("btn-refresh-orgs").addEventListener("click", loadOrganisations);
 $("btn-create-org").addEventListener("click", createOrganisation);
 $("btn-refresh-org-content").addEventListener("click", loadOrgContent);
+$("btn-refresh-members").addEventListener("click", loadOrgMembers);
+$("btn-convert-user").addEventListener("click", convertFreeUser);
 $("btn-upload").addEventListener("click", uploadFiles);
 $("btn-shared-upload").addEventListener("click", uploadShared);
 $("btn-refresh-shared").addEventListener("click", loadSharedDocuments);
