@@ -1110,6 +1110,8 @@ function renderVerification(info, extra) {
     $("input").disabled = false;
     $("input").placeholder = "Ask about your workspace documents…";
     $("mic").disabled = false;
+    $("send").disabled = false;
+    $("voice-auto").disabled = false;
     $("search-q").disabled = false;
     return;
   }
@@ -1122,11 +1124,27 @@ function renderVerification(info, extra) {
   $("input").disabled = true;
   $("input").placeholder = "Confirm your email address to ask questions…";
   $("mic").disabled = true;
+  // Send is inert while the textarea is empty, but leaving it looking enabled
+  // reads as a bug rather than a gate.
+  $("send").disabled = true;
+  $("voice-auto").disabled = true;
   $("search-q").disabled = true;
   if (info.resend_available_at) {
     $("verify-resend").disabled = false;
   }
 }
+
+// Confirming usually happens in another tab (the email link). Re-check on
+// focus so returning to the app unlocks the composer without a reload.
+document.addEventListener("visibilitychange", async () => {
+  if (document.visibilityState !== "visible" || !token || !me) return;
+  try {
+    const res = await api("/me", { headers: authHeaders(), auth: true });
+    if (!res.ok) return;
+    me = await res.json();
+    renderVerification(me.verification);
+  } catch (e) {}
+});
 
 $("verify-resend").addEventListener("click", async () => {
   const btn = $("verify-resend");
