@@ -554,3 +554,28 @@ class TestSurfaces:
         readme = open("README.md").read()
         for name in ("SMTP_HOST", "MAX_FREE_ACCOUNTS", "EMAIL_VERIFICATION_REQUIRED"):
             assert name in readme, name
+
+
+class TestDeletedAccount:
+    def test_deleted_account_token_is_rejected(self, env):
+        """Deleting an account must kill its token, not just the row.
+
+        The token proves who signed in, not that the account still exists.
+        Before the lookup was added, a deleted account kept every permission
+        until the token expired and /me crashed on the missing row.
+        """
+        c, _tmp = env
+        body = signup(c).json()
+        token = body["token"]
+        user_id = body["user"]["id"]
+        assert c.get("/me", headers=bearer(token)).status_code == 200
+        assert c.delete(f"/admin/users/{user_id}", headers=admin_auth()).status_code == 200
+        assert c.get("/me", headers=bearer(token)).status_code == 401
+        assert c.post("/chat", headers=bearer(token),
+                      json={"question": "hi"}).status_code == 401
+        assert c.get("/sessions", headers=bearer(token)).status_code == 401
+        # An unauthenticated caller is treated the same way, so the response
+        # does not reveal whether the account once existed.
+        assert c.get("/me", headers=bearer(token)).json()["detail"] == (
+            c.get("/me").json()["detail"]
+        )

@@ -790,13 +790,23 @@ def create_app(
             # every authenticated endpoint until it expired.
             if is_download_token(payload):
                 raise HTTPException(status_code=401, detail="Missing or invalid token")
+            # A token proves who signed in, not that the account still exists.
+            # Without this lookup a deleted account keeps every permission it
+            # had until the token expires, and /me crashes on the missing row.
+            row = user_store.get(payload["sub"])
+            if not row:
+                raise HTTPException(status_code=401, detail="Missing or invalid token")
             return {
-                "id": payload["sub"],
-                "email": payload.get("email", ""),
-                "name": payload.get("name", ""),
-                "category": payload.get("category", ""),
-                "organisation_id": payload.get("organisation_id"),
-                "workspaces": payload.get("workspaces") or [],
+                "id": row["id"],
+                "email": row["email"],
+                "name": row["name"],
+                "category": row["category"],
+                "organisation_id": row["organisation_id"],
+                # Membership is read live for the same reason: a grant or a
+                # move should take effect without waiting for a new token.
+                "workspaces": user_store.workspace_categories(row["id"]),
+                "created_at": row["created_at"],
+                "email_verified_at": row.get("email_verified_at"),
             }
 
     else:
