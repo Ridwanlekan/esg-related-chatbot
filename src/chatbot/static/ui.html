@@ -25,6 +25,7 @@
     border: 1px solid var(--border); color: var(--muted);
   }
   .badge.ok { color: #4ade80; border-color: rgba(74,222,128,.4); }
+  .badge.warn { color: #fbbf24; border-color: rgba(251,191,36,.4); }
   .badge.err { color: #f87171; border-color: rgba(248,113,113,.4); }
   .badge.theme { color: var(--accent); border-color: rgba(56,189,248,.4); }
   .spacer { flex: 1; }
@@ -60,21 +61,38 @@
   #voice-notice {
     padding: 6px 20px 0; font-size: 12px; color: #fbbf24; min-height: 18px;
   }
-  /* D18: the free tier is gated on confirming an address. Blocking the
-     composer here, rather than letting /chat answer 403, is the difference
-     between an explanation and a broken-looking product. */
-  #verify-notice {
+  /* D18: the free tier is gated on confirming an address, and D3 stops a
+     workspace whose subscription has ended. Blocking the composer here,
+     rather than letting /chat answer 403/402, is the difference between an
+     explanation and a broken-looking product. Both notices share the shape
+     because they are the same kind of message: why the box is shut. */
+  #verify-notice, #billing-notice {
     margin: 10px 20px 0; padding: 10px 14px; border-radius: 10px;
     background: rgba(251, 191, 36, .1); border: 1px solid rgba(251, 191, 36, .4);
     display: flex; gap: 12px; align-items: center; justify-content: space-between;
     flex-wrap: wrap;
   }
-  #verify-notice .verify-text { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
-  #verify-notice .verify-text span { color: var(--muted); font-size: 12px; }
-  #verify-notice .verify-actions { display: flex; gap: 8px; align-items: center; }
+  #verify-notice .verify-text, #billing-notice .verify-text { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+  #verify-notice .verify-text span, #billing-notice .verify-text span { color: var(--muted); font-size: 12px; }
+  #verify-notice .verify-actions, #billing-notice .verify-actions { display: flex; gap: 8px; align-items: center; }
   #verify-notice a { font-size: 12px; color: #fbbf24; }
-  #verify-notice button { font-size: 12px; padding: 5px 10px; }
-  #verify-notice.error { background: rgba(248, 113, 113, .1); border-color: rgba(248, 113, 113, .4); }
+  #verify-notice button, #billing-notice button { font-size: 12px; padding: 5px 10px; }
+  #verify-notice.error, #billing-notice.err { background: rgba(248, 113, 113, .1); border-color: rgba(248, 113, 113, .4); }
+  /* The owner's allowance panel: the pool, the seats and whether reporting to
+     Stripe is actually running, in the one place someone looks before they
+     decide the workspace is about to run out. */
+  #usage-panel { display: flex; flex-direction: column; gap: 7px; font-size: 13px; }
+  #usage-panel .u-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  #usage-panel .u-row { display: flex; justify-content: space-between; gap: 10px; }
+  #usage-panel .u-row .k { color: var(--muted); font-size: 12px; }
+  #usage-panel .u-row .v { text-align: right; }
+  #usage-panel .u-note { font-size: 12px; color: var(--muted); line-height: 1.4; }
+  #usage-panel .u-meter { height: 6px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--border); overflow: hidden; }
+  #usage-panel .u-meter i { display: block; height: 100%; background: var(--accent); }
+  #usage-panel .u-meter.warn i { background: #fbbf24; }
+  #usage-panel .u-meter.err i { background: #f87171; }
+  #usage-panel .u-list { display: flex; flex-direction: column; gap: 3px; }
+  #usage-refresh { align-self: flex-start; font-size: 11px; padding: 4px 9px; }
   #mic { min-width: 42px; font-size: 15px; }
   #voice-auto { min-width: 42px; font-size: 15px; }
   #voice-auto.off { opacity: .4; }
@@ -184,6 +202,7 @@
   <h1 id="workspace-title">ESG Assistant</h1>
   <span id="health" class="badge">checking…</span>
   <span id="user-badge" class="badge theme"></span>
+  <span id="org-badge" class="badge hidden"></span>
   <span class="spacer"></span>
   <span id="session-label" class="badge">session: —</span>
   <button id="new-session">New session</button>
@@ -202,6 +221,15 @@
       <div class="verify-actions">
         <a id="verify-link" class="hidden" href="#">Open confirmation link</a>
         <button id="verify-resend">Resend email</button>
+      </div>
+    </div>
+    <div id="billing-notice" class="hidden">
+      <div class="verify-text">
+        <strong id="billing-title">Payment problem</strong>
+        <span id="billing-detail"></span>
+      </div>
+      <div class="verify-actions">
+        <button id="billing-manage" class="hidden">Update payment method</button>
       </div>
     </div>
     <div id="composer">
@@ -226,6 +254,15 @@
       </div>
       <div id="search-results"></div>
     </section>
+    <section id="usage-section" class="hidden">
+      <h2>Usage &amp; billing</h2>
+      <div id="usage-panel"><div class="muted">Loading…</div></div>
+      <button id="usage-refresh">Refresh</button>
+    </section>
+    <section id="billing-setup-section" class="hidden">
+      <h2>Subscription</h2>
+      <div id="billing-setup"><div class="muted">Loading…</div></div>
+    </section>
   </aside>
 </main>
 </div>
@@ -243,6 +280,12 @@ let activeTab = "login";
 let selectedCat = "finance";
 let inviteToken = "";
 let inviteCategory = "";
+let inviteOrganisation = "";
+// Two independent reasons to keep the composer shut: an unconfirmed address
+// (D18) and a workspace whose subscription has stopped (D3). Separate flags
+// because each notice renders on its own, and whichever ran last must not
+// unlock what the other still forbids.
+let composerBlocked = { verification: false, billing: false };
 
 function tzOffset() { return -new Date().getTimezoneOffset(); }
 function authHeaders(json) {
@@ -322,7 +365,8 @@ async function loadWorkspaces() {
       const badge = document.createElement("div");
       badge.className = "muted";
       badge.style.marginTop = "8px";
-      badge.textContent = "🔒 Invite-only signup for " + inviteCategory;
+      badge.textContent = "🔒 Invite-only signup for " + inviteCategory +
+        (inviteOrganisation ? " · joining " + inviteOrganisation : " · free tier");
       pills.appendChild(badge);
     }
   } catch (e) { /* keep the select inert on failure */ }
@@ -373,11 +417,140 @@ async function enterChat(verification) {
     // /me is authoritative; the signup payload only fills the gap on first run
     // so a no-SMTP deployment can show the link it just returned.
     renderVerification(me.verification, verification);
+    renderBillingNotice();
+    renderBillingSetup();
     setSession(null);
     clearMessages();
     addMsg("bot", welcome());
     renderSessions();
+    renderOrgBadge();
+    showUsagePanel();
   } catch (e) { setAuthError(e.message); }
+}
+
+// A paid organisation's plan and billing state ride on /me so the owner can
+// see that the subscription is live without opening the admin console. The
+// badge is hidden for the free sample organisation and for anyone who has not
+// subscribed yet.
+function renderOrgBadge() {
+  const badge = $("org-badge");
+  const org = me && me.organisation;
+  if (!org || org.system_owned || (!org.plan && !org.billing_status)) {
+    badge.classList.add("hidden");
+    return;
+  }
+  const status = org.billing_status || "—";
+  const plan = org.plan ? org.plan.charAt(0).toUpperCase() + org.plan.slice(1) : "—";
+  badge.textContent = plan + " · " + status;
+  const cls = (status === "active" || status === "trialing") ? "ok"
+    : (status === "past_due" || status === "unpaid" || status === "incomplete") ? "warn"
+      : "err";
+  badge.className = "badge " + cls;
+}
+
+// ---- Usage & billing panel ------------------------------------------------
+// GET /billing/usage answers any member, but this panel is the owner's: the
+// pool and the seats are the numbers someone acts on when they decide whether
+// to buy more or ask who is using them. Members keep the badge in the header.
+function usageVisible() {
+  const org = me && me.organisation;
+  return !!org && !org.system_owned && org.role === "owner";
+}
+
+function usageWhen(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? iso
+    : d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+}
+
+function usageRow(k, v) {
+  return `<div class="u-row"><span class="k">${k}</span><span class="v">${v}</span></div>`;
+}
+
+function usageStatusTag(status) {
+  const cls = (status === "active" || status === "trialing") ? "ok"
+    : (status === "past_due" || status === "unpaid" || status === "incomplete") ? "warn"
+      : "err";
+  return `<span class="badge ${cls}">${escHtml(status || "—")}</span>`;
+}
+
+function usageMeter(used, included) {
+  // No bar for an unmetered pool: there is no fill level to show.
+  if (!included || included <= 0) return "";
+  const pct = Math.min(100, Math.round(((Number(used) || 0) / included) * 100));
+  const cls = pct >= 100 ? "err" : pct >= 80 ? "warn" : "";
+  return `<div class="u-meter ${cls}"><i style="width:${pct}%"></i></div>`;
+}
+
+function renderUsagePanel(u) {
+  const q = u.questions || {};
+  const s = u.seats || {};
+  const rep = u.reporting || {};
+  const plan = u.plan ? u.plan.charAt(0).toUpperCase() + u.plan.slice(1) : "—";
+  const parts = [
+    `<div class="u-head"><span class="badge theme">${escHtml(plan)}</span>` +
+    usageStatusTag(u.billing_status) + "</div>",
+  ];
+
+  if (q.included == null) {
+    parts.push(usageRow("Questions this month", `${Number(q.used) || 0}`));
+    parts.push('<div class="u-note">Free tier — questions are not metered.</div>');
+  } else if (q.metered === false) {
+    // A plan with no Stripe customer behind it yet: count it, report nothing.
+    parts.push(usageRow("Questions this month", `${Number(q.used) || 0} of ${q.included}`));
+    parts.push(usageMeter(q.used, q.included));
+    parts.push('<div class="u-note">No Stripe subscription yet — nothing is metered.</div>');
+  } else {
+    parts.push(usageRow("Questions this month", `${Number(q.used) || 0} of ${q.included}`));
+    parts.push(usageMeter(q.used, q.included));
+    if (Number(q.overage) > 0) {
+      parts.push(`<div class="u-note">${q.overage} past the pool — reported to Stripe as it happens.</div>`);
+    }
+  }
+
+  const from = usageWhen(u.period_start);
+  const to = usageWhen(u.period_end);
+  parts.push(usageRow("Billing period",
+    from && to ? `${from} → ${to}` : to ? `ends ${to}` : "—"));
+
+  const includedSeats = s.included_per_workspace;
+  parts.push(usageRow("Seats",
+    `${Number(s.total) || 0} used · ${includedSeats == null ? "—" : includedSeats} included per workspace`));
+  const byWorkspace = (s.by_workspace || [])
+    .map((w) => `<div class="u-row"><span class="k">${escHtml(w.category)}</span><span class="v">${w.seats} seat${w.seats === 1 ? "" : "s"}</span></div>`);
+  if (byWorkspace.length) parts.push(`<div class="u-list">${byWorkspace.join("")}</div>`);
+  parts.push(usageRow("Extra seats",
+    `${Number(s.extra) || 0}` + (Number(s.reported) ? ` (${s.reported} already reported)` : "")));
+
+  if (!rep.configured) {
+    parts.push('<div class="u-note">Not connected to Stripe — nothing is reported yet.</div>');
+  } else if (!rep.period_start_set) {
+    parts.push('<div class="u-note">Reporting idle: no billing period is recorded yet, so questions are not sent to Stripe.</div>');
+  } else {
+    parts.push('<div class="u-note">Reporting to Stripe: on.</div>');
+  }
+  return parts.join("");
+}
+
+async function loadUsagePanel() {
+  const box = $("usage-panel");
+  try {
+    const res = await api("/billing/usage", { headers: authHeaders(), auth: true });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Could not read usage");
+    box.innerHTML = renderUsagePanel(data);
+  } catch (e) {
+    box.innerHTML = `<div class="u-note">${escHtml(e.message)}</div>`;
+  }
+}
+
+// Shown only where usageVisible() allows it, then filled. Called again on
+// return to the tab so a question asked elsewhere does not leave stale numbers.
+function showUsagePanel() {
+  if (!usageVisible()) return;
+  $("usage-section").classList.remove("hidden");
+  loadUsagePanel();
 }
 
 function welcome() {
@@ -747,8 +920,11 @@ async function send() {
   } finally {
     if (timer) cancelAnimationFrame(timer);
     streaming = false;
-    $("send").disabled = false;
-    if (voice.state === "idle") $("mic").disabled = false;
+    // Resting state belongs to the gate, not to the request that just
+    // finished: an in-flight answer must not unlock a composer that billing
+    // or verification has shut in the meantime.
+    applyComposerGate();
+    if (voice.state !== "idle") $("mic").disabled = true;
     sessionOffset = 0;
     renderSessions();
   }
@@ -1103,16 +1279,37 @@ $("signup-cat").addEventListener("change", (e) => selectCat(e.target.value));
 // The server refuses /chat for an unconfirmed free account. This keeps the
 // promise at the composer: the control is visibly unavailable and says why,
 // instead of the user pressing Send and reading a permission error.
+function applyComposerGate() {
+  const reason = composerBlocked.verification ? "verification"
+    : composerBlocked.billing ? "billing" : null;
+  if (reason) {
+    $("input").disabled = true;
+    $("input").placeholder = reason === "verification"
+      ? "Confirm your email address to ask questions…"
+      : "This workspace is paused until its payment is fixed…";
+    $("mic").disabled = true;
+    // Send is inert while the textarea is empty, but leaving it looking enabled
+    // reads as a bug rather than a gate.
+    $("send").disabled = true;
+    $("voice-auto").disabled = true;
+    $("search-q").disabled = true;
+    return;
+  }
+  $("input").disabled = false;
+  $("input").placeholder = "Ask about your workspace documents…";
+  $("mic").disabled = false;
+  $("send").disabled = false;
+  $("voice-auto").disabled = false;
+  $("search-q").disabled = false;
+}
+
 function renderVerification(info, extra) {
   const notice = $("verify-notice");
-  if (!info || info.verified) {
+  const unverified = !!info && !info.verified;
+  composerBlocked.verification = unverified;
+  if (!unverified) {
     notice.classList.add("hidden");
-    $("input").disabled = false;
-    $("input").placeholder = "Ask about your workspace documents…";
-    $("mic").disabled = false;
-    $("send").disabled = false;
-    $("voice-auto").disabled = false;
-    $("search-q").disabled = false;
+    applyComposerGate();
     return;
   }
   notice.classList.remove("hidden");
@@ -1121,18 +1318,163 @@ function renderVerification(info, extra) {
   const anchor = $("verify-link");
   if (link) { anchor.href = link; anchor.classList.remove("hidden"); }
   else { anchor.classList.add("hidden"); }
-  $("input").disabled = true;
-  $("input").placeholder = "Confirm your email address to ask questions…";
-  $("mic").disabled = true;
-  // Send is inert while the textarea is empty, but leaving it looking enabled
-  // reads as a bug rather than a gate.
-  $("send").disabled = true;
-  $("voice-auto").disabled = true;
-  $("search-q").disabled = true;
+  applyComposerGate();
   if (info.resend_available_at) {
     $("verify-resend").disabled = false;
   }
 }
+
+// ---- D3 billing state ------------------------------------------------------
+// The server answers 402 once a subscription has stopped, which is the
+// enforcement half; this is the other half. Everyone in the workspace should
+// be able to see why the composer closed, and the owner needs the door the
+// 402 message tells them to walk through — opening the card form is a billing
+// decision, exactly like buying the plan was, so the button is theirs alone.
+function renderBillingNotice() {
+  const notice = $("billing-notice");
+  const org = (me && me.organisation) || null;
+  const status = (!org || org.system_owned) ? null : org.billing_status;
+  composerBlocked.billing = status === "canceled" || status === "unpaid";
+  const owner = !!org && org.role === "owner";
+
+  if (status === "past_due" || status === "unpaid" || status === "canceled") {
+    notice.classList.remove("hidden");
+    notice.classList.toggle("err", status !== "past_due");
+    if (status === "canceled") {
+      $("billing-title").textContent = "Subscription ended";
+      $("billing-detail").textContent =
+        "This workspace stopped when the subscription ended. Ask the owner to choose a plan again.";
+    } else if (status === "unpaid") {
+      $("billing-title").textContent = "Payment failed";
+      $("billing-detail").textContent =
+        "Payments were retried and did not go through, so this workspace is stopped. Update the payment method to restore it.";
+    } else {
+      $("billing-title").textContent = "Payment failed";
+      $("billing-detail").textContent =
+        "Your workspace stays available, but the last payment did not go through. Update the payment method to keep access.";
+    }
+    // The portal manages cards and invoices; it cannot restart a subscription
+    // that has already ended, so offering it for `canceled` would be a button
+    // that leads nowhere. Choosing a plan again is checkout's job.
+    $("billing-manage").classList.toggle("hidden", !owner || status === "canceled");
+  } else {
+    notice.classList.add("hidden");
+  }
+  applyComposerGate();
+}
+
+$("billing-manage").addEventListener("click", () => openBillingPortal($("billing-manage")));
+
+// The payment decision lives with the owner. This card is where a
+// never-subscribed organisation buys its plan and a live one reaches Stripe's
+// portal to change the payment method or cancel. Both endpoints are owner-only,
+// so nothing is shown to a plain member and signing in as an owner turns the
+// card on.
+function ownerView() {
+  const org = me && me.organisation;
+  return !!org && !org.system_owned && org.role === "owner";
+}
+
+function billingSetupNote(box, message) {
+  box.append(Object.assign(document.createElement("div"), {
+    className: "u-note", textContent: message,
+  }));
+}
+
+async function openBillingPortal(btn) {
+  const previous = btn.textContent;
+  setBusy(btn, true, "Opening…");
+  try {
+    const res = await api("/billing/portal", {
+      method: "POST", headers: authHeaders(true), auth: true,
+      body: JSON.stringify({}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Could not open the billing portal");
+    location.href = data.url;
+  } catch (e) {
+    // Stay on the page and say why: a failed redirect would otherwise look
+    // like nothing happened.
+    billingSetupNote($("billing-setup"), e.message);
+  } finally { setBusy(btn, false); btn.textContent = previous; }
+}
+
+async function startCheckout(btn, plan, interval) {
+  const previous = btn.textContent;
+  setBusy(btn, true, "Opening checkout…");
+  try {
+    const res = await api("/billing/checkout", {
+      method: "POST", headers: authHeaders(true), auth: true,
+      body: JSON.stringify({ plan: String(plan || "team").toLowerCase(), interval: String(interval || "month").toLowerCase() }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Could not start the subscription");
+    location.href = data.url;
+  } catch (e) {
+    billingSetupNote($("billing-setup"), e.message);
+  } finally { setBusy(btn, false); btn.textContent = previous; }
+}
+
+function pickupLabel(name, sel) {
+  const el = document.createElement("label");
+  el.className = "k";
+  el.append(name + ": ", sel);
+  return el;
+}
+
+function renderBillingSetup() {
+  const card = $("billing-setup-section");
+  if (!ownerView()) { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  const box = $("billing-setup");
+  box.innerHTML = "";
+  const org = me.organisation;
+  const status = org.billing_status || null;
+
+  if (!org.plan && !status) {
+    const plan = document.createElement("select");
+    plan.innerHTML = "<option value=\"team\">Team</option><option value=\"business\">Business</option>";
+    const interval = document.createElement("select");
+    interval.innerHTML = "<option value=\"month\">Monthly</option><option value=\"year\">Yearly</option>";
+    const row = document.createElement("div");
+    row.className = "u-row";
+    row.append(pickupLabel("Plan", plan), pickupLabel("Billing", interval));
+    box.append(row);
+    billingSetupNote(box,
+      "You are billed per workspace. Seats and questions past the pool are metered. Stripe handles the card and receipt.");
+    const start = document.createElement("button");
+    start.type = "button";
+    start.textContent = "Start subscription";
+    start.addEventListener("click", () => startCheckout(start, plan.value, interval.value));
+    box.append(start);
+    return;
+  }
+
+  box.innerHTML = usageStatusTag(status);
+  const manage = document.createElement("button");
+  manage.type = "button";
+  manage.textContent = "Manage billing";
+  manage.addEventListener("click", () => openBillingPortal(manage));
+  if (status === "canceled") {
+    const again = document.createElement("button");
+    again.type = "button";
+    again.textContent = "Choose a plan again";
+    again.addEventListener("click", () => startCheckout(again, org.plan || "team", "month"));
+    box.append(again);
+  } else if (status === "active" || status === "trialing" || status === "past_due" || status === "unpaid") {
+    box.append(manage);
+  }
+}
+
+// Re-read after a question, a checkout in another tab, or a seat change - the
+// panel is a snapshot, and a stale one would be worse than no panel at all.
+$("usage-refresh").addEventListener("click", async () => {
+  const btn = $("usage-refresh");
+  const previous = btn.textContent;
+  setBusy(btn, true, "…");
+  try { await loadUsagePanel(); }
+  finally { setBusy(btn, false); btn.textContent = previous; }
+});
 
 // Confirming usually happens in another tab (the email link). Re-check on
 // focus so returning to the app unlocks the composer without a reload.
@@ -1143,6 +1485,10 @@ document.addEventListener("visibilitychange", async () => {
     if (!res.ok) return;
     me = await res.json();
     renderVerification(me.verification);
+    renderBillingNotice();
+    renderBillingSetup();
+    renderOrgBadge();
+    showUsagePanel();
   } catch (e) {}
 });
 
@@ -1184,6 +1530,7 @@ $("verify-resend").addEventListener("click", async () => {
       if (res.ok) {
         const data = await res.json();
         inviteCategory = data.category;
+        inviteOrganisation = data.organisation_id || "";
       } else {
         inviteToken = "";
       }

@@ -32,6 +32,16 @@ def test_organisations_tab_is_registered():
     assert '["tab-organisations", "view-organisations"]' in ADMIN
 
 
+def test_every_tab_button_actually_has_a_click_listener():
+    """A tab can be declared, rendered, and handled by showTab and still do
+    nothing on click if no listener was ever attached — which is exactly how
+    the Organisations tab shipped dead: showTab handled it, nobody called it."""
+    declared = set(re.findall(r'\["(tab-[a-z]+)",', ADMIN))
+    wired = set(re.findall(r'\$\("(tab-[a-z]+)"\)\.addEventListener\("click"', ADMIN))
+    missing = declared - wired
+    assert not missing, f"tabs declared but with no click listener: {sorted(missing)}"
+
+
 def test_switching_to_the_tab_loads_both_halves():
     """The tab is useless if it opens empty, and the two halves load separately."""
     body = _sync_fn("showTab")
@@ -229,6 +239,29 @@ class TestCreateUserOrganisation:
         body = _fn("loadOrgOptions")
         assert "Free (sample) — self-service" in body
         assert 'sel.value = ""' in body
+
+
+class TestInviteOrganisation:
+    """Invites are how a customer's own people join it, so the form has to be
+    able to name one — and has to be able to say "no organisation" too, since
+    that is what every invite meant before."""
+
+    def test_invite_form_offers_an_organisation_choice(self):
+        assert 'id="invite-org"' in ADMIN
+
+    def test_create_invite_sends_the_choice(self):
+        body = _fn("createInvite")
+        assert "payload.organisation_id = org" in body
+        assert 'if (org) payload.organisation_id = org' in body
+
+    def test_the_select_is_filled_from_the_organisation_list(self):
+        body = _fn("loadOrgOptions")
+        assert '$("invite-org")' in body
+        assert "Free (sample) — self-service" in body
+
+    def test_the_invite_table_names_the_organisation(self):
+        assert "<th>Organisation</th>" in ADMIN
+        assert 'inv.organisation_id || "Free (sample)"' in ADMIN
 
 
 def test_upload_makes_no_one_able_to_see_the_document():

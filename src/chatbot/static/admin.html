@@ -90,6 +90,7 @@
   .tag.custom { color: var(--accent); border-color: rgba(56,189,248,.4); }
   .tag.ok { color: var(--ok); border-color: rgba(74,222,128,.4); }
   .tag.warn { color: var(--warn); border-color: rgba(251,191,36,.4); }
+  .tag.err { color: var(--err); border-color: rgba(248,113,113,.4); }
   .row-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; }
   .row-form .field label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
   .doc-group { margin-bottom: 14px; }
@@ -284,6 +285,11 @@
       <div id="org-upload-log"><div class="muted"></div></div>
     </div>
 
+    <div class="card hidden" id="org-billing-card">
+      <h2>Billing for <span id="org-billing-name"></span></h2>
+      <div id="org-billing-body"><div class="muted">Loading…</div></div>
+    </div>
+
     <div class="card hidden" id="org-members-card">
       <h2>People in <span id="org-members-name"></span></h2>
       <div class="hint">One owner per organisation. Everyone else is either an admin or a plain member, and a member only sees the workspaces ticked here.</div>
@@ -365,12 +371,13 @@
       <h2>Invite links <span class="muted">(invite-only signup)</span></h2>
       <div class="row-form">
         <div class="field"><label>Category</label><select id="invite-cat"></select></div>
+        <div class="field"><label>Organisation</label><select id="invite-org"></select></div>
         <div class="field"><label>Uses allowed</label><input id="invite-uses" type="number" min="1" max="1000" value="1"></div>
         <div class="field"><label>Expires in (h)</label><input id="invite-ttl" type="number" min="1" max="8760" value="168"></div>
         <div class="field"><label>Note (optional)</label><input id="invite-label" placeholder="e.g. audit team"></div>
         <div class="field"><button id="btn-create-invite" class="primary">Create invite</button></div>
       </div>
-      <div class="hint">Anyone with the one-time link can create an account in that workspace without opening signup for everyone. The full link is shown only once, at creation time.</div>
+      <div class="hint">Anyone with the one-time link can create an account in that workspace without opening signup for everyone. Choosing an organisation puts the new account in it — that is how a customer's own people join; on <em>Free</em> the account joins the shared sample. The full link is shown only once, at creation time.</div>
       <div id="invite-list"><div class="muted" id="invite-empty">No active invites. Create one above — the full link is shown once (copy it immediately).</div></div>
     </div>
   </section>
@@ -813,6 +820,7 @@ async function refreshStatus() {
 
 function renderOverview(data) {
   const t = data.totals || {};
+  orgScoped = data.organisations != null;
   const nums = [t.workspaces, t.chunks, t.users, t.sessions].map((v) => v == null ? "—" : v);
   const labels = ["Workspaces", "Chunks indexed", "Users", "Sessions"];
   $("totals").innerHTML = nums.map((n, i) =>
@@ -821,6 +829,16 @@ function renderOverview(data) {
 
   const box = $("workspaces");
   box.innerHTML = "";
+  if (orgScoped) {
+    const note = elm("div", "muted");
+    note.innerHTML = "Organisation-scoped: each of the " + data.organisations +
+      " organisation(s) indexes its own copy of the content assigned to it. " +
+      "Manage content under <b>Organisations → Content</b>. " +
+      "<b>Re-index all</b> rebuilds every organisation's index.";
+    box.appendChild(note);
+    renderProgress(data.progress);
+    return;
+  }
   for (const ws of data.workspaces || []) {
     const row = document.createElement("div");
     row.className = "workspace";
@@ -972,9 +990,9 @@ async function loadCategories() {
 /* ---------------- shared documents ---------------- */
 
 async function loadOrgOptions() {
-  const sel = $("user-org");
-  if (!sel) return;
-  const current = sel.value;
+  const sels = [$("user-org"), $("invite-org")].filter(Boolean);
+  if (!sels.length) return;
+  let options = "";
   try {
     const res = await api("/admin/organisations", { headers: authHeaders() });
     const orgs = (await res.json()).organisations || [];
@@ -982,13 +1000,17 @@ async function loadOrgOptions() {
     // Default to the free self-service path, so the common case needs no choice
     // made at all (Q22).
     const sample = orgs.find((o) => o.system_owned) || null;
-    sel.innerHTML =
+    options =
       '<option value="">Free (sample) — self-service</option>' +
       orgs.filter((o) => !o.system_owned).map((o) =>
         '<option value="' + esc(o.id) + '">' +
         esc(o.name || o.id) + " — paying customer</option>").join("");
-    if (sample && !current) sel.value = "";
-    if (current && byId.has(current)) sel.value = current;
+    for (const sel of sels) {
+      const current = sel.value;
+      sel.innerHTML = options;
+      if (sample && !current) sel.value = "";
+      if (current && byId.has(current)) sel.value = current;
+    }
   } catch (e) {
     // The console must still create free accounts when organisations are
     // unavailable, so leave the default option in place rather than failing.
@@ -1400,6 +1422,7 @@ function fmtFileSize(f) { return fmtSize(f.size); }
 /* ---------------- organisations and master library ---------------- */
 
 let orgCache = [];
+let orgScoped = false;
 let libraryCache = [];
 let selectedOrg = null;
 let orgContentCache = { assignments: {}, library: [], workspaces: [] };
@@ -1487,6 +1510,49 @@ async function uploadLibrary() {
   finally { setBusy(btn, false); }
 }
 
+// Billing status -> tag class. Canceled is a hard stop (colour it red), while
+// past_due/unpaid/incomplete are "pay but still working" (amber), matching the
+// lifecycle the proposal describes.
+function billingTag(status) {
+  if (status === "active" || status === "trialing") return "ok";
+  if (status === "canceled") return "err";
+  if (status === "past_due" || status === "unpaid" || status === "incomplete") return "warn";
+  return "custom";
+}
+
+function renderBilling(org) {
+  const body = $("org-billing-body");
+  body.innerHTML = "";
+  if (!org.plan && !org.billing_status) {
+    body.appendChild(elm("div", "muted",
+      "No subscription yet. The organisation's owner starts one through " +
+      "POST /billing/checkout, which redirects to Stripe Checkout."));
+    return;
+  }
+  const rows = [
+    ["Plan", org.plan ? (org.plan.charAt(0).toUpperCase() + org.plan.slice(1)) : "—"],
+    ["Stripe customer", org.stripe_customer_id || "—"],
+    ["Subscription", org.stripe_subscription_id || "—"],
+    ["Renews", org.current_period_end ? new Date(org.current_period_end).toLocaleString() : "—"],
+  ];
+  const table = document.createElement("table");
+  table.className = "table";
+  table.innerHTML = "<tbody>" + rows.map(([k, v]) =>
+    "<tr><td style='color:var(--muted); font-size:12px; text-transform:uppercase; width:140px'>" +
+    k + "</td><td>" + esc(v) + "</td></tr>").join("") + "</tbody>";
+  // The status lives as a coloured tag rather than raw text: it is the one
+  // column an operator scans for.
+  const statusRow = document.createElement("tr");
+  statusRow.innerHTML =
+    "<td style='color:var(--muted); font-size:12px; text-transform:uppercase; width:140px'>Status</td><td></td>";
+  const status = document.createElement("span");
+  status.className = "tag " + billingTag(org.billing_status);
+  status.textContent = org.billing_status || "—";
+  statusRow.lastElementChild.appendChild(status);
+  table.querySelector("tbody").insertBefore(statusRow, table.querySelector("tbody").rows[1]);
+  body.appendChild(table);
+}
+
 async function loadOrganisations() {
   try {
     const res = await api("/admin/organisations", { headers: authHeaders() });
@@ -1509,16 +1575,44 @@ function renderOrganisations() {
   const table = document.createElement("table");
   table.className = "table";
   table.innerHTML =
-    "<thead><tr><th>Organisation</th><th>Users</th><th>Documents</th>" +
-    "<th>Type</th><th></th></tr></thead>";
+    "<thead><tr><th>Organisation</th><th>Owner</th><th>Users</th><th>Documents</th>" +
+    "<th>Plan</th><th>Billing</th><th>Type</th><th></th></tr></thead>";
   const tbody = document.createElement("tbody");
   for (const o of orgCache) {
     const tr = document.createElement("tr");
     const name = elm("td", "", o.name || o.id);
     name.appendChild(elm("div", "muted", o.id));
     tr.appendChild(name);
+    const ownerCell = elm("td");
+    if (o.system_owned) {
+      ownerCell.appendChild(elm("span", "muted", "—"));
+    } else if (o.owner) {
+      ownerCell.textContent = o.owner;
+      ownerCell.title = "Organisation owner";
+    } else {
+      const tag = elm("span", "tag warn", "no owner");
+      tag.title = "Customer org with no owner yet — the next invite, admin user create, or startup backfill assigns one.";
+      ownerCell.appendChild(tag);
+    }
+    tr.appendChild(ownerCell);
     tr.appendChild(elm("td", "", String(o.user_count == null ? 0 : o.user_count)));
     tr.appendChild(elm("td", "", String(o.assignments == null ? 0 : o.assignments)));
+    const planCell = elm("td");
+    planCell.innerHTML = o.plan
+      ? esc(o.plan.charAt(0).toUpperCase() + o.plan.slice(1) +
+           (o.plan !== "enterprise" ? (o.plan === "team" ? " · US$190/mo" : " · US$490/mo") : ""))
+      : '<span class="muted">—</span>';
+    tr.appendChild(planCell);
+    const statusCell = elm("td");
+    if (o.plan) {
+      const span = document.createElement("span");
+      span.className = "tag " + billingTag(o.billing_status);
+      span.textContent = o.billing_status || "—";
+      statusCell.appendChild(span);
+    } else {
+      statusCell.appendChild(elm("span", "muted", "—"));
+    }
+    tr.appendChild(statusCell);
     tr.appendChild(elm("td", "", o.system_owned ? "system" : "customer"));
     const actions = elm("td");
     const open = elm("button", "small", "Content");
@@ -1545,6 +1639,9 @@ function selectOrganisation(org) {
   selectedOrg = org;
   $("org-detail-card").classList.remove("hidden");
   $("org-detail-name").textContent = org.name || org.id;
+  $("org-billing-card").classList.remove("hidden");
+  $("org-billing-name").textContent = org.name || org.id;
+  renderBilling(org);
   $("org-members-card").classList.remove("hidden");
   $("org-members-name").textContent = org.name || org.id;
   loadOrgContent();
@@ -2048,6 +2145,14 @@ async function loadWorkspaces() {
 function renderWorkspaces(q) {
   const box = $("ws-list");
   box.innerHTML = "";
+  if (orgScoped) {
+    box.appendChild(elm("div", "muted",
+      "Organisation-scoped deployment: each organisation provisions its own " +
+      "workspaces and indexes its own copy of the content assigned to it. " +
+      "See Organisations → Content per customer. Use Create workspace above to " +
+      "add a new category."));
+    return;
+  }
   const list = wsCache.filter((w) =>
     !q || (w.category + " " + (w.label || "") + " " + (w.blurb || "")).toLowerCase().includes(q));
   if (!list.length) { box.appendChild(elm("div", "muted", q ? "No workspaces match." : "No workspaces yet.")); return; }
@@ -2207,12 +2312,13 @@ function renderInvites(invites) {
   const table = document.createElement("table");
   table.className = "table";
   const thead = document.createElement("thead");
-  thead.innerHTML = "<tr><th>Workspace</th><th>Note</th><th>Uses</th><th>Created</th><th>Expires</th><th>Status</th><th></th></tr>";
+  thead.innerHTML = "<tr><th>Workspace</th><th>Organisation</th><th>Note</th><th>Uses</th><th>Created</th><th>Expires</th><th>Status</th><th></th></tr>";
   table.appendChild(thead);
   const tbody = document.createElement("tbody");
   for (const inv of invites) {
     const tr = document.createElement("tr");
-    tr.appendChild(elm("td", "", inv.category + (inv.label ? " · " + inv.label : "")));
+    tr.appendChild(elm("td", "", inv.category));
+    tr.appendChild(elm("td", "", inv.organisation_id || "Free (sample)"));
     tr.appendChild(elm("td", "", inv.label || "—"));
     tr.appendChild(elm("td", "pillcount", inv.uses + "/" + inv.max_uses));
     tr.appendChild(elm("td", "muted", relTime(inv.created_at)));
@@ -2249,6 +2355,10 @@ async function createInvite() {
     ttl_hours: Math.max(1, parseInt($("invite-ttl").value, 10) || 168),
     label: $("invite-label").value.trim() || null,
   };
+  // Absent means the account joins the free tier, which is what every invite
+  // did before invitations could name an organisation.
+  const org = $("invite-org") ? $("invite-org").value : "";
+  if (org) payload.organisation_id = org;
   try {
     const res = await api("/admin/invites", {
       method: "POST", headers: authHeaders(), body: JSON.stringify(payload),
@@ -2663,6 +2773,7 @@ $("audit-search").addEventListener("input", () => {
 });
 
 $("tab-overview").addEventListener("click", () => showTab("tab-overview"));
+$("tab-organisations").addEventListener("click", () => showTab("tab-organisations"));
 $("tab-documents").addEventListener("click", () => showTab("tab-documents"));
 $("tab-workspaces").addEventListener("click", () => showTab("tab-workspaces"));
 $("tab-users").addEventListener("click", () => showTab("tab-users"));

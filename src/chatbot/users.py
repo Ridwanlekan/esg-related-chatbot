@@ -219,6 +219,18 @@ def _row_to_organisation(row):
         # is the safe reading: a real customer must never inherit the guard.
         "system_owned": bool(row["system_owned"]) if "system_owned" in row.keys() else False,
         "created_at": row["created_at"],
+        # Billing fields (lazy ALTER below). Absent for rows that predate the
+        # columns, so each stays conditional rather than defaulting a made-up
+        # state.
+        "stripe_customer_id": row["stripe_customer_id"] if "stripe_customer_id" in row.keys() else None,
+        "stripe_subscription_id": row["stripe_subscription_id"] if "stripe_subscription_id" in row.keys() else None,
+        "plan": row["plan"] if "plan" in row.keys() else None,
+        "billing_status": row["billing_status"] if "billing_status" in row.keys() else None,
+        "current_period_end": row["current_period_end"] if "current_period_end" in row.keys() else None,
+        "current_period_start": row["current_period_start"] if "current_period_start" in row.keys() else None,
+        # Extra seats already reported to Stripe for `current_period_end`, so a
+        # mid-period join sends the difference rather than the whole count again.
+        "seats_reported": row["seats_reported"] if "seats_reported" in row.keys() else 0,
     }
 
 
@@ -302,6 +314,45 @@ class UserStore:
             self.conn.execute("ALTER TABLE users ADD COLUMN verification_token_hash TEXT")
         if "verification_sent_at" not in cols:
             self.conn.execute("ALTER TABLE users ADD COLUMN verification_sent_at TEXT")
+        org_cols = {
+            r[1] for r in self.conn.execute("PRAGMA table_info(organisations)").fetchall()
+        }
+        # Billing columns, lazily added so a database written by an older build
+        # opens untouched. `billing_status` deliberately has no default: an
+        # organisation that was never billed should not quietly read as "active".
+        for col in (
+            "stripe_customer_id",
+            "stripe_subscription_id",
+            "plan",
+            "billing_status",
+            "current_period_end",
+            "current_period_start",
+        ):
+            if col not in org_cols:
+                self.conn.execute(
+                    f"ALTER TABLE organisations ADD COLUMN {col} TEXT"
+                )
+        # Seats are metered per billing period, so what has already been
+        # reported has to survive a restart; without it a second sync in the
+        # same period would bill the same seats twice. Defaults to 0, which
+        # reads as "nothing reported yet" - the safe direction, since the next
+        # period's opening snapshot sets it straight either way.
+        if "seats_reported" not in org_cols:
+            self.conn.execute(
+                "ALTER TABLE organisations ADD COLUMN seats_reported INTEGER "
+                "NOT NULL DEFAULT 0"
+            )
+        # Webhook idempotency: Stripe may retry delivery and our own handler may
+        # be invoked more than once, so each event id is recorded after it has
+        # been applied and skip the second pass rather than double-apply.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS billing_events ("
+            "event_id TEXT PRIMARY KEY, "
+            "type TEXT NOT NULL, "
+            "organisation_id TEXT, "
+            "at TEXT NOT NULL, "
+            "detail TEXT)"
+        )
         self.conn.commit()
         self._ensure_system_organisations()
         self._ensure_memberships()
@@ -352,11 +403,101 @@ class UserStore:
         ).fetchone()
         return _row_to_organisation(row) if row else None
 
+    def get_organisation_by_stripe_customer(self, customer_id):
+        """Resolve an organisation from a Stripe customer id.
+
+        Webhook events identify the customer, so this is how an event reaches
+        the organisation it belongs to when the event carries no metadata.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM organisations WHERE stripe_customer_id = ?",
+            (customer_id,),
+        ).fetchone()
+        return _row_to_organisation(row) if row else None
+
+    def set_organisation_billing(self, organisation_id, **fields):
+        """Update billing fields on an organisation (customer, plan, status).
+
+        Fields are whitelisted so a caller can never slip a column past schema
+        changes. Returns the updated organisation or None if it does not exist.
+        """
+        allowed = {
+            "stripe_customer_id",
+            "stripe_subscription_id",
+            "plan",
+            "billing_status",
+            "current_period_end",
+            "current_period_start",
+            "seats_reported",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return self.get_organisation(organisation_id)
+        assignments = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values())
+        cur = self.conn.execute(
+            f"UPDATE organisations SET {assignments} WHERE id = ?",
+            (*values, organisation_id),
+        )
+        self.conn.commit()
+        if cur.rowcount == 0:
+            return None
+        return self.get_organisation(organisation_id)
+
+    def has_billing_event(self, event_id):
+        return self.conn.execute(
+            "SELECT 1 FROM billing_events WHERE event_id = ?", (event_id,)
+        ).fetchone() is not None
+
+    def record_billing_event(self, event_id, event_type, organisation_id, detail):
+        """Record a processed webhook event id so a retry is not re-applied."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO billing_events (event_id, type, "
+            "organisation_id, at, detail) VALUES (?, ?, ?, ?, ?)",
+            (event_id, event_type, organisation_id, _now(), (detail or "")[:2000]),
+        )
+        self.conn.commit()
+
     def list_organisations(self):
         rows = self.conn.execute(
             "SELECT * FROM organisations ORDER BY id"
         ).fetchall()
         return [_row_to_organisation(r) for r in rows]
+
+    def organisation_workspace_categories(self, organisation_id):
+        """Distinct workspaces the organisation has provisioned.
+
+        The base fee is charged per workspace, so this is the quantity this
+        organisation is billed for: one fee line per workspace its people can
+        reach. Distinct memberships are the source because a user may hold
+        several workspaces (Q7), and seats are counted per workspace (Q8).
+        """
+        rows = self.conn.execute(
+            "SELECT DISTINCT m.category FROM workspace_memberships m "
+            "JOIN users u ON u.id = m.user_id "
+            "WHERE u.organisation_id = ? ORDER BY m.category",
+            (organisation_id,),
+        ).fetchall()
+        return [r["category"] for r in rows]
+
+    def organisation_workspace_seats(self, organisation_id):
+        """Seats held per workspace inside one organisation.
+
+        The seat allowance is counted per workspace (Q8) while the people
+        belong to the organisation, so the two are joined here: only this
+        organisation's users count towards a workspace's seats, and a workspace
+        nobody in the organisation has joined is not provisioned at all (which
+        is what organisation_workspace_categories returns).
+        """
+        rows = self.conn.execute(
+            "SELECT m.category AS category, COUNT(*) AS seats "
+            "FROM workspace_memberships m "
+            "JOIN users u ON u.id = m.user_id "
+            "WHERE u.organisation_id = ? "
+            "GROUP BY m.category ORDER BY m.category",
+            (organisation_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def create_organisation(self, organisation_id, name):
         """Create a customer organisation. Refuses the reserved system ids.
@@ -444,6 +585,59 @@ class UserStore:
         )
         self.conn.commit()
         return role
+
+    def ensure_initial_owner(self, organisation_id, user_id):
+        """Make this account the organisation's owner when it has none yet.
+
+        The first account a customer organisation gets is the one running it,
+        however it arrived - created by an Administrator, or the first to
+        redeem an invite. Q9 keeps owner singular, so this grants nothing once
+        an owner exists: later accounts are plain members until that owner
+        promotes them. Returns True when a role was granted.
+        """
+        org = self.get_organisation(organisation_id)
+        if org is None or org.get("system_owned") or not user_id:
+            return False
+        if self.get(user_id) is None or self.org_role(user_id) is not None:
+            return False
+        for row in self.org_roles_for(organisation_id):
+            if row["role"] == ORG_ROLE_OWNER:
+                return False
+        self.set_org_role(organisation_id, user_id, ORG_ROLE_OWNER)
+        return True
+
+    def backfill_org_roles(self):
+        """Grant the owner each customer organisation was never given.
+
+        Accounts created before roles were recorded landed in their
+        organisation with no row in org_roles at all, so the owner badge, the
+        role checks and Q9's single-owner rule all read an empty table. The
+        earliest account of each organisation is the one that was running it.
+        System organisations - the shared free tier and the legacy default -
+        are platform-owned and are left alone. Idempotent; returns the number
+        of owners granted.
+        """
+        granted = 0
+        rows = self.conn.execute(
+            "SELECT id FROM organisations WHERE system_owned = 0"
+        ).fetchall()
+        for row in rows:
+            org_id = row["id"]
+            if self.ensure_initial_owner(
+                org_id,
+                self._earliest_member(org_id),
+            ):
+                granted += 1
+        return granted
+
+    def _earliest_member(self, organisation_id):
+        """The account that joined an organisation first, or None."""
+        row = self.conn.execute(
+            "SELECT id FROM users WHERE organisation_id = ? "
+            "ORDER BY created_at, id LIMIT 1",
+            (organisation_id,),
+        ).fetchone()
+        return row["id"] if row else None
 
     def revoke_org_role(self, organisation_id, user_id):
         """Remove an org-level role. Refuses to leave an organisation ownerless.

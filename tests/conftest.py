@@ -32,6 +32,21 @@ _SCRUB = {
     "SMTP_USER",
     "SMTP_PASSWORD",
     "SMTP_FROM",
+    # Billing (D3): without scrubbing, a developer's real Stripe keys could make
+    # tests sign webhooks they never set up, or silently flip into "configured".
+    "STRIPE_SECRET_KEY",
+    "STRIPE_PUBLISHABLE_KEY",
+    "STRIPE_WEBHOOK_SECRET",
+    "STRIPE_PRICE_TEAM_MONTHLY",
+    "STRIPE_PRICE_TEAM_ANNUAL",
+    "STRIPE_PRICE_BUSINESS_MONTHLY",
+    "STRIPE_PRICE_BUSINESS_ANNUAL",
+    "STRIPE_PRICE_ENTERPRISE_ANNUAL",
+    "STRIPE_PRICE_EXTRA_SEAT_TEAM",
+    "STRIPE_PRICE_EXTRA_SEAT_BUSINESS",
+    "STRIPE_PRICE_QUESTION_OVERAGE",
+    "STRIPE_METER_EXTRA_SEATS",
+    "STRIPE_METER_QUESTIONS",
 }
 
 

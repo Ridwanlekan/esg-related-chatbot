@@ -515,3 +515,91 @@ def test_legacy_table_backfill_is_idempotent(tmp_path):
     reopened = UserStore(db_path=str(db), secret="s")
     assert reopened.get("u1")["organisation_id"] == DEFAULT_ORGANISATION_ID
     assert len(reopened.list_organisations()) == 2
+
+# ---- Organisation roles: who owns what ------------------------------------
+#
+# Q9 makes owner singular per organisation, and every owner-only surface reads
+# org_roles. An account that arrives without a row there is a member nothing
+# can administer, which is how the platform's own accounts were being created.
+
+
+def test_ensure_initial_owner_grants_the_first_account(store):
+    store.create_organisation("acme", "Acme Ltd")
+    first = store.create_user("a@bank.com", "password123", "A", "finance",
+                              organisation_id="acme", verified=True)
+    second = store.create_user("b@bank.com", "password123", "B", "finance",
+                               organisation_id="acme", verified=True)
+
+    assert store.ensure_initial_owner("acme", first["id"]) is True
+    assert store.org_role(first["id"]) == "owner"
+    # The second account is a plain member until the owner promotes it.
+    assert store.ensure_initial_owner("acme", second["id"]) is False
+    assert store.org_role(second["id"]) is None
+    # And the rule never grants the same account twice.
+    assert store.ensure_initial_owner("acme", first["id"]) is False
+
+
+def test_an_account_with_a_role_is_left_alone(store):
+    store.create_organisation("acme", "Acme Ltd")
+    user = store.create_user("a@bank.com", "password123", "A", "finance",
+                             organisation_id="acme", verified=True)
+    store.set_org_role("acme", user["id"], "admin")
+    assert store.ensure_initial_owner("acme", user["id"]) is False
+    assert store.org_role(user["id"]) == "admin"
+
+
+def test_an_unknown_account_grants_nothing(store):
+    store.create_organisation("acme", "Acme Ltd")
+    assert store.ensure_initial_owner("acme", None) is False
+    assert store.ensure_initial_owner("acme", "nobody") is False
+
+
+def test_the_free_tier_is_never_given_an_owner(store):
+    free = store.create_user("free@sample.com", "password123", "F", "finance",
+                             organisation_id=SAMPLE_ORGANISATION_ID, verified=True)
+    assert store.ensure_initial_owner(SAMPLE_ORGANISATION_ID, free["id"]) is False
+    assert store.org_role(free["id"]) is None
+
+
+def test_backfill_makes_the_earliest_account_the_owner(store):
+    store.create_organisation("acme", "Acme Ltd")
+    earliest = store.create_user("a@bank.com", "password123", "A", "finance",
+                                 organisation_id="acme", verified=True)
+    store.create_user("b@bank.com", "password123", "B", "finance",
+                      organisation_id="acme", verified=True)
+
+    assert store.backfill_org_roles() == 1
+    assert store.org_role(earliest["id"]) == "owner"
+    assert store.org_role(
+        store.get_by_email("b@bank.com")["id"]
+    ) is None
+    # Idempotent: a second pass finds nothing left to grant.
+    assert store.backfill_org_roles() == 0
+
+
+def test_backfill_never_moves_an_owner_already_chosen(store):
+    store.create_organisation("acme", "Acme Ltd")
+    store.create_user("a@bank.com", "password123", "A", "finance",
+                      organisation_id="acme", verified=True)
+    chosen = store.create_user("b@bank.com", "password123", "B", "finance",
+                               organisation_id="acme", verified=True)
+    store.set_org_role("acme", chosen["id"], "owner")
+
+    assert store.backfill_org_roles() == 0
+    assert store.org_role(chosen["id"]) == "owner"
+
+
+def test_backfill_leaves_the_system_organisations_alone(store):
+    free = store.create_user("free@sample.com", "password123", "F", "finance",
+                             organisation_id=SAMPLE_ORGANISATION_ID, verified=True)
+    legacy = store.create_user("old@default.com", "password123", "O", "finance",
+                               organisation_id=DEFAULT_ORGANISATION_ID, verified=True)
+
+    assert store.backfill_org_roles() == 0
+    assert store.org_role(free["id"]) is None
+    assert store.org_role(legacy["id"]) is None
+
+
+def test_backfill_skips_an_organisation_with_no_accounts(store):
+    store.create_organisation("empty", "Empty Ltd")
+    assert store.backfill_org_roles() == 0

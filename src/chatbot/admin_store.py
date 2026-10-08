@@ -78,7 +78,8 @@ class AdminStore:
             "uses INTEGER NOT NULL DEFAULT 0, "
             "created_at TEXT NOT NULL, "
             "expires_at TEXT NOT NULL, "
-            "actor TEXT)"
+            "actor TEXT, "
+            "organisation_id TEXT)"
         )
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS usage ("
@@ -93,7 +94,8 @@ class AdminStore:
             "category TEXT, "
             "user_id TEXT, "
             "session_id TEXT, "
-            "request_id TEXT)"
+            "request_id TEXT, "
+            "organisation_id TEXT)"
         )
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS settings ("
@@ -176,6 +178,8 @@ class AdminStore:
         )
         self.conn.commit()
         self._migrate_usage_units()
+        self._migrate_usage_organisation()
+        self._migrate_invites_organisation()
 
     # ---- outbox (D18) ------------------------------------------------------
 
@@ -320,6 +324,42 @@ class AdminStore:
         }
         if "units" not in cols:
             self.conn.execute("ALTER TABLE usage ADD COLUMN units REAL")
+            self.conn.commit()
+
+    def _migrate_usage_organisation(self):
+        """Attribute usage rows to an organisation, which is what billing counts.
+
+        Questions are billed to the organisation rather than the person who
+        asked, and the question pool is per organisation per period, so a row
+        without an owner cannot be counted at all. Rows written before this
+        column existed simply read NULL and are excluded from the pool, which
+        under-counts rather than over-counts a customer.
+        """
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(usage)").fetchall()
+        }
+        if "organisation_id" not in cols:
+            self.conn.execute("ALTER TABLE usage ADD COLUMN organisation_id TEXT")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_org_period "
+            "ON usage(organisation_id, kind, at)"
+        )
+        self.conn.commit()
+
+    def _migrate_invites_organisation(self):
+        """Add the organisation an invite belongs to.
+
+        Lazy ALTER, so a database opened by an older build keeps working: its
+        invites simply have no organisation and redeem into the free tier,
+        which is what those tokens always did.
+        """
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(invites)").fetchall()
+        }
+        if "organisation_id" not in cols:
+            self.conn.execute("ALTER TABLE invites ADD COLUMN organisation_id TEXT")
             self.conn.commit()
 
     def list_workspaces(self):
@@ -478,16 +518,20 @@ class AdminStore:
     def _hash_token(token):
         return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
 
-    def create_invite(self, category, label=None, max_uses=1, ttl_hours=168, actor=""):
+    def create_invite(self, category, label=None, max_uses=1, ttl_hours=168,
+                      actor="", organisation_id=None):
         cat = validate_category(category)
         token = secrets.token_urlsafe(24)
         now = datetime.now(timezone.utc)
         expires = now + timedelta(hours=int(ttl_hours))
+        org = (organisation_id or "").strip() or None
         self.conn.execute(
             "INSERT INTO invites (token, category, label, max_uses, uses, "
-            "created_at, expires_at, actor) VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
+            "created_at, expires_at, actor, organisation_id) "
+            "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)",
             (self._hash_token(token), cat, (label or "").strip() or None,
-             int(max(1, max_uses)), now.isoformat(), expires.isoformat(), actor or ""),
+             int(max(1, max_uses)), now.isoformat(), expires.isoformat(),
+             actor or "", org),
         )
         self.conn.commit()
         return {
@@ -498,12 +542,13 @@ class AdminStore:
             "uses": 0,
             "created_at": now.isoformat(),
             "expires_at": expires.isoformat(),
+            "organisation_id": org,
         }
 
     def _invite_row(self, token_hash):
         return self.conn.execute(
-            "SELECT category, label, max_uses, uses, expires_at FROM invites "
-            "WHERE token = ?",
+            "SELECT category, label, max_uses, uses, expires_at, organisation_id "
+            "FROM invites WHERE token = ?",
             (token_hash,),
         ).fetchone()
 
@@ -519,6 +564,7 @@ class AdminStore:
             "category": row["category"],
             "label": row["label"],
             "expires_at": row["expires_at"],
+            "organisation_id": row["organisation_id"],
         }
 
     @staticmethod
@@ -534,7 +580,7 @@ class AdminStore:
         return True, None
 
     def redeem_invite(self, token):
-        """Consume one use of an invite and return its category/label."""
+        """Consume one use of an invite and return its category/org binding."""
         token_hash = self._hash_token(token)
         row = self._invite_row(token_hash)
         if row is None:
@@ -546,12 +592,14 @@ class AdminStore:
             "UPDATE invites SET uses = uses + 1 WHERE token = ?", (token_hash,)
         )
         self.conn.commit()
-        return {"category": row["category"], "label": row["label"]}
+        return {"category": row["category"], "label": row["label"],
+                "organisation_id": row["organisation_id"]}
 
     def list_invites(self):
         now = datetime.now(timezone.utc)
         rows = self.conn.execute(
-            "SELECT category, label, max_uses, uses, created_at, expires_at, actor "
+            "SELECT category, label, max_uses, uses, created_at, expires_at, "
+            "actor, organisation_id "
             "FROM invites ORDER BY created_at DESC"
         ).fetchall()
         invites = []
@@ -582,18 +630,22 @@ class AdminStore:
         user_id=None,
         session_id=None,
         request_id=None,
+        organisation_id=None,
     ):
         """Append one metered usage row. Best-effort, never raises.
 
         `units` is the generic non-token meter: seconds of audio for kind
         "stt", characters for kind "tts". Token-based kinds leave it None.
+        `organisation_id` is what makes the row billable: the question pool
+        belongs to the organisation, not to the person who asked.
         """
         try:
             with self._lock:
                 self.conn.execute(
                     "INSERT INTO usage (at, kind, model, prompt_tokens, "
                     "completion_tokens, duration_s, units, category, user_id, "
-                    "session_id, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "session_id, request_id, organisation_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         _now(),
                         kind,
@@ -606,11 +658,38 @@ class AdminStore:
                         user_id,
                         session_id,
                         request_id,
+                        organisation_id,
                     ),
                 )
                 self.conn.commit()
         except sqlite3.Error:
             pass
+
+    def questions_in_period(self, organisation_id, since=None):
+        """Questions an organisation has asked since `since` (ISO-8601).
+
+        Counted from rows written as kind "question" - one per request that
+        reached the model - rather than from the LLM rows underneath it, which
+        are several per question (a rewrite and an answer both log usage).
+        Voice and search rows are therefore never counted either: speech is
+        bundled (Q18) and a search generates no answer.
+        """
+        if not organisation_id:
+            return 0
+        sql = (
+            "SELECT COUNT(*) FROM usage "
+            "WHERE organisation_id = ? AND kind = 'question'"
+        )
+        params = [organisation_id]
+        if since:
+            sql += " AND at >= ?"
+            params.append(since)
+        try:
+            with self._lock:
+                row = self.conn.execute(sql, params).fetchone()
+            return int(row[0] or 0)
+        except sqlite3.Error:
+            return 0
 
     @staticmethod
     def _nonneg_float(value, default):
@@ -706,6 +785,10 @@ class AdminStore:
 
     def _usage_rows(self, range_days=None, category=None):
         where, params = [], []
+        # Billing's question rows share this table but are not LLM calls:
+        # including them would inflate the call count on the cost page and
+        # count the same request twice, once as tokens and once as a question.
+        where.append("kind <> 'question'")
         if range_days:
             cutoff = (datetime.now(timezone.utc) - timedelta(days=range_days)).isoformat()
             where.append("at >= ?")
@@ -713,7 +796,7 @@ class AdminStore:
         if category:
             where.append("category = ?")
             params.append(category)
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        clause = " WHERE " + " AND ".join(where)
         return self.conn.execute(
             f"SELECT * FROM usage{clause} ORDER BY id", params
         ).fetchall()

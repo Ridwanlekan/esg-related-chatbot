@@ -224,6 +224,24 @@ def test_stream_records_rewrite_and_stream(usage_env):
     assert {d["key"] for d in stats["by_kind"]} == {"rewrite", "stream"}
 
 
+def test_a_streamed_question_counts_against_the_organisation(usage_env):
+    """The pool is metered per organisation, so the streamed path must count.
+
+    /chat attributed the question row; /chat/stream wrote the row without the
+    organisation, which would quietly under-count an overage.
+    """
+    c = usage_env
+    token = _signup(c)
+    h = {"authorization": f"Bearer {token}"}
+    with c.stream("POST", "/chat/stream", json={"question": "targets?"}, headers=h) as res:
+        assert res.status_code == 200
+        "".join(res.iter_text())
+    rows = c.app.state.admin_store.conn.execute(
+        "SELECT organisation_id FROM usage WHERE kind = 'question'"
+    ).fetchall()
+    assert [r["organisation_id"] for r in rows] == ["_sample"]
+
+
 def test_update_cost_rates_and_recompute(usage_env):
     c = usage_env
     token = _signup(c)

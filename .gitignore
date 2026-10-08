@@ -10,8 +10,8 @@ followup_questions.txt
 # Commercial proposals and pricing models: client name, tier prices, margin and
 # cost basis. This is a public repo, so these are never tracked. Kept local
 # and shared by hand.
-doc/*proposal*.md
-doc/*pricing*.md
+doc/*proposal*
+doc/*pricing*
 
 # Python
 __pycache__/

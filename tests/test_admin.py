@@ -480,6 +480,114 @@ class TestInvites:
         )
         assert signup.status_code == 200
 
+    def test_invite_binds_the_account_to_its_organisation(self, admin_env):
+        """A token issued for a customer must land the account in that customer.
+
+        Before this, the signup ignored the invitation entirely and dropped
+        the account in the free-tier pool with whatever workspace the browser
+        happened to send — the invite was consumed and the user was lost.
+        """
+        c, _, _ = admin_env
+        c.post(
+            "/admin/organisations",
+            headers=auth("secret-admin-key"),
+            json={"id": "acme", "name": "Acme"},
+        )
+        token = c.post(
+            "/admin/invites",
+            headers=auth("secret-admin-key"),
+            json={"category": "hr", "organisation_id": "acme"},
+        ).json()["token"]
+        # The invitation advertises where it goes before the form is filled in.
+        assert c.get(f"/invites/{token}").json()["organisation_id"] == "acme"
+
+        res = c.post(
+            "/auth/signup",
+            json={
+                "email": "acme-hr@corp.com",
+                "password": "password123",
+                "name": "Acme HR",
+                # The caller asks for another workspace; the invite decides.
+                "category": "finance",
+                "invite": token,
+            },
+        )
+        assert res.status_code == 200
+        user = res.json()["user"]
+        assert user["organisation_id"] == "acme"
+        assert user["category"] == "hr"
+        assert user["email_verified"] is True  # vouched by whoever issued it
+
+    def test_invite_without_an_organisation_stays_in_the_free_tier(self, admin_env):
+        """Invitations minted before this column existed keep their meaning."""
+        c, _, _ = admin_env
+        token = c.post(
+            "/admin/invites",
+            headers=auth("secret-admin-key"),
+            json={"category": "finance"},
+        ).json()["token"]
+        res = c.post(
+            "/auth/signup",
+            json={
+                "email": "free-invitee@example.com",
+                "password": "password123",
+                "name": "Free",
+                "category": "finance",
+                "invite": token,
+            },
+        )
+        assert res.status_code == 200
+        assert res.json()["user"]["organisation_id"] == "_sample"
+
+    def test_invite_for_an_unknown_organisation_is_refused(self, admin_env):
+        """An unresolvable organisation would mint a token nobody can redeem."""
+        c, _, _ = admin_env
+        res = c.post(
+            "/admin/invites",
+            headers=auth("secret-admin-key"),
+            json={"category": "finance", "organisation_id": "nope"},
+        )
+        assert res.status_code == 404
+        assert "nope" in res.json()["detail"]
+
+    def test_an_invite_table_from_an_older_build_still_works(self, admin_env):
+        c, _, tmp_path = admin_env
+        import datetime as dt
+        import sqlite3
+
+        from chatbot.admin_store import AdminStore
+
+        path = str(tmp_path / "legacy.sqlite3")
+        token = "legacy-token-value"
+        now = dt.datetime.now(dt.timezone.utc)
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE invites (token TEXT PRIMARY KEY, category TEXT NOT NULL, "
+            "label TEXT, max_uses INTEGER NOT NULL, uses INTEGER NOT NULL DEFAULT 0, "
+            "created_at TEXT NOT NULL, expires_at TEXT NOT NULL, actor TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO invites (token, category, max_uses, uses, created_at, "
+            "expires_at, actor) VALUES (?, 'finance', 1, 0, ?, ?, '')",
+            (
+                AdminStore._hash_token(token),
+                now.isoformat(),
+                (now + dt.timedelta(days=1)).isoformat(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        store = AdminStore(path)
+        try:
+            # The lazy ALTER added the column, so an old row reads as no org
+            # rather than blowing up on a missing field.
+            assert store.peek_invite(token)["organisation_id"] is None
+            fresh = store.create_invite("hr", organisation_id="acme")
+            assert store.peek_invite(fresh["token"])["organisation_id"] == "acme"
+        finally:
+            store.close()
+
     def test_max_uses_exceeded_rejected(self, admin_env):
         c, _, _ = admin_env
         created = c.post(
@@ -638,3 +746,68 @@ class TestAdminAuthGate:
             | {"authorization": "Basic " + __import__("base64").b64encode(b"admin:hunter2").decode()},
         ).json()["events"]
         assert any(e["event"] == "user.create" and e["actor"] == "user:admin" for e in events)
+
+class TestOrgRolesForAdminCreatedAccounts:
+    """An account the platform creates is an account that owns, or assists.
+
+    The first seat a customer organisation gets - by hand or by invite - is the
+    one running it, and without an owner the role-gated surfaces read an empty
+    table (Q9). These pin who gets the owner role on the create and invite
+    paths, so the gap cannot return as a one-line omission.
+    """
+
+    key = auth("secret-admin-key")
+
+    def _org_acme(self, c):
+        store = c.app.state.user_store
+        store.create_organisation("acme", "Acme Ltd")
+        return store
+
+    def test_the_first_admin_created_account_becomes_the_owner(self, admin_env):
+        c, _, _ = admin_env
+        self._org_acme(c)
+        res = c.post("/admin/users", headers=self.key, json={
+            "email": "owner@acme.com", "password": "password123",
+            "name": "Owner", "category": "finance", "organisation_id": "acme",
+        })
+        assert res.status_code == 200
+        store = c.app.state.user_store
+        assert store.org_role(res.json()["id"]) == "owner"
+
+    def test_subsequent_accounts_are_plain_members(self, admin_env):
+        c, _, _ = admin_env
+        self._org_acme(c)
+        for email in ("owner@acme.com", "second@acme.com"):
+            res = c.post("/admin/users", headers=self.key, json={
+                "email": email, "password": "password123",
+                "name": "Member", "category": "finance", "organisation_id": "acme",
+            })
+            assert res.status_code == 200
+        store = c.app.state.user_store
+        assert store.org_role(store.get_by_email("owner@acme.com")["id"]) == "owner"
+        assert store.org_role(store.get_by_email("second@acme.com")["id"]) is None
+
+    def test_an_invited_first_seat_becomes_the_owner(self, admin_env):
+        c, _, _ = admin_env
+        self._org_acme(c)
+        invite = c.post("/admin/invites", headers=self.key, json={
+            "category": "hr", "label": "acme", "max_uses": 1,
+            "ttl_hours": 1, "organisation_id": "acme",
+        }).json()
+        res = c.post("/auth/signup", json={
+            "email": "ceo@acme.com", "password": "password123",
+            "name": "CEO", "category": "hr", "invite": invite["token"],
+        })
+        assert res.status_code == 200
+        store = c.app.state.user_store
+        assert store.org_role(res.json()["user"]["id"]) == "owner"
+
+    def test_a_free_tier_signup_is_left_without_a_role(self, admin_env):
+        c, _, _ = admin_env
+        res = c.post("/auth/signup", json={
+            "email": "free@sample.com", "password": "password123",
+            "name": "Free", "category": "finance",
+        })
+        assert res.status_code == 200
+        store = c.app.state.user_store
+        assert store.org_role(res.json()["user"]["id"]) is None
