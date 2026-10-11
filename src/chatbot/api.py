@@ -11,6 +11,7 @@ import sqlite3
 import time
 import urllib.parse
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import uvicorn
@@ -37,7 +38,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from chatbot import shared_docs, smalltalk, telemetry, voice
+from chatbot import (
+    billing,
+    content_library,
+    email_sender,
+    shared_docs,
+    smalltalk,
+    telemetry,
+    voice,
+)
 from chatbot.admin_security import (
     admin_gate_config,
     make_basic_auth_check,
@@ -45,6 +54,7 @@ from chatbot.admin_security import (
     verify_totp,
 )
 from chatbot.admin_store import AdminStore, validate_category
+from chatbot import documents as documents_mod
 from chatbot.documents import DocumentNotFound, resolve_document
 from chatbot.download_links import (
     TOKEN_QUERY_PARAM,
@@ -59,12 +69,25 @@ from chatbot.download_links import (
 from chatbot.ingest import INGEST_PROGRESS
 from chatbot.security import RateLimiter, int_env, make_auth_check, make_rate_limit
 from chatbot.session_store import SessionStore
-from chatbot.users import UserStore, verify_jwt
+from chatbot import users as users_mod
+from chatbot.users import (
+    EMAIL_RE,
+    ORG_ROLE_ADMIN,
+    ORG_ROLE_OWNER,
+    ORG_ROLES,
+    SAMPLE_ORGANISATION_ID,
+    UserStore,
+    max_free_accounts,
+    max_free_questions,
+    verification_required,
+    verify_jwt,
+)
 from chatbot.workspaces import (
     base_workspace_names,
     default_workspace_config,
     index_dir,
     make_workspace_bot,
+    organisation_workspace_config,
     reload_extra_workspaces,
     root_data_dir,
     system_prompt_for,
@@ -80,6 +103,18 @@ DEFAULT_SESSIONS_PATH = os.path.join(INDEX_DIR, "sessions.sqlite3")
 DEFAULT_USERS_PATH = os.path.join(INDEX_DIR, "users.sqlite3")
 UI_FILE = Path(__file__).with_name("static") / "ui.html"
 ADMIN_FILE = Path(__file__).with_name("static") / "admin.html"
+# The organisation console (owner/admin analytics and billing). Separate from
+# the chat UI because it answers a different question - how the organisation is
+# doing - and its Chat link hands the reader back to the chat UI.
+OWNER_FILE = Path(__file__).with_name("static") / "owner.html"
+# Landing page for the email-confirmation link (D18). Separate from the app UI
+# because the person following the link has usually not signed in on this
+# device, so there is no session to show them the app with.
+VERIFY_FILE = Path(__file__).with_name("static") / "verify.html"
+# Landing page for the password-reset link. Same reasoning as the verification
+# page: the person clicking has usually not signed in, so there is no app
+# session to render into.
+RESET_FILE = Path(__file__).with_name("static") / "reset.html"
 DEFAULT_WORKSPACES_DB = os.path.join(INDEX_DIR, "workspaces.sqlite3")
 
 _DEFAULT = object()
@@ -246,6 +281,9 @@ class InviteCreateRequest(BaseModel):
     label: str | None = Field(default=None, max_length=120)
     max_uses: int = Field(default=1, ge=1, le=1000)
     ttl_hours: int = Field(default=168, ge=1, le=8760)
+    # The organisation the redeemed account joins. Absent means the token is
+    # for the free tier, which is what every invite did before this field.
+    organisation_id: str | None = Field(default=None, max_length=64)
 
 
 class LoginRequest(BaseModel):
@@ -258,18 +296,85 @@ class UserResponse(BaseModel):
     email: str
     name: str
     category: str
+    # Absent for tokens minted before organisations existed, so optional to keep
+    # those sessions working rather than failing response validation.
+    organisation_id: str | None = None
+    # Optional for the same reason: tokens predating the membership table carry
+    # no claim, and the server falls back to `category` for those users.
+    workspaces: list[str] = []
     created_at: str
+    # D18: absent on rows predating the column and on tokens minted before it
+    # existed, so it stays optional rather than breaking those sessions.
+    email_verified: bool | None = None
+    account_status: str | None = "active"
 
 
 class AuthResponse(BaseModel):
     token: str
     user: UserResponse
     workspace: dict
+    # Present only when the account still needs to confirm its address. Carries
+    # the link when mail could not actually be sent, so a deployment without an
+    # SMTP relay is not locked out of its own product.
+    verification: dict | None = None
+
+
+class VerificationRequest(BaseModel):
+    token: str = Field(min_length=8, max_length=2048)
+
+
+class ResendVerificationRequest(BaseModel):
+    pass
+
+
+class ForgotPasswordRequest(BaseModel):
+    # The address to send a reset link to. The response is the same whether or
+    # not the account exists, so this form cannot be used to probe for emails.
+    email: str = Field(min_length=3, max_length=320)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=8, max_length=2048)
+    password: str = Field(min_length=8, max_length=256)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
+class AdminPasswordResetRequest(BaseModel):
+    # An owner/admin resetting a member's password. The password is set
+    # directly and must be shared out of band; the member can change it after
+    # signing in. The account's other sessions are signed out.
+    password: str = Field(min_length=8, max_length=256)
+
+
+class WorkspaceSwitchRequest(BaseModel):
+    # The workspace the caller wants to make active. Validated against the
+    # workspaces they may actually reach, never trusted as a category name.
+    category: str = Field(min_length=1, max_length=64)
 
 
 class MeResponse(BaseModel):
     user: UserResponse
     workspace: dict
+    # Every workspace this user may reach, primary first. More than one means
+    # the frontend should offer a switcher; exactly one means it must not.
+    workspaces: list[dict] = []
+    # D18. Non-null only while the address is unconfirmed, and the frontend
+    # should then block the composer and offer a resend rather than letting the
+    # user discover the block by asking a question.
+    verification: dict | None = None
+    # The caller's organisation (plan and billing_status fill in once the
+    # owner subscribes). Stripe ids are deliberately not included: this is a
+    # user-facing payload, not an admin one.
+    organisation: dict | None = None
+    # Free-tier runway, non-null only for an account in the shared sample
+    # workspace: cap, used, remaining and whether the cap has been reached. The
+    # frontend uses it to show the remaining count and, at zero, why asking is
+    # blocked and how to upgrade.
+    free_tier: dict | None = None
 
 
 class WorkspaceCreateRequest(BaseModel):
@@ -290,6 +395,10 @@ class AdminUserCreateRequest(BaseModel):
     password: str = Field(min_length=8, max_length=256)
     name: str = Field(min_length=1, max_length=120)
     category: str = Field(min_length=1, max_length=40)
+    # Omitted means the free self-service path: the account lands in the shared
+    # sample organisation on the launch pack (Q22, Section 3.5). A paying
+    # account is created by an Administrator directly into its organisation.
+    organisation_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class AdminUserUpdateRequest(BaseModel):
@@ -301,6 +410,90 @@ class AdminUserUpdateRequest(BaseModel):
 class DocumentDeleteRequest(BaseModel):
     category: str
     filename: str
+    organisation_id: str | None = None
+
+
+class OrganisationCreateRequest(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    name: str | None = Field(default=None, max_length=160)
+
+
+class OrganisationDeleteRequest(BaseModel):
+    organisation_id: str = Field(min_length=1, max_length=64)
+    # Must echo the organisation id. See admin_delete_organisation.
+    confirm: str = Field(min_length=1, max_length=64)
+
+
+class ContentAssignRequest(BaseModel):
+    organisation_id: str = Field(min_length=1, max_length=64)
+    categories: list[str] = Field(default_factory=list)
+    filenames: list[str] = Field(min_length=1)
+
+
+class ContentUnassignRequest(BaseModel):
+    organisation_id: str = Field(min_length=1, max_length=64)
+    categories: list[str] = Field(default_factory=list)
+    filenames: list[str] = Field(min_length=1)
+
+
+class OrgRoleRequest(BaseModel):
+    organisation_id: str = Field(min_length=1, max_length=64)
+    user_id: str = Field(min_length=1, max_length=64)
+    role: str = Field(min_length=1, max_length=20)
+
+
+class OwnershipTransferRequest(BaseModel):
+    organisation_id: str = Field(min_length=1, max_length=64)
+    from_user_id: str = Field(min_length=1, max_length=64)
+    to_user_id: str = Field(min_length=1, max_length=64)
+
+
+# Self-service models. None of these carry an organisation id: the caller's own
+# account decides which organisation they are acting on, so there is no field to
+# point at somebody else's.
+
+class OrgMemberCreateRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=200)
+    name: str = Field(default="", max_length=160)
+    category: str = Field(default="finance", max_length=64)
+    workspaces: list[str] = Field(default_factory=list)
+
+
+class OrgSelfRoleRequest(BaseModel):
+    role: str = Field(default="", max_length=20)
+    account_status: str | None = Field(default=None, max_length=20)
+
+
+class OrgSelfInviteRequest(BaseModel):
+    # No organisation_id: an owner/admin may only mint seats for their own
+    # organisation, so the target is taken from the caller's account.
+    category: str = Field(min_length=2, max_length=40)
+    label: str | None = Field(default=None, max_length=120)
+    max_uses: int = Field(default=1, ge=1, le=100)
+    ttl_hours: int = Field(default=168, ge=1, le=2160)
+
+
+class OrgSelfWorkspacesRequest(BaseModel):
+    categories: list[str] = Field(default_factory=list)
+    revoke: list[str] = Field(default_factory=list)
+    category: str | None = Field(default=None, max_length=64)
+
+
+class OrgSelfTransferRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=64)
+
+
+class OrgMembershipRequest(BaseModel):
+    organisation_id: str = Field(min_length=1, max_length=64)
+    user_id: str = Field(min_length=1, max_length=64)
+    category: str = Field(min_length=1, max_length=40)
+
+
+class OrgMoveRequest(BaseModel):
+    organisation_id: str = Field(min_length=1, max_length=64)
+    user_id: str = Field(min_length=1, max_length=64)
+    workspaces: list[str] = Field(min_length=1)
 
 
 class SharedLinkRequest(BaseModel):
@@ -374,7 +567,34 @@ def create_app(
 
     if user_store is _DEFAULT:
         user_store = UserStore(DEFAULT_USERS_PATH, secret=auth_secret)
+        # Accounts written before organisation roles were recorded landed with
+        # no row in org_roles at all, so nothing named the owner of a customer
+        # organisation and the owner-only surfaces looked at an empty table.
+        # Repaired at startup rather than by a one-off script so every
+        # deployment gets it on its next start. Idempotent, and it only fills
+        # gaps: a role an Administrator granted by hand is never overwritten.
+        try:
+            granted = user_store.backfill_org_roles()
+            if granted:
+                logger.info("Granted %d initial organisation owner role(s).",
+                            granted)
+        except (sqlite3.Error, ValueError):
+            logger.exception("Organisation role backfill failed.")
     auth_enabled = user_store is not None
+
+    if user_store is not None and user_store.get_organisation(SAMPLE_ORGANISATION_ID):
+        # Q2: the free tier must work the moment someone signs up, with no
+        # administrator action. Idempotent, so this is safe on every start and
+        # never overwrites an Administrator's later edits to the sample pack.
+        try:
+            seeded = content_library.seed_sample_pack(
+                SAMPLE_ORGANISATION_ID, categories=workspace_names()
+            )
+            if seeded:
+                logger.info("Sample pack seeded for %s: %d document(s).",
+                            SAMPLE_ORGANISATION_ID, len(seeded))
+        except (OSError, ValueError):
+            logger.exception("Sample pack seeding failed; free tier may be empty.")
 
     # Signs and verifies citation download links. With auth on this is AUTH_SECRET,
     # so rotating it revokes every outstanding link. With auth off there is no
@@ -392,6 +612,10 @@ def create_app(
         default_workspace_config() if bot is None and not workspaces else {}
     )
     app.state.category_bots = {}
+    # Per-organisation bots, keyed by (organisation_id, workspace). Empty unless
+    # auth is on; the cache exists so a workspace's live vector-store handle
+    # survives between requests instead of being rebuilt each time.
+    app.state.org_bots = {}
     if config_cors:
         app.add_middleware(
             CORSMiddleware,
@@ -562,12 +786,20 @@ def create_app(
             "totp": cfg["totp"],
         }
 
-    def record_usage_events(request, usage_events, *, category, user_id, session_id):
+    def record_usage_events(
+        request, usage_events, *, category, user_id, session_id, organisation_id=None
+    ):
         """Persist per-request LLM usage rows (best-effort, never raises).
 
         Shared chatbot instances make request-scoped attribution impossible on
         the bot, so the api layer owns the attribution context. `usage_events`
         are collected by passing a usage_sink list through the bot's call path.
+
+        The same call is where a question becomes billable: one row of kind
+        "question" for the request as a whole (a request that rewrote and then
+        answered logs two LLM rows but is one question), attributed to the
+        organisation whose pool it counts against, and then reported to Stripe
+        the moment it crosses that pool.
         """
         store = app.state.admin_store
         if store is None or not usage_events:
@@ -585,9 +817,48 @@ def create_app(
                     user_id=user_id,
                     session_id=session_id,
                     request_id=rid,
+                    organisation_id=organisation_id,
                 )
+            store.record_usage(
+                kind="question",
+                category=category,
+                user_id=user_id,
+                session_id=session_id,
+                request_id=rid,
+                organisation_id=organisation_id,
+            )
         except Exception:
             logger.exception("usage log write failed")
+        if not organisation_id:
+            return
+        try:
+            billing.report_question_usage(
+                app.state.user_store, store, organisation_id
+            )
+        except Exception:
+            # Metering is a side effect of an answer that has already been
+            # given; a Stripe outage must not turn into a failed chat.
+            logger.warning("question usage not reported", exc_info=True)
+
+    def refresh_seat_usage(organisation_id):
+        """Re-report extra seats after seats changed (best-effort, never raises).
+
+        Called from every path that adds or removes a seat, because the meter
+        only learns about a seat when someone tells it: the period-opening
+        snapshot is the backstop that catches anything missed here, at the cost
+        of at most one period of drift.
+        """
+        if not organisation_id:
+            return
+        try:
+            store = app.state.user_store
+            org = store.get_organisation(organisation_id) if store else None
+            if org:
+                billing.sync_extra_seats(
+                    store, org, hint=telemetry.get_request_id()
+                )
+        except Exception:
+            logger.warning("seat usage not reported", exc_info=True)
 
     @app.middleware("http")
     async def observability(request: Request, call_next):
@@ -642,11 +913,35 @@ def create_app(
             # every authenticated endpoint until it expired.
             if is_download_token(payload):
                 raise HTTPException(status_code=401, detail="Missing or invalid token")
+            # A token proves who signed in, not that the account still exists.
+            # Without this lookup a deleted account keeps every permission it
+            # had until the token expires, and /me crashes on the missing row.
+            row = user_store.get(payload["sub"])
+            if not row:
+                raise HTTPException(status_code=401, detail="Missing or invalid token")
+            if (row.get("account_status") or "active") == "suspended":
+                raise HTTPException(status_code=401, detail="Account suspended. Please contact an administrator.")
+            # A password change moves the account's session generation. A token
+            # minted before that carries an older number and is refused here,
+            # which is what makes "change password" sign the other devices out.
+            # Tokens with no claim read as 0, the value of an untouched account.
+            if int(payload.get("v", 0)) != user_store.token_version(row["id"]):
+                raise HTTPException(
+                    status_code=401,
+                    detail="Your session has ended. Please sign in again.",
+                )
             return {
-                "id": payload["sub"],
-                "email": payload.get("email", ""),
-                "name": payload.get("name", ""),
-                "category": payload.get("category", ""),
+                "id": row["id"],
+                "email": row["email"],
+                "name": row["name"],
+                "category": row["category"],
+                "organisation_id": row["organisation_id"],
+                # Membership is read live for the same reason: a grant or a
+                # move should take effect without waiting for a new token.
+                "workspaces": reachable_categories(row),
+                "created_at": row["created_at"],
+                "email_verified_at": row.get("email_verified_at"),
+                "account_status": (row.get("account_status") or "active"),
             }
 
     else:
@@ -717,7 +1012,37 @@ def create_app(
 
     admin_store_dep = Depends(get_admin_store)
 
-    def get_bot(request: Request, category: str):
+    def get_org_bot(request: Request, organisation_id: str, category: str):
+        """A workspace bot bound to one organisation's own data dir and index.
+
+        Per-organisation scoping (Section 3.4) is only real if the index is
+        per-organisation too: two organisations both holding a "finance"
+        workspace would otherwise share one vector store, and one could retrieve
+        the other's material. Resolved through organisation_workspace_config so
+        the bot's data_dir is that organisation's served copy.
+
+        Explicitly injected registries (an app handed ``bot=`` or ``workspaces=``)
+        keep winning, the same precedence get_bot() has always used: a caller that
+        supplies its own bots is supplying them for every organisation.
+        """
+        app_ = request.app
+        if app_.state.bot is not None or app_.state.workspace_registry:
+            return get_bot(request, category)
+        if category not in workspace_names():
+            raise HTTPException(status_code=403, detail=f"Unknown workspace: {category}")
+        key = (organisation_id, category)
+        cached = app_.state.org_bots.get(key)
+        if cached is None:
+            cached = make_workspace_bot(
+                category,
+                organisation_workspace_config(organisation_id, category),
+            )
+            app_.state.org_bots[key] = cached
+        return cached
+
+    def get_bot(request: Request, category: str, organisation_id: str | None = None):
+        if organisation_id:
+            return get_org_bot(request, organisation_id, category)
         app_ = request.app
         if category and category in app_.state.workspace_registry:
             return app_.state.workspace_registry[category]
@@ -752,6 +1077,9 @@ def create_app(
         app_.state.category_bots = {
             cat: b for cat, b in app_.state.category_bots.items() if cat in conf
         }
+        app_.state.org_bots = {
+            key: b for key, b in app_.state.org_bots.items() if key[1] in conf
+        }
         app_.state.workspace_config = conf
 
     def resolve_session(request: Request, session_id, user_id, store):
@@ -764,12 +1092,278 @@ def create_app(
         store.create(session_id, user_id=user_id)
         return session_id
 
-    def workspace_summary(category):
+    def workspace_summary(category, is_primary=True):
         return {
             "category": category,
+            # Lets the switcher mark the active option without comparing against
+            # a separate field on the response.
+            "is_primary": is_primary,
             "categories": workspace_names(),
             **workspace_meta(category),
         }
+
+    def workspaces_for(user):
+        """Summaries of every workspace a user may reach, primary first.
+
+        A user's primary workspace is `users.category`, which the JWT also
+        carries. Tokens minted before the membership table have no `workspaces`
+        claim, so they fall back to the single category they always had rather
+        than rendering an empty switcher.
+        """
+        categories = user.get("workspaces") or [user.get("category")]
+        primary = user.get("category")
+        seen, ordered = set(), []
+        for cat in categories:
+            if cat and cat not in seen:
+                seen.add(cat)
+                ordered.append(workspace_summary(cat, is_primary=cat == primary))
+        return ordered
+
+    def user_workspaces(user):
+        """Same list, restricted to workspaces the user can actually reach.
+
+        For a live row this intersects the membership table with the configured
+        workspace registry, so a membership pointing at a deleted or misnamed
+        workspace cannot surface a dead switcher option.
+        """
+        summaries = workspaces_for(user)
+        known = set(workspace_names())
+        allowed = [
+            s for s in summaries
+            if s["category"] == user.get("category") or s["category"] in known
+        ]
+        return allowed or [workspace_summary(user.get("category"))]
+
+    def _cooldown_elapsed(sent_at_iso):
+        """Whether the resend cooldown has passed, treating bad input as elapsed."""
+        try:
+            sent = datetime.fromisoformat(sent_at_iso)
+        except (TypeError, ValueError):
+            return True
+        if sent.tzinfo is None:
+            sent = sent.replace(tzinfo=timezone.utc)
+        return (
+            datetime.now(timezone.utc) - sent
+        ).total_seconds() >= users_mod.VERIFICATION_RESEND_COOLDOWN_SECONDS
+
+    def require_verified(user):
+        """Block an unconfirmed account from spending model time.
+
+        D18 asks whether a user must confirm an address before the sample
+        workspace opens. The answer here is yes, applied only to the free
+        self-service path: a paid or invited account was vouched for by someone
+        who set it up, and a customer must never be locked out of a product
+        they have already bought.
+
+        Placed at the endpoints that actually serve content rather than in
+        `require_user`, so an unverified user can still reach `/me` and the
+        resend endpoint, which is what lets them recover.
+        """
+        if user_store is None or not verification_required():
+            return
+        if user.get("organisation_id") != SAMPLE_ORGANISATION_ID:
+            return
+        if user_store.is_verified(user["id"]):
+            return
+        raise HTTPException(
+            status_code=403,
+            detail="Confirm your email address to start asking questions.",
+        )
+
+    # The billing states that stop service. `canceled` is not "the owner
+    # clicked cancel": Stripe keeps sending ordinary events until the period
+    # boundary, and only sends customer.subscription.deleted once the paid
+    # period is actually over, so it lands here meaning service has ended.
+    # `unpaid` is Stripe's give-up state after every retry failed.
+    # `past_due` is deliberately absent — the proposal keeps a late payer
+    # working behind a clear notice, because locking out someone whose card
+    # failed makes the next attempt to collect from them less likely to work.
+    _BILLING_BLOCKED = frozenset({"canceled", "unpaid"})
+
+    def require_active_billing(user):
+        """Refuse content-serving endpoints to a stopped subscription.
+
+        Applied at exactly the endpoints `require_verified` guards — every
+        one that spends model time or hands back a document — and nowhere
+        else. `/me`, the verification resend and the billing endpoints stay
+        open, because an owner has to be able to see what happened and reach
+        a plan or a card from inside the locked-out state; the UI's own door
+        message depends on `/me` succeeding.
+
+        An organisation that has never subscribed has no status and is not
+        governed: billing gates the plans, not the product, for someone the
+        platform admin has not yet put on one. System organisations are
+        exempt for the same reason the webhook never touches them.
+        """
+        org_id = user.get("organisation_id")
+        if not org_id or user_store is None:
+            return
+        org = user_store.get_organisation(org_id)
+        if org is None or org.get("system_owned"):
+            return
+        status = org.get("billing_status")
+        if status not in _BILLING_BLOCKED:
+            return
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "This organisation's subscription has ended. Ask its owner to "
+                "choose a plan again to restore access."
+                if status == "canceled"
+                else "This organisation's payments have failed and its "
+                     "workspace is stopped. Ask its owner to update the "
+                     "payment method to restore access."
+            ),
+        )
+
+    def free_tier_status(user):
+        """How much of the free allowance an account has left, or None.
+
+        Only an account in the shared sample organisation is on the free tier;
+        a seat in a customer organisation is governed by that organisation's
+        plan instead. `cap` of 0 means the ceiling is switched off.
+        """
+        if user_store is None or user.get("organisation_id") != SAMPLE_ORGANISATION_ID:
+            return None
+        cap = max_free_questions()
+        store = app.state.admin_store
+        used = store.questions_for_user(user["id"]) if store is not None else 0
+        remaining = max(0, cap - used) if cap else None
+        return {
+            "cap": cap,
+            "used": used,
+            "remaining": remaining,
+            "limited": bool(cap),
+            "reached": bool(cap) and used >= cap,
+        }
+
+    def require_free_tier_quota(user):
+        """Refuse a free-tier account that has used up its question allowance.
+
+        Checked only once a question is known to need the model - small talk
+        never reaches the model and does not count - and answered with 402 so
+        the frontend renders it as an upgrade prompt rather than a generic
+        error. A paid seat is never subject to this: only the ownerless sample
+        organisation is.
+        """
+        status = free_tier_status(user)
+        if not status or not status["reached"]:
+            return
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "You've used all {} questions on the free plan. Upgrade to a "
+                "paid workspace to keep asking — open the Billing page to "
+                "choose a plan.".format(status["cap"])
+            ),
+        )
+
+    def public_base_url(request: Request):
+        """The origin a verification link should point at.
+
+        Prefers an explicit setting so a link is correct behind a proxy or a
+        public hostname the app cannot infer from its own request.
+        """
+        configured = app.state.admin_store.get_setting("public_base_url") if (
+            app.state.admin_store is not None
+        ) else None
+        if configured:
+            return configured
+        return str(request.base_url).rstrip("/")
+
+    def public_base_url_from_settings(admin_store):
+        """Fallback origin for calls with no request in hand."""
+        configured = (
+            admin_store.get_setting("public_base_url") if admin_store else None
+        )
+        return configured or "http://localhost:8000"
+
+    def _issue_and_send_verification(user, request=None):
+        """Mint a verification token and get the message away.
+
+        A send failure is swallowed deliberately. The account exists and the
+        user can resend, so failing the whole signup over a mail outage would
+        turn a transient problem into a lost account. The token is minted
+        first and the plaintext is only returned when sending fell back to the
+        outbox, where an operator can act on it.
+        """
+        token = user_store.issue_verification_token(user["id"])
+        sender = email_sender.build_sender(app.state.admin_store)
+        base_url = public_base_url(request) if request is not None else None
+        result = {"sent": False, "verified": bool(user.get("email_verified_at"))}
+        if base_url is None:
+            # No request in hand (internal call path): still record the mail so
+            # the link is recoverable, using the stored host if there is one.
+            base_url = public_base_url_from_settings(app.state.admin_store)
+        try:
+            delivered = email_sender.send_verification_email(
+                sender, user["email"], base_url, token
+            )
+            # "Sent" means the message is retrievable: transmitted by a relay,
+            # or written to the outbox. Both count, because both let the user
+            # confirm.
+            result["sent"] = bool(delivered)
+        except Exception as exc:  # pragma: no cover - exercised via sender failure
+            logger.warning(
+                "verification mail failed for %s: %s; falling back to outbox",
+                user.get("id"), exc,
+            )
+            if app.state.admin_store is not None:
+                app.state.admin_store.record_email(
+                    user["email"],
+                    email_sender.verification_subject(base_url),
+                    email_sender.verification_body(base_url, token),
+                    html_body=email_sender.verification_html(base_url, token),
+                )
+            result["sent"] = False
+            if base_url:
+                # The message now exists in the outbox, so the link is still
+                # recoverable and can be handed over directly.
+                result["link"] = f"{base_url.rstrip('/')}/verify-email?token={token}"
+        if sender.name() == "outbox" and base_url and "link" not in result:
+            # Surface the link so a no-SMTP deployment can onboard the user
+            # without reading the database.
+            result["link"] = f"{base_url.rstrip('/')}/verify-email?token={token}"
+        return result
+
+    def _issue_and_send_password_reset(user, request=None):
+        """Mint a reset token and get the message away.
+
+        Mirrors `_issue_and_send_verification`: the plaintext token is returned
+        only so an outbox deployment can hand the link over directly. A send
+        failure is swallowed because the account still exists and a fresh link
+        can be requested; failing here would turn a mail outage into a locked
+        account.
+        """
+        token = user_store.issue_password_reset_token(user["id"])
+        sender = email_sender.build_sender(app.state.admin_store)
+        base_url = public_base_url(request) if request is not None else None
+        if base_url is None:
+            base_url = public_base_url_from_settings(app.state.admin_store)
+        result = {"sent": False}
+        try:
+            delivered = email_sender.send_password_reset_email(
+                sender, user["email"], base_url, token
+            )
+            result["sent"] = bool(delivered)
+        except Exception as exc:  # pragma: no cover - exercised via sender failure
+            logger.warning(
+                "password reset mail failed for %s: %s; falling back to outbox",
+                user.get("id"), exc,
+            )
+            if app.state.admin_store is not None:
+                app.state.admin_store.record_email(
+                    user["email"],
+                    email_sender.password_reset_subject(base_url),
+                    email_sender.password_reset_body(base_url, token),
+                    html_body=email_sender.password_reset_html(base_url, token),
+                )
+            result["sent"] = False
+        if sender.name() == "outbox" and base_url:
+            # Surface the link so a no-SMTP deployment can still exercise the
+            # flow; a real relay never returns it.
+            result["link"] = f"{base_url.rstrip('/')}/reset-password?token={token}"
+        return result
 
     @app.get("/metrics")
     def metrics(store=store_dep):
@@ -832,13 +1426,41 @@ def create_app(
             for meta in [workspace_meta(cat)]
         ]
 
+    # The UI pages carry no ETag or Last-Modified, so a browser falls back to
+# heuristically keeping the copy it fetched earlier. After an edit or a deploy
+# that means a reload can still show stale HTML; no-store removes that trap.
+    def _ui_html(content):
+        return HTMLResponse(content, headers={"cache-control": "no-store"})
+
     @app.get("/ui", response_class=HTMLResponse)
     def ui():
-        return UI_FILE.read_text() if UI_FILE.exists() else "<h1>UI not found</h1>"
+        return _ui_html(UI_FILE.read_text() if UI_FILE.exists() else "<h1>UI not found</h1>")
+
+    @app.get("/verify-email", response_class=HTMLResponse)
+    def verify_email_page():
+        return _ui_html(
+            VERIFY_FILE.read_text() if VERIFY_FILE.exists()
+            else "<h1>Verification page not found</h1>"
+        )
+
+    @app.get("/reset-password", response_class=HTMLResponse)
+    def reset_password_page():
+        return _ui_html(
+            RESET_FILE.read_text() if RESET_FILE.exists()
+            else "<h1>Password reset page not found</h1>"
+        )
 
     @app.get("/admin", response_class=HTMLResponse)
     def admin():
-        return ADMIN_FILE.read_text() if ADMIN_FILE.exists() else "<h1>Admin UI not found</h1>"
+        return _ui_html(
+            ADMIN_FILE.read_text() if ADMIN_FILE.exists() else "<h1>Admin UI not found</h1>"
+        )
+
+    @app.get("/owner", response_class=HTMLResponse)
+    def owner():
+        return _ui_html(
+            OWNER_FILE.read_text() if OWNER_FILE.exists() else "<h1>Owner UI not found</h1>"
+        )
 
     @app.get("/admin/config")
     def admin_public_config():
@@ -846,9 +1468,16 @@ def create_app(
         return app.state.admin_gate
 
     @app.get("/admin/status", dependencies=admin_gate_deps)
-    def admin_status(request: Request):
-        registry = app.state.workspace_registry
-        config_based = bool(app.state.workspace_config)
+    def admin_status(request: Request, organisation_id: str | None = None):
+        """Workspace and index status, optionally for one organisation.
+
+        Scoped, the counts are that organisation's own served copies and its own
+        index. Reporting the global tree here would tell a platform operator
+        that a customer with nothing assigned has four indexed workspaces.
+        """
+        organisation_id = _org_scope(organisation_id)
+        registry = app.state.workspace_registry if not organisation_id else None
+        config_based = bool(app.state.workspace_config) and not organisation_id
         cats = (
             list(registry)
             if registry
@@ -858,16 +1487,17 @@ def create_app(
         total_chunks = 0
         for cat in cats:
             meta = workspace_meta(cat)
-            if config_based:
-                db = Path(index_dir()) / f"vectors_{cat}.sqlite3"
+            if organisation_id or config_based:
+                db = _scope_index_path(cat, organisation_id)
                 chunks = sources = 0
                 if db.exists():
                     try:
                         conn = sqlite3.connect(db)
                         chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
                         sources = conn.execute(
-                            "SELECT COUNT(DISTINCT source) FROM chunks"
-                        ).fetchone()[0]
+                            "SELECT DISTINCT source FROM chunks"
+                        ).fetchall()
+                        sources = len(sources)
                         conn.close()
                     except sqlite3.Error:
                         pass
@@ -879,7 +1509,7 @@ def create_app(
                     chunks = 0
                 sources = 0
             total_chunks += chunks or 0
-            data = Path(root_data_dir()) / cat
+            data = _scope_data_dir(cat, organisation_id)
             files = sorted(p.name for p in data.iterdir()) if data.is_dir() else []
             statuses.append(
                 {
@@ -897,10 +1527,26 @@ def create_app(
         totals = {
             "workspaces": len(cats),
             "chunks": total_chunks,
-            "users": user_store.count_users() if user_store is not None else 0,
+            "users": (
+                user_store.count_users_in_organisation(organisation_id)
+                if organisation_id and user_store is not None
+                else (user_store.count_users() if user_store is not None else 0)
+            ),
             "sessions": app.state.session_store.count(),
         }
-        return {"totals": totals, "workspaces": statuses, "progress": INGEST_PROGRESS.snapshot()}
+        payload = {
+            "totals": totals,
+            "workspaces": statuses,
+            "progress": INGEST_PROGRESS.snapshot(),
+        }
+        if organisation_id:
+            payload["organisation_id"] = organisation_id
+        elif user_store is not None:
+            # Lets the console tell an organisation-scoped deployment from a
+            # legacy single-tenant one and describe the right place to manage
+            # content, without changing any of the reads above.
+            payload["organisations"] = len(user_store.list_organisations())
+        return payload
 
     @app.get("/admin/workspaces", dependencies=admin_gate_deps)
     def admin_workspaces(get_store: AdminStore = admin_store_dep):
@@ -1038,8 +1684,48 @@ def create_app(
         )
         return {"deleted": category, "purged": removed}
 
-    def _vector_stats(cat):
-        db = Path(index_dir()) / f"vectors_{cat}.sqlite3"
+    def _org_scope(organisation_id):
+        """Resolve an organisation scope, or None when none was asked for.
+
+        An absent organisation means the legacy global workspace tree, which is
+        what every pre-organisation deployment and every existing console
+        request means. When one is given, every read and write below is confined
+        to that organisation's served copies and its own index, so the console
+        cannot show one customer's documents under another's name.
+        """
+        if not organisation_id:
+            return None
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        org = user_store.get_organisation(organisation_id)
+        if org is None:
+            raise HTTPException(status_code=404, detail="Organisation not found")
+        try:
+            content_library.organisation_dir(organisation_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Invalid organisation.")
+        return organisation_id
+
+    def _scope_data_dir(cat, organisation_id):
+        """Where a workspace's documents live for this scope."""
+        if organisation_id:
+            try:
+                return content_library.workspace_dir(organisation_id, cat)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid workspace.")
+        return Path(root_data_dir()) / cat
+
+    def _scope_index_path(cat, organisation_id):
+        """The index a workspace is read from for this scope."""
+        if organisation_id:
+            try:
+                return content_library.index_dir_for(organisation_id, cat)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid workspace.")
+        return Path(index_dir()) / f"vectors_{cat}.sqlite3"
+
+    def _vector_stats(cat, organisation_id=None):
+        db = _scope_index_path(cat, organisation_id)
         if not db.exists():
             return set(), 0
         try:
@@ -1054,25 +1740,78 @@ def create_app(
         except sqlite3.Error:
             return set(), 0
 
-    def _indexed_sources(cat):
-        return _vector_stats(cat)[0]
+    def org_workspace_categories(organisation_id):
+        """Every workspace that belongs to an organisation.
+
+        The union of the workspaces its members hold seats in and the workspaces
+        it has content indexed under. Owners and admins reach all of these, so a
+        manager is never locked out of a workspace they can administer. The
+        content half cannot be read from the user store, which is why this lives
+        where the index paths are known.
+        """
+        cats = set(user_store.organisation_workspace_categories(organisation_id))
+        for cat in workspace_names():
+            if cat in cats:
+                continue
+            try:
+                data_dir = _scope_data_dir(cat, organisation_id)
+                index_path = _scope_index_path(cat, organisation_id)
+            except HTTPException:
+                continue
+            if data_dir.is_dir() or index_path.exists():
+                cats.add(cat)
+        return sorted(cats)
+
+    def reachable_categories(user):
+        """Workspaces a user may reach, organisation managers included.
+
+        A member reaches exactly their own memberships. An organisation owner or
+        admin additionally reaches every workspace in their organisation, so
+        they can enter what they administer. Read live on every authenticated
+        request, so granting or revoking takes effect without a new token.
+        """
+        if user_store is None:
+            return list(user.get("workspaces") or [user.get("category")])
+        extra = None
+        if user_store.org_role(user["id"]) in (ORG_ROLE_OWNER, ORG_ROLE_ADMIN):
+            extra = org_workspace_categories(user["organisation_id"])
+        return user_store.reachable_workspaces(user["id"], extra)
+
+    def _indexed_sources(cat, organisation_id=None):
+        return _vector_stats(cat, organisation_id)[0]
 
     @app.get("/admin/documents", dependencies=admin_gate_deps)
-    def admin_documents(limit: int = 100, offset: int = 0, category: str | None = None):
+    def admin_documents(
+        limit: int = 100,
+        offset: int = 0,
+        category: str | None = None,
+        organisation_id: str | None = None,
+    ):
+        """Documents, optionally scoped to one organisation.
+
+        Scoped is the honest default for a multi-tenant console: without it this
+        endpoint describes the global tree, which for a deployment that has moved
+        to organisations is nobody's content at all. Left in place unscoped for
+        pre-organisation deployments, where the global tree is real.
+        """
         limit = max(1, min(limit, 500))
         offset = max(0, offset)
-        registry = app.state.workspace_registry
+        organisation_id = _org_scope(organisation_id)
+        registry = app.state.workspace_registry if not organisation_id else None
+        known = list(registry) if registry else workspace_names()
         if category is not None:
-            if category not in (list(registry) if registry else workspace_names()):
+            if category not in known:
                 raise HTTPException(status_code=404, detail="Unknown workspace")
             cats = [category]
         else:
-            cats = list(registry) if registry else workspace_names()
+            cats = known
         groups = []
-        shared_map = _shared_targets_by_path(app.state.admin_store)
+        shared_map = (
+            _shared_targets_by_path(app.state.admin_store) if not organisation_id else {}
+        )
         for cat in cats:
-            indexed = _indexed_sources(cat)
-            folder = Path(root_data_dir()) / cat
+            indexed = _indexed_sources(cat, organisation_id)
+            folder = _scope_data_dir(cat, organisation_id)
             all_files = []
             if folder.is_dir():
                 for p in sorted(folder.iterdir()):
@@ -1099,7 +1838,10 @@ def create_app(
                     "has_more": offset + len(page) < len(all_files),
                 }
             )
-        return {"documents": groups, "limit": limit, "offset": offset}
+        payload = {"documents": groups, "limit": limit, "offset": offset}
+        if organisation_id:
+            payload["organisation_id"] = organisation_id
+        return payload
 
     def _shared_conflict(store, category, name):
         """Explain why writing `name` into `category` would damage a shared doc.
@@ -1125,6 +1867,78 @@ def create_app(
             f"uploading over it would rewrite the shared copy."
         )
 
+    async def _upload_into_organisation(
+        request, organisation_id, category, files
+    ):
+        """Library upload followed by assignment, for one workspace.
+
+        Split out of the unscoped upload so an organisation write and a global
+        write cannot drift apart: the organisation path gets the atomic library
+        write, the assignment record and the organisation's own reindex, and
+        falls out of the same rules about what is refused.
+        """
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        _org_or_404(organisation_id)
+        if content_library.is_sample(organisation_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The system sample organisation is the shared free tier; paid "
+                    "content cannot be uploaded into it."
+                ),
+            )
+        started = time.time()
+        root = content_library.library_root()
+        root.mkdir(parents=True, exist_ok=True)
+        stored, assigned, skipped = [], [], []
+        for f in files:
+            name = shared_docs.safe_name(f.filename)
+            if not name:
+                continue
+            payload = await f.read()
+            target = root / name
+            tmp = target.with_name(target.name + ".partial")
+            try:
+                tmp.write_bytes(payload)
+                tmp.replace(target)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
+            store.add_library_doc(
+                name, size=len(payload), actor=actor_label(request)
+            )
+            stored.append(name)
+            try:
+                dest = content_library.materialise(
+                    organisation_id, category, target, filename=name
+                )
+            except ValueError as exc:
+                skipped.append({"filename": name, "reason": str(exc)})
+                continue
+            store.add_content_assignment(
+                organisation_id, category, name, actor=actor_label(request)
+            )
+            assigned.append({"category": category, "filename": name, "path": str(dest)})
+        if not stored:
+            raise HTTPException(status_code=422, detail="No files were uploaded")
+        stats = await _reindex(request, [category], organisation_id)
+        log_audit(
+            request, "content.assign", "organisation", organisation_id,
+            ",".join(sorted({a["filename"] for a in assigned})),
+        )
+        return {
+            "organisation_id": organisation_id,
+            "saved_files": stored,
+            "assigned": assigned,
+            "skipped": skipped,
+            "reindexed": stats,
+            "duration_seconds": round(time.time() - started, 1),
+        }
+
     @app.post(
         "/admin/upload",
         dependencies=admin_gate_deps,
@@ -1134,10 +1948,23 @@ def create_app(
         request: Request,
         category: str = Form(...),
         files: list[UploadFile] = File(default=[]),
+        organisation_id: str | None = Form(default=None),
     ):
+        """Upload documents, unscoped or into one organisation's workspace.
+
+        Scoped, this does not write straight into the served copy. A served copy
+        with no assignment behind it is content nobody can see and nobody can
+        revoke, so an organisation upload goes into the master library and is
+        then assigned, exactly as the two-step console flow would. One rule for
+        how content reaches a customer: it is assigned, never dropped in place.
+        """
         if category not in workspace_names():
             raise HTTPException(status_code=422, detail="Unknown workspace")
         store = app.state.admin_store
+        if organisation_id:
+            return await _upload_into_organisation(
+                request, organisation_id, category, files
+            )
         for f in files:
             name = os.path.basename((f.filename or "").replace("\\", "/"))
             if not name:
@@ -1168,12 +1995,55 @@ def create_app(
             "duration_seconds": round(time.time() - started, 1),
         }
 
+    async def _delete_from_organisation(request, req):
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        _org_or_404(req.organisation_id)
+        name = shared_docs.safe_name(req.filename)
+        if not name:
+            raise HTTPException(status_code=404, detail="Document not found")
+        try:
+            existed = content_library.remove(
+                req.organisation_id, req.category, name
+            )
+        except ValueError:
+            existed = False
+        unassigned = store.remove_content_assignment(
+            req.organisation_id, req.category, name
+        )
+        if not existed and not unassigned:
+            raise HTTPException(status_code=404, detail="Document not found")
+        stats = await _reindex(request, [req.category], req.organisation_id)
+        log_audit(
+            request, "content.unassign", "organisation", req.organisation_id,
+            f"{req.category}/{name}",
+        )
+        return {
+            "organisation_id": req.organisation_id,
+            "deleted": name,
+            "workspace": req.category,
+            "assignment_removed": unassigned,
+            "served_copy_removed": existed,
+            "stale_chunks_removed": (stats.get(req.category) or {})
+            .get("stale_chunks_removed", 0),
+        }
+
     @app.post("/admin/documents/delete", dependencies=admin_gate_deps)
     async def admin_delete_document(
         req: DocumentDeleteRequest, request: Request
     ):
+        """Delete a document, unscoped or from one organisation's workspace.
+
+        Scoped, this removes the served copy *and* the assignment. Unlinking the
+        file alone would leave the assignment behind, so the console would keep
+        offering to grant the customer a document that is no longer there, and
+        the audit trail would claim content the customer never received.
+        """
         if req.category not in workspace_names():
             raise HTTPException(status_code=422, detail="Unknown workspace")
+        if req.organisation_id:
+            return await _delete_from_organisation(request, req)
         folder = Path(root_data_dir()) / req.category
         name = os.path.basename(req.filename.replace("\\", "/"))
         conflict = _shared_conflict(app.state.admin_store, req.category, name)
@@ -1205,12 +2075,17 @@ def create_app(
             for t in store.all_shared_targets()
         }
 
-    async def _reindex(request, categories):
-        """Re-index each workspace once; returns per-category ingest stats."""
+    async def _reindex(request, categories, organisation_id=None):
+        """Re-index each workspace once; returns per-category ingest stats.
+
+        Pass `organisation_id` after an assignment change so the index that moves
+        is the one the customer's users actually query, rather than the
+        category-global workspace index.
+        """
         results = {}
         for cat in dict.fromkeys(categories):
             try:
-                bot = get_bot(request, cat)
+                bot = get_bot(request, cat, organisation_id)
             except HTTPException:
                 continue
             if bot is None:
@@ -1423,6 +2298,1093 @@ def create_app(
                   ",".join(affected))
         return {"deleted": filename, "detached_from": affected, "reindexed": stats}
 
+    # ---- master library and per-organisation assignment (Section 3.4) ------
+
+    @app.post("/admin/organisations", dependencies=admin_gate_deps)
+    def admin_create_organisation(req: OrganisationCreateRequest, request: Request):
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        try:
+            org = user_store.create_organisation(req.id, req.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        log_audit(request, "org.create", "organisation", org["id"], req.name or "")
+        return org
+
+    @app.get("/admin/organisations", dependencies=admin_gate_deps)
+    def admin_list_organisations():
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        store = app.state.admin_store
+        out = []
+        for org in user_store.list_organisations():
+            entry = dict(org)
+            entry["user_count"] = user_store.count_for_organisation(org["id"])
+            # Who owns the org is the first thing an operator scans for: the
+            # role rows already carry the email, so surfacing it here is one
+            # field on the list instead of a drill-down per row.
+            entry["owner"] = next(
+                (r["email"] for r in user_store.org_roles_for(org["id"])
+                 if r["role"] == "owner"),
+                None,
+            )
+            if store is not None:
+                entry["assignments"] = len(store.list_content_assignments(org["id"]))
+            out.append(entry)
+        return {"organisations": out}
+
+    @app.post("/admin/organisations/delete", dependencies=admin_gate_deps)
+    def admin_delete_organisation(req: OrganisationDeleteRequest, request: Request):
+        """Q12: delete an organisation's content immediately, after confirmation.
+
+        Two steps on purpose. `confirm` must be the organisation id, so a
+        mis-click cannot destroy a customer's material: the caller has to echo
+        back what they are deleting.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        if req.confirm != req.organisation_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Confirmation does not match the organisation id. "
+                       "Nothing was deleted.",
+            )
+        org = user_store.get_organisation(req.organisation_id)
+        if org is None:
+            raise HTTPException(status_code=404, detail="Organisation not found")
+        if org["system_owned"]:
+            raise HTTPException(
+                status_code=403,
+                detail=f"'{req.organisation_id}' is system-owned and cannot be deleted.",
+            )
+        removed_files = content_library.purge_organisation(req.organisation_id)
+        store = app.state.admin_store
+        if store is not None:
+            for row in store.list_content_assignments(req.organisation_id):
+                store.remove_content_assignment(
+                    row["organisation_id"], row["category"], row["filename"]
+                )
+        members = user_store.count_for_organisation(req.organisation_id)
+        user_store.delete_organisation(req.organisation_id)
+        log_audit(
+            request, "org.delete", "organisation", req.organisation_id,
+            f"members={members} files_removed={removed_files}",
+        )
+        return {
+            "deleted": req.organisation_id,
+            "members_deleted": members,
+            "content_purged": removed_files,
+        }
+
+    @app.post("/admin/library/upload", dependencies=admin_gate_deps, response_model=dict)
+    async def admin_library_upload(
+        request: Request,
+        subject: str = Form(default=""),
+        jurisdiction: str = Form(default=""),
+        effective_date: str = Form(default=""),
+        version: str = Form(default=""),
+        files: list[UploadFile] = File(default=[]),
+    ):
+        """Upload to the curated master library. Platform Administrators only.
+
+        Uploading here does not serve anyone. Content reaches an organisation
+        only through an explicit assignment, which is the whole of the access
+        control model (Section 3.4).
+        """
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        root = content_library.library_root()
+        root.mkdir(parents=True, exist_ok=True)
+        saved = []
+        for f in files:
+            name = shared_docs.safe_name(f.filename)
+            if not name:
+                continue
+            target = root / name
+            payload = await f.read()
+            tmp = target.with_name(target.name + ".partial")
+            try:
+                tmp.write_bytes(payload)
+                tmp.replace(target)
+            except OSError:
+                tmp.unlink(missing_ok=True)
+                raise
+            store.add_library_doc(
+                name, size=len(payload), subject=subject or None,
+                jurisdiction=jurisdiction or None,
+                effective_date=effective_date or None,
+                version=version or None, actor=actor_label(request),
+            )
+            saved.append(name)
+        if not saved:
+            raise HTTPException(status_code=422, detail="No files were uploaded")
+        log_audit(request, "library.upload", "library_document", ",".join(saved),
+                  subject or "")
+        return {"saved_files": saved}
+
+    @app.get("/admin/migrations/legacy-content", dependencies=admin_gate_deps)
+    def admin_legacy_content_scan():
+        """Preview the pre-organisation content a cutover would move (D19)."""
+        docs = content_library.scan_legacy_tree()
+        assigned_names = {
+            row["filename"]
+            for row in app.state.admin_store.list_content_assignments()
+        } if app.state.admin_store is not None else set()
+        unassigned = [d for d in docs if d["filename"] not in assigned_names]
+        orphaned = content_library.orphaned_shared_documents()
+        return {
+            "documents": docs,
+            "count": len(docs),
+            "by_workspace": {
+                cat: sum(1 for d in docs if d["category"] == cat)
+                for cat in sorted({d["category"] for d in docs})
+            },
+            # Turning the legacy fallback off strands any document below that no
+            # organisation has been assigned. Emptiness is the wrong test: the
+            # migration copies rather than moves, so the originals stay on disk
+            # by design and the tree is never empty after a successful run.
+            "fallback_enabled": documents_mod.legacy_fallback_enabled(),
+            "unassigned": unassigned,
+            "orphaned_shared": orphaned,
+            "safe_to_disable_fallback": not unassigned and not orphaned,
+        }
+
+    def _legacy_destinations(item, selected, store, known):
+        """Which workspaces one legacy document should be assigned to.
+
+        A document keeps the workspace it lived in. That is the only mapping that
+        does not invent access: the alternative, giving everything to everything,
+        hands a customer an HR policy because they once had an HR workspace.
+
+        A shared document has no workspace of its own — it came from _shared and
+        was linked into the workspaces recorded in the admin store, so those are
+        its destinations.
+        """
+        from_category = item.get("from_category")
+        if item.get("shared"):
+            targets = [
+                c for c in store.shared_target_categories(item["filename"])
+                if c in known
+            ]
+            return [c for c in targets if not selected or c in selected]
+        if from_category in known:
+            return [from_category] if not selected or from_category in selected else []
+        return []
+
+    @app.post("/admin/migrations/legacy-content", dependencies=admin_gate_deps,
+              response_model=dict)
+    async def admin_migrate_legacy_content(request: Request):
+        """Import the pre-organisation tree into the library and assign it (D19).
+
+        The operator names the organisation that inherits the content. The
+        legacy tree belonged to the deployment rather than to a customer, so
+        there is no correct owner to infer; assigning it to the free tier or to
+        an arbitrary customer would be worse than asking.
+
+        Files are copied, not moved, and the legacy tree is left untouched, so a
+        wrong call here is recoverable by assigning the document elsewhere.
+        """
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        body = await request.json()
+        target = (body.get("organisation_id") or "").strip()
+        if not target:
+            raise HTTPException(
+                status_code=422,
+                detail="Name the organisation that inherits this content.",
+            )
+        _org_or_404(target)
+        if content_library.is_sample(target):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The system sample organisation is the free tier. Legacy "
+                    "content must go to a customer organisation."
+                ),
+            )
+        categories = body.get("categories") or None
+        result = content_library.migrate_legacy_tree(
+            target, categories=categories, actor=actor_label(request)
+        )
+        for item in result["imported"]:
+            store.add_library_doc(
+                item["filename"], size=Path(item["path"]).stat().st_size,
+                subject="legacy-migration", actor=actor_label(request),
+            )
+        # Shared documents came from _shared and belong in every workspace they
+        # were linked into, which the operator has to name because the link map
+        # lives in the admin store rather than in the filesystem.
+        known = workspace_names()
+        cats = (
+            [c for c in categories if c in known]
+            if categories else list(known)
+        )
+        assigned = []
+        touched = []
+        for item in result["imported"]:
+            name = shared_docs.safe_name(item["filename"])
+            source = Path(item["path"])
+            # Each document goes to the workspace it actually lived in. Giving
+            # every legacy document to every workspace would hand a customer an
+            # HR policy because they once had an HR workspace.
+            dest_cats = _legacy_destinations(
+                item, cats, store, known
+            )
+            if not dest_cats:
+                result["skipped"].append(
+                    {"filename": name, "from_category": item["from_category"],
+                     "reason": "No destination workspace."}
+                )
+                continue
+            for cat in dest_cats:
+                try:
+                    dest = content_library.materialise(
+                        target, cat, source, filename=name
+                    )
+                except ValueError as exc:
+                    result["skipped"].append(
+                        {"filename": name, "category": cat, "reason": str(exc)}
+                    )
+                    continue
+                store.add_content_assignment(
+                    target, cat, name, actor=actor_label(request)
+                )
+                assigned.append({"category": cat, "filename": name,
+                                 "path": str(dest)})
+                touched.append(cat)
+        result["assigned"] = assigned
+        stats = await _reindex(request, touched, target) if touched else {}
+        log_audit(
+            request, "migration.legacy_content", "organisation", target,
+            f"{len(result['imported'])} imported, {len(assigned)} assignments",
+        )
+        return {**result, "reindexed": stats}
+
+    @app.get("/admin/library", dependencies=admin_gate_deps)
+    def admin_library(subject: str | None = None):
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        docs = store.list_library_docs(subject=subject or None)
+        root = content_library.library_root()
+        for doc in docs:
+            doc["present"] = (root / doc["filename"]).exists()
+            doc["assigned_to"] = [
+                row["organisation_id"]
+                for row in store.list_content_assignments()
+                if row["filename"] == doc["filename"]
+            ]
+        return {"documents": docs, "subjects": sorted(
+            {d["subject"] for d in docs if d["subject"]}
+        )}
+
+    @app.post("/admin/library/assign", dependencies=admin_gate_deps, response_model=dict)
+    async def admin_assign_content(request: Request, req: ContentAssignRequest):
+        """Assign library content to one organisation's workspaces.
+
+        Materialises a served copy per workspace and records the act, so the
+        audit log can answer which content an organisation was given (D12).
+        """
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        org = user_store.get_organisation(req.organisation_id)
+        if org is None:
+            raise HTTPException(status_code=404, detail="Organisation not found")
+        if content_library.is_sample(req.organisation_id):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The system sample organisation is the shared free tier; paid "
+                    "content cannot be assigned to it. Create a customer "
+                    "organisation and convert the account instead."
+                ),
+            )
+        cats = [c for c in dict.fromkeys(req.categories) if c in workspace_names()]
+        if not cats:
+            raise HTTPException(
+                status_code=422, detail="Select at least one valid workspace."
+            )
+        root = content_library.library_root()
+        assigned, skipped = [], []
+        for filename in dict.fromkeys(req.filenames):
+            name = shared_docs.safe_name(filename)
+            source = root / name if name else None
+            if not name or not source.is_file():
+                skipped.append({"filename": filename, "reason": "Not in the library."})
+                continue
+            for cat in cats:
+                try:
+                    dest = content_library.materialise(
+                        req.organisation_id, cat, source, filename=name
+                    )
+                except ValueError as exc:
+                    skipped.append({"filename": name, "category": cat, "reason": str(exc)})
+                    continue
+                store.add_content_assignment(
+                    req.organisation_id, cat, name, actor=actor_label(request)
+                )
+                assigned.append(
+                    {"category": cat, "filename": name, "path": str(dest)}
+                )
+        if not assigned:
+            raise HTTPException(
+                status_code=422, detail="Nothing was assigned. " + str(skipped)
+            )
+        stats = await _reindex(request, cats, req.organisation_id)
+        log_audit(
+            request, "content.assign", "organisation", req.organisation_id,
+            ",".join(sorted({a["filename"] for a in assigned})),
+        )
+        return {
+            "organisation_id": req.organisation_id,
+            "assigned": assigned,
+            "skipped": skipped,
+            "reindexed": stats,
+        }
+
+    @app.post("/admin/library/unassign", dependencies=admin_gate_deps, response_model=dict)
+    async def admin_unassign_content(request: Request, req: ContentUnassignRequest):
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        cats = [c for c in dict.fromkeys(req.categories) if c in workspace_names()]
+        if not cats:
+            raise HTTPException(
+                status_code=422, detail="Select at least one valid workspace."
+            )
+        removed = []
+        for filename in dict.fromkeys(req.filenames):
+            name = shared_docs.safe_name(filename)
+            if not name:
+                continue
+            for cat in cats:
+                try:
+                    existed = content_library.remove(
+                        req.organisation_id, cat, name
+                    )
+                except ValueError:
+                    existed = False
+                if store.remove_content_assignment(req.organisation_id, cat, name) or existed:
+                    removed.append({"category": cat, "filename": name})
+        stats = await _reindex(request, cats, req.organisation_id)
+        log_audit(request, "content.unassign", "organisation",
+                  req.organisation_id, ",".join(r["filename"] for r in removed))
+        return {"organisation_id": req.organisation_id, "removed": removed,
+                "reindexed": stats}
+
+    @app.get("/admin/organisations/{organisation_id}/content",
+             dependencies=admin_gate_deps)
+    def admin_organisation_content(organisation_id: str):
+        """What one organisation is currently served, and what it could be given."""
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        if user_store is not None:
+            org = user_store.get_organisation(organisation_id)
+            if org is None:
+                raise HTTPException(status_code=404, detail="Organisation not found")
+        rows = store.list_content_assignments(organisation_id)
+        by_category = {}
+        for row in rows:
+            entry = by_category.setdefault(row["category"], [])
+            served = content_library.list_documents(organisation_id, row["category"])
+            entry.append({
+                "filename": row["filename"],
+                "assigned_at": row["assigned_at"],
+                "actor": row["actor"],
+                # Recorded assignment vs what is actually on disk. A gap means
+                # somebody deleted a served copy outside the console, and the
+                # assignment would otherwise look intact.
+                "present": row["filename"] in served,
+            })
+        return {
+            "organisation_id": organisation_id,
+            "assignments": by_category,
+            "library": store.list_library_docs(),
+            "workspaces": workspace_names(),
+        }
+
+    # ---- seats, roles and workspace access (Section 3.3) -------------------
+    #
+    # A customer organisation is not operable without these: an owner role
+    # nobody can grant, and seats nobody can add, leave an organisation that
+    # exists on paper and has no one who can run it.
+
+    def _org_or_404(organisation_id):
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        org = user_store.get_organisation(organisation_id)
+        if org is None:
+            raise HTTPException(status_code=404, detail="Organisation not found")
+        return org
+
+    # ---- organisation self-service (Section 3.3) ----------------------------
+    #
+    # Q11 gives Organisation Admin the right to manage their own people and
+    # workspaces. These routes exist so they do not need the platform key to do
+    # it. Two rules hold across all of them:
+    #
+    #   The organisation comes from the caller's own account, never from the
+    #   request. There is no organisation_id parameter to get wrong, so there is
+    #   no way to address another customer's seats by editing a body.
+    #
+    #   Authority is re-read from the store on every call rather than trusted from
+    #   the token. A token issued while someone was an admin outlives their
+    #   demotion, so a demoted admin's existing token must stop working here.
+
+    def _caller_organisation(caller):
+        """The caller's own organisation, or 403 if they have no usable account.
+
+        Free-tier accounts live in the system sample organisation, which has no
+        owner and is not a customer: there is nobody there to hand authority to.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        org_id = (caller or {}).get("organisation_id")
+        if not org_id:
+            raise HTTPException(
+                status_code=403, detail="Your account has no organisation."
+            )
+        return _org_or_404(org_id)
+
+    def _require_org_manager(caller, allow_owner_only=False):
+        """Authorise an organisation admin (Q11). Returns (organisation, role)."""
+        org = _caller_organisation(caller)
+        role = user_store.org_role(caller["id"])
+        if role not in (ORG_ROLE_OWNER, ORG_ROLE_ADMIN):
+            raise HTTPException(
+                status_code=403,
+                detail="Only an organisation owner or admin can do this.",
+            )
+        if allow_owner_only and role != ORG_ROLE_OWNER:
+            raise HTTPException(
+                status_code=403, detail="Only the organisation owner can do this."
+            )
+        return org, role
+
+    def _member_in_caller_org(caller, user_id):
+        """Resolve a target user, refusing anyone outside the caller's org.
+
+        Without this an admin could pass any user id and edit another
+        organisation's seats, since the ids are not secret.
+        """
+        target = user_store.get(user_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        if target["organisation_id"] != caller["organisation_id"]:
+            raise HTTPException(
+                status_code=404, detail="User not found"
+            )
+        return target
+
+    @app.get("/org/members")
+    def org_members(caller: dict = user_dep):
+        """Everyone in the caller's organisation, with role and workspaces.
+
+        The same shape the platform console gets, so "who here can do what" is
+        one question rather than two lists to reconcile by eye.
+        """
+        org, role = _require_org_manager(caller)
+        roles = {r["user_id"]: r["role"] for r in user_store.org_roles_for(org["id"])}
+        members = []
+        for u in user_store.list_users_in_organisation(org["id"], limit=500):
+            u["org_role"] = roles.get(u["id"])
+            u["workspaces"] = [
+                m["category"] for m in user_store.memberships(u["id"])
+            ]
+            u["primary_workspace"] = u["category"]
+            members.append(u)
+        return {
+            "organisation": org,
+            "your_role": role,
+            "members": members,
+            "available_workspaces": workspace_names(),
+        }
+
+    @app.post("/org/members")
+    def org_create_member(req: OrgMemberCreateRequest, request: Request,
+                          caller: dict = user_dep):
+        """Add a seat to the caller's organisation.
+
+        A customer may add their own people (Q11) but may not introduce content
+        (Q1: there is no customer-side upload path at all). Creating an account
+        here is a seat, not a document.
+        """
+        org, _role = _require_org_manager(caller)
+        try:
+            user = user_store.create_user(
+                req.email, req.password, req.name, req.category,
+                organisation_id=org["id"],
+                # The org admin vouched for this person, matching the platform
+                # console. D18 gates self-service, not customer-managed seats.
+                verified=True,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        added = []
+        for cat in dict.fromkeys(req.workspaces or [req.category]):
+            try:
+                user_store.add_workspace(user["id"], cat)
+                added.append(cat)
+            except ValueError:
+                # A bad workspace name must not leave a half-provisioned seat
+                # behind, so undo the account rather than reporting success.
+                user_store.delete_user(user["id"])
+                raise HTTPException(
+                    status_code=422, detail=f"Unknown workspace: {cat}"
+                )
+        log_audit(
+            request, "org.member_create", "user", user["id"],
+            f"org={org['id']} actor_role={user_store.org_role(caller['id'])}",
+        )
+        refresh_seat_usage(org["id"])
+        user["workspaces"] = user_store.workspace_categories(user["id"])
+        return user
+
+    @app.delete("/org/members/{user_id}")
+    def org_remove_member(user_id: str, request: Request, caller: dict = user_dep):
+        """Remove a seat from the caller's organisation."""
+        org, role = _require_org_manager(caller)
+        target = _member_in_caller_org(caller, user_id)
+        if target["id"] == caller["id"]:
+            raise HTTPException(
+                status_code=409,
+                detail="You cannot remove your own seat. Ask the owner to do it.",
+            )
+        if user_store.org_role(user_id) == ORG_ROLE_OWNER:
+            raise HTTPException(
+                status_code=409,
+                detail="The owner's seat cannot be removed; transfer ownership "
+                       "instead.",
+            )
+        if not user_store.delete_user(user_id):
+            raise HTTPException(status_code=404, detail="User not found")
+        log_audit(
+            request, "org.member_remove", "user", user_id,
+            f"org={org['id']} actor_role={role}",
+        )
+        refresh_seat_usage(org["id"])
+        return {"removed": user_id}
+
+    @app.post("/org/members/{user_id}/role")
+    def org_set_member_role(user_id: str, req: OrgSelfRoleRequest, request: Request,
+                            caller: dict = user_dep):
+        """Grant or revoke an organisation role inside the caller's organisation."""
+        org, role = _require_org_manager(caller)
+        target = _member_in_caller_org(caller, user_id)
+        wanted = (req.role or "").strip().lower()
+        if wanted == ORG_ROLE_OWNER:
+            raise HTTPException(
+                status_code=409,
+                detail="Ownership is transferred, not granted. Use the transfer "
+                       "endpoint.",
+            )
+        if target["id"] == caller["id"] and wanted == "":
+            raise HTTPException(
+                status_code=409, detail="You cannot remove your own admin role."
+            )
+        try:
+            if req.role is not None:
+                if wanted:
+                    user_store.set_org_role(org["id"], user_id, wanted)
+                else:
+                    user_store.revoke_org_role(org["id"], user_id)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        if req.account_status is not None:
+            try:
+                user_store.update_user(user_id, account_status=req.account_status)
+            except ValueError as e:
+                raise HTTPException(status_code=422, detail=str(e))
+        log_audit(
+            request, "org.role_change", "user", user_id,
+            f"org={org['id']} role={wanted or 'none'} actor_role={role}",
+        )
+        final = user_store.get(user_id)
+        role_after = user_store.org_role(user_id) if final else None
+        return {"user_id": user_id, "role": role_after, "account_status": (final.get("account_status") or "active") if final else (req.account_status or (final.get("account_status") if final else "active"))}
+
+    @app.post("/org/members/{user_id}/reset-password")
+    def org_reset_member_password(user_id: str, req: AdminPasswordResetRequest,
+                                  request: Request, caller: dict = user_dep):
+        """An owner or admin sets a member's password directly.
+
+        The new password has to be handed to the member out of band (email,
+        chat, or in person). Setting it signs every existing session of that
+        account out, so a member whose access has been compromised cannot
+        stay logged in. A member can change it themselves afterwards.
+        """
+        org, role = _require_org_manager(caller)
+        target = _member_in_caller_org(caller, user_id)
+        try:
+            user_store.update_user(user_id, password=req.password)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        log_audit(
+            request, "org.member_password_reset", "user", user_id,
+            f"org={org['id']} actor_role={role}",
+        )
+        return {"user_id": user_id, "sent": True}
+
+    @app.post("/org/members/{user_id}/workspaces")
+    def org_set_member_workspaces(user_id: str, req: OrgSelfWorkspacesRequest,
+                                  request: Request, caller: dict = user_dep):
+        """Grant or revoke workspace access for a seat (Q11)."""
+        org, role = _require_org_manager(caller)
+        target = _member_in_caller_org(caller, user_id)
+        cats = [c for c in dict.fromkeys(req.categories)]
+        unknown = [c for c in cats if c not in workspace_names()]
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail="Unknown workspace: " + ", ".join(unknown),
+            )
+        granted, revoked = [], []
+        try:
+            for cat in cats:
+                user_store.add_workspace(user_id, cat)
+                granted.append(cat)
+            for cat in req.revoke:
+                if cat not in workspace_names():
+                    raise HTTPException(
+                        status_code=422, detail="Unknown workspace: " + cat
+                    )
+                user_store.remove_workspace(user_id, cat)
+                revoked.append(cat)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        if req.category and req.category in user_store.workspace_categories(user_id):
+            user_store.update_user(user_id, category=req.category)
+        log_audit(
+            request, "org.workspace_access", "user", user_id,
+            f"org={org['id']} granted={','.join(granted)} "
+            f"revoked={','.join(revoked)} actor_role={role}",
+        )
+        refresh_seat_usage(org["id"])
+        return {
+            "user_id": user_id,
+            "workspaces": user_store.workspace_categories(user_id),
+        }
+
+    @app.post("/org/transfer-ownership")
+    def org_transfer_ownership(req: OrgSelfTransferRequest, request: Request,
+                               caller: dict = user_dep):
+        """Move the single owner seat. Owner only (Q9)."""
+        org, _role = _require_org_manager(caller, allow_owner_only=True)
+        target = _member_in_caller_org(caller, req.user_id)
+        try:
+            user_store.transfer_ownership(org["id"], caller["id"], target["id"])
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        log_audit(
+            request, "org.transfer_ownership", "user", target["id"],
+            f"org={org['id']} from={caller['id']}",
+        )
+        return {"organisation_id": org["id"], "owner": target["id"]}
+
+    # ---- organisation console (owner/admin analytics) ----------------------
+    #
+    # The owner's dashboard is the org-scoped twin of the platform console:
+    # same questions (how much have we used, who is here, what is indexed),
+    # answered from the caller's own organisation and nothing else. Every route
+    # is manager-gated and takes the organisation from the caller's account, so
+    # none of them can be pointed at another customer.
+
+    def _org_content_workspaces(org):
+        """Per-workspace index and content status for one organisation."""
+        seats = {r["category"]: r for r in user_store.organisation_workspace_seats(org["id"])}
+        member_cats = set(user_store.organisation_workspace_categories(org["id"]))
+        rows = []
+        total_chunks = 0
+        for cat in workspace_names():
+            db = _scope_index_path(cat, org["id"])
+            chunks = sources = 0
+            if db.exists():
+                try:
+                    conn = sqlite3.connect(db)
+                    chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                    sources = len(
+                        conn.execute("SELECT DISTINCT source FROM chunks").fetchall()
+                    )
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            data = _scope_data_dir(cat, org["id"])
+            files = sorted(p.name for p in data.iterdir()) if data.is_dir() else []
+            seat_count = int((seats.get(cat) or {}).get("seats") or 0)
+            if not seat_count and not chunks and not files and cat not in member_cats:
+                # Neither assigned content, nor a seat, nor an index: the
+                # workspace is not part of this organisation, so it is left out
+                # rather than shown empty the way the global console does.
+                continue
+            total_chunks += chunks or 0
+            meta = workspace_meta(cat)
+            rows.append(
+                {
+                    "category": cat,
+                    "label": meta.get("label", cat.title()),
+                    "emoji": meta.get("emoji"),
+                    "blurb": meta.get("blurb"),
+                    "chunks": chunks,
+                    "sources": sources,
+                    "data_file_count": len(files),
+                    "data_files": files,
+                    "seats": seat_count,
+                    "indexed": (chunks or 0) > 0,
+                }
+            )
+        return rows, total_chunks
+
+    @app.get("/org/overview")
+    def org_overview(caller: dict = user_dep):
+        """One organisation's dashboard: plan, usage, seats, people, content."""
+        org, role = _require_org_manager(caller)
+        store = app.state.admin_store
+        members = user_store.list_users_in_organisation(org["id"], limit=1000)
+        roles = {u["id"]: user_store.org_role(u["id"]) for u in members}
+        by_role = {}
+        for u in members:
+            key = roles.get(u["id"]) or "member"
+            by_role[key] = by_role.get(key, 0) + 1
+        workspaces, total_chunks = _org_content_workspaces(org)
+        billing_usage = billing.usage_summary(user_store, store, org)
+        invites = store.list_invites(organisation_id=org["id"]) if store else []
+        return {
+            "organisation": {
+                "id": org["id"],
+                "name": org["name"],
+                "system_owned": org["system_owned"],
+                "plan": org.get("plan"),
+                "billing_status": org.get("billing_status"),
+                "current_period_start": org.get("current_period_start"),
+                "current_period_end": org.get("current_period_end"),
+            },
+            "your_role": role,
+            "billing": billing_usage,
+            "members": {"total": len(members), "by_role": by_role},
+            "invites": {
+                "total": len(invites),
+                "pending": len([i for i in invites if i.get("valid")]),
+            },
+            "workspaces": workspaces,
+            "totals": {
+                "workspaces": len(workspaces),
+                "chunks": total_chunks,
+                "members": len(members),
+                "questions_used": billing_usage["questions"]["used"],
+            },
+        }
+
+    @app.get("/org/plans")
+    def org_plans(caller: dict = user_dep):
+        """Plan tiers an owner may purchase, with what each includes."""
+        _require_org_manager(caller)
+        return {"plans": billing.plan_catalog()}
+
+    @app.get("/org/usage")
+    def org_usage(range: str = "7d", category: str | None = None,
+                  caller: dict = user_dep):
+        """Token and cost analytics for the caller's own organisation."""
+        org, _role = _require_org_manager(caller)
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Usage tracking is disabled")
+        range_days = {"24h": 1, "7d": 7, "30d": 30}.get(range)
+        if range != "all" and range_days is None:
+            raise HTTPException(status_code=422, detail="range must be 24h, 7d, 30d or all")
+        return store.usage_stats(
+            range_days=range_days,
+            category=category or None,
+            organisation_id=org["id"],
+        )
+
+    @app.get("/org/content")
+    def org_content(caller: dict = user_dep):
+        """What is indexed under each of the caller's organisation workspaces."""
+        org, _role = _require_org_manager(caller)
+        workspaces, total_chunks = _org_content_workspaces(org)
+        return {
+            "organisation_id": org["id"],
+            "workspaces": workspaces,
+            "totals": {"workspaces": len(workspaces), "chunks": total_chunks},
+        }
+
+    @app.get("/org/invites")
+    def org_invites(caller: dict = user_dep):
+        """Invitations minted for the caller's own organisation."""
+        org, _role = _require_org_manager(caller)
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Invites are not enabled")
+        return {"organisation_id": org["id"], "invites": store.list_invites(org["id"])}
+
+    @app.post("/org/invites")
+    def org_create_invite(req: OrgSelfInviteRequest, request: Request,
+                          caller: dict = user_dep):
+        """Mint a seat invitation for the caller's own organisation."""
+        org, role = _require_org_manager(caller)
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Invites are not enabled")
+        if req.category not in workspace_names():
+            raise HTTPException(
+                status_code=422, detail=f"Unknown workspace: {req.category}"
+            )
+        invite = store.create_invite(
+            req.category,
+            label=req.label,
+            max_uses=req.max_uses,
+            ttl_hours=req.ttl_hours,
+            actor=caller.get("email", ""),
+            organisation_id=org["id"],
+        )
+        log_audit(
+            request, "org.invite_create", "workspace", req.category,
+            f"org={org['id']} max_uses={req.max_uses} actor_role={role}",
+        )
+        return invite
+
+    @app.get("/admin/organisations/{organisation_id}/members",
+             dependencies=admin_gate_deps)
+    def admin_organisation_members(organisation_id: str):
+        """Everyone in an organisation, with their role and workspaces.
+
+        Role and membership are reported together because the question an
+        administrator actually has is "who here can do what", not two separate
+        lists to reconcile by eye.
+        """
+        _org_or_404(organisation_id)
+        roles = {
+            r["user_id"]: r["role"]
+            for r in user_store.org_roles_for(organisation_id)
+        }
+        members = []
+        for u in user_store.list_users_in_organisation(organisation_id, limit=500):
+            memberships = user_store.memberships(u["id"])
+            u["org_role"] = roles.get(u["id"])
+            u["workspaces"] = [m["category"] for m in memberships]
+            u["primary_workspace"] = u["category"]
+            members.append(u)
+        return {
+            "organisation_id": organisation_id,
+            "members": members,
+            "available_workspaces": workspace_names(),
+            "org_roles": sorted(ORG_ROLES),
+        }
+
+    @app.post("/admin/organisations/role", dependencies=admin_gate_deps)
+    def admin_set_org_role(req: OrgRoleRequest, request: Request):
+        """Grant or change an organisation role (Q9: exactly one owner)."""
+        _org_or_404(req.organisation_id)
+        try:
+            roles = user_store.set_org_role(
+                req.organisation_id, req.user_id, req.role
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        log_audit(
+            request, "org.role", "organisation", req.organisation_id,
+            f"user={req.user_id} role={req.role}",
+        )
+        return {"organisation_id": req.organisation_id, "roles": roles}
+
+    @app.post("/admin/organisations/role/revoke", dependencies=admin_gate_deps)
+    def admin_revoke_org_role(req: OrgRoleRequest, request: Request):
+        """Revoke a role. Refuses to leave an organisation ownerless (Q9)."""
+        _org_or_404(req.organisation_id)
+        target = user_store.get(req.user_id)
+        if target is None or target["organisation_id"] != req.organisation_id:
+            raise HTTPException(
+                status_code=404, detail="That user is not in this organisation."
+            )
+        if user_store.org_role(req.user_id) == ORG_ROLE_OWNER:
+            remaining = [
+                r for r in user_store.org_roles_for(req.organisation_id)
+                if r["role"] == ORG_ROLE_OWNER and r["user_id"] != req.user_id
+            ]
+            if not remaining:
+                raise HTTPException(
+                    status_code=409,
+                    detail="An organisation must keep exactly one owner. "
+                           "Transfer ownership before revoking this role.",
+                )
+        try:
+            user_store.revoke_org_role(req.organisation_id, req.user_id)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        log_audit(
+            request, "org.role.revoke", "organisation", req.organisation_id,
+            f"user={req.user_id} role={req.role}",
+        )
+        return {"organisation_id": req.organisation_id,
+                "roles": user_store.org_roles_for(req.organisation_id)}
+
+    @app.post("/admin/organisations/transfer-ownership",
+              dependencies=admin_gate_deps)
+    def admin_transfer_ownership(req: OwnershipTransferRequest, request: Request):
+        """Hand ownership to another member. The previous owner becomes admin."""
+        _org_or_404(req.organisation_id)
+        try:
+            roles = user_store.transfer_ownership(
+                req.organisation_id, req.from_user_id, req.to_user_id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        log_audit(
+            request, "org.ownership.transfer", "organisation", req.organisation_id,
+            f"from={req.from_user_id} to={req.to_user_id}",
+        )
+        return {"organisation_id": req.organisation_id, "roles": roles}
+
+    @app.post("/admin/organisations/{organisation_id}/billing/refresh",
+              dependencies=admin_gate_deps)
+    def admin_refresh_organisation_billing(organisation_id: str, request: Request):
+        """Write this organisation's billing columns from Stripe's own record.
+
+        For a row whose period window was never learned because no webhook
+        arrived - seeded by hand, restored from a copy, or pointed at a
+        subscription that predates the endpoint. Without the period opening the
+        question meter has no window to count from, so usage is silently not
+        reported rather than reported wrongly. Stripe is only read.
+        """
+        org = _org_or_404(organisation_id)
+        if org.get("system_owned"):
+            raise HTTPException(
+                status_code=422,
+                detail="Platform-owned organisations are not billed.",
+            )
+        subscription_id = org.get("stripe_subscription_id")
+        if not subscription_id:
+            raise HTTPException(
+                status_code=422,
+                detail="No subscription recorded for this organisation.",
+            )
+        try:
+            updated = billing.refresh_subscription_from_stripe(
+                user_store, subscription_id
+            )
+        except billing.BillingUnconfigured as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        except billing.InvalidBillingRequest as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except billing.BillingUpstreamError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+        log_audit(
+            request, "billing.refresh", "organisation", organisation_id,
+            f"subscription={subscription_id}",
+        )
+        return {
+            "organisation_id": organisation_id,
+            "billing": {
+                "plan": updated.get("plan"),
+                "billing_status": updated.get("billing_status"),
+                "stripe_subscription_id": updated.get("stripe_subscription_id"),
+                "current_period_start": updated.get("current_period_start"),
+                "current_period_end": updated.get("current_period_end"),
+            },
+        }
+
+    @app.post("/admin/organisations/workspaces/add", dependencies=admin_gate_deps)
+    def admin_add_org_workspace(req: OrgMembershipRequest, request: Request):
+        _org_or_404(req.organisation_id)
+        target = user_store.get(req.user_id)
+        if target is None or target["organisation_id"] != req.organisation_id:
+            raise HTTPException(
+                status_code=404, detail="That user is not in this organisation."
+            )
+        try:
+            memberships = user_store.add_workspace(req.user_id, req.category)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        log_audit(
+            request, "org.workspace.add", "user", req.user_id,
+            f"org={req.organisation_id} workspace={req.category}",
+        )
+        refresh_seat_usage(req.organisation_id)
+        return {"user_id": req.user_id, "memberships": memberships}
+
+    @app.post("/admin/organisations/workspaces/remove", dependencies=admin_gate_deps)
+    def admin_remove_org_workspace(req: OrgMembershipRequest, request: Request):
+        _org_or_404(req.organisation_id)
+        target = user_store.get(req.user_id)
+        if target is None or target["organisation_id"] != req.organisation_id:
+            raise HTTPException(
+                status_code=404, detail="That user is not in this organisation."
+            )
+        try:
+            removed = user_store.remove_workspace(req.user_id, req.category)
+        except ValueError as exc:
+            # Includes "Cannot remove the only workspace", so a seat cannot be
+            # left with nowhere to work.
+            raise HTTPException(status_code=422, detail=str(exc))
+        log_audit(
+            request, "org.workspace.remove", "user", req.user_id,
+            f"org={req.organisation_id} workspace={req.category}",
+        )
+        refresh_seat_usage(req.organisation_id)
+        return {"user_id": req.user_id, "removed": removed}
+
+    @app.post("/admin/organisations/move", dependencies=admin_gate_deps)
+    def admin_move_user_to_organisation(req: OrgMoveRequest, request: Request):
+        """Move a user into a customer organisation with named workspaces.
+
+        The conversion path from a free account (Q1): the person keeps their
+        identity and conversation history and gains access to the workspaces the
+        new organisation assigns. Access is explicit rather than inherited, so a
+        user never arrives carrying every workspace the target organisation
+        happens to use.
+        """
+        target = _org_or_404(req.organisation_id)
+        user = user_store.get(req.user_id)
+        if user is None:
+            raise HTTPException(status_code=404, detail="User not found")
+        source = user["organisation_id"]
+        if source == req.organisation_id:
+            raise HTTPException(
+                status_code=409, detail="User is already in that organisation."
+            )
+        cats = [c for c in dict.fromkeys(req.workspaces) if c in workspace_names()]
+        if not cats:
+            raise HTTPException(
+                status_code=422, detail="Select at least one valid workspace."
+            )
+        try:
+            # Out of the old workspaces first: a leftover membership would grant
+            # reach the new organisation never chose to give.
+            for existing in user_store.workspace_categories(req.user_id):
+                if existing not in cats and existing != user["category"]:
+                    user_store.remove_workspace(req.user_id, existing)
+            for cat in cats:
+                user_store.add_workspace(req.user_id, cat)
+            user_store.set_primary_workspace(req.user_id, cats[0])
+            user_store.set_user_organisation(req.user_id, req.organisation_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        log_audit(
+            request, "user.move", "user", req.user_id,
+            f"{source} -> {req.organisation_id} workspaces={','.join(cats)}",
+        )
+        # The seat leaves one organisation and arrives in another, and both
+        # sides are metered.
+        refresh_seat_usage(source)
+        refresh_seat_usage(req.organisation_id)
+        out = user_store.get(req.user_id)
+        out["workspaces"] = user_store.workspace_categories(req.user_id)
+        return {
+            "user": out,
+            "from_organisation": source,
+            "to_organisation": req.organisation_id,
+            "target_system_owned": target["system_owned"],
+        }
+
     @app.get("/admin/users", dependencies=admin_gate_deps)
     def admin_users(limit: int = 100, offset: int = 0):
         if user_store is None:
@@ -1439,12 +3401,27 @@ def create_app(
             raise HTTPException(status_code=503, detail="User accounts are disabled")
         try:
             user = user_store.create_user(
-                req.email, req.password, req.name, req.category
+                req.email, req.password, req.name, req.category,
+                organisation_id=req.organisation_id,
+                # Someone who can reach this endpoint set the account up, so it
+                # is vouched for: no address confirmation on a seat an operator
+                # created deliberately (D18 governs self-service only).
+                verified=True,
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
+        # The organisation this account lands in is the one the platform is
+        # setting up, so its first account is its owner. Without the row here
+        # the owner badge, the role checks and Q9's single-owner rule all read
+        # an empty table for accounts an Administrator created by hand.
+        if req.organisation_id:
+            user_store.ensure_initial_owner(req.organisation_id, user["id"])
         user["session_count"] = app.state.session_store.count(user_id=user["id"])
-        log_audit(request, "user.create", "user", user.get("id"), req.email)
+        log_audit(
+            request, "user.create", "user", user.get("id"),
+            f"{req.email} org={user.get('organisation_id')}",
+        )
+        refresh_seat_usage(req.organisation_id)
         return user
 
     @app.patch("/admin/users/{user_id}", dependencies=admin_gate_deps)
@@ -1469,9 +3446,11 @@ def create_app(
     def admin_delete_user(user_id: str, request: Request):
         if user_store is None:
             raise HTTPException(status_code=503, detail="User accounts are disabled")
+        existing = user_store.get(user_id)
         if not user_store.delete_user(user_id):
             raise HTTPException(status_code=404, detail="User not found")
         log_audit(request, "user.delete", "user", user_id)
+        refresh_seat_usage(existing.get("organisation_id") if existing else None)
         return {"deleted": user_id}
 
     @app.get("/admin/audit", dependencies=admin_gate_deps)
@@ -1632,18 +3611,105 @@ def create_app(
         store = app.state.admin_store
         if store is None:
             raise HTTPException(status_code=503, detail="Admin store is disabled")
+        # The organisation is checked here rather than in the store because
+        # the admin database holds no organisations: an invite naming one that
+        # does not exist would mint a token nobody can redeem.
+        if req.organisation_id:
+            if app.state.user_store is None:
+                raise HTTPException(
+                    status_code=503, detail="User accounts are disabled"
+                )
+            if app.state.user_store.get_organisation(req.organisation_id) is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Unknown organisation: {req.organisation_id}",
+                )
         try:
             invite = store.create_invite(
                 req.category,
                 label=req.label,
                 max_uses=req.max_uses,
                 ttl_hours=req.ttl_hours,
+                organisation_id=req.organisation_id,
             )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
         log_audit(request, "invite.create", "workspace", req.category,
-                  f"max_uses={req.max_uses} ttl_hours={req.ttl_hours}")
+                  f"max_uses={req.max_uses} ttl_hours={req.ttl_hours} "
+                  f"organisation={req.organisation_id or '-'}")
         return invite
+
+    # ---- D18: verification and free-account administration -----------------
+
+    class VerificationOverrideRequest(BaseModel):
+        verified: bool = True
+
+    @app.get("/admin/verifications", dependencies=admin_gate_deps)
+    def admin_list_verifications(
+        limit: int = 100, offset: int = 0, organisation_id: str | None = None
+    ):
+        """Pending confirmations plus the free-account position.
+
+        The cap is reported alongside the queue so an operator can see both
+        problems in one place: accounts waiting, and accounts available.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        pending = user_store.list_unverified(
+            organisation_id=organisation_id, limit=limit, offset=offset
+        )
+        cap = max_free_accounts()
+        used = user_store.count_users_in_organisation(SAMPLE_ORGANISATION_ID)
+        return {
+            "pending": pending,
+            "count": user_store.count_unverified(organisation_id),
+            "verification_required": verification_required(),
+            "free_accounts": {
+                "used": used,
+                "limit": cap,
+                "remaining": max(0, cap - used) if cap else 0,
+            },
+        }
+
+    @app.post("/admin/users/{user_id}/verify", dependencies=admin_gate_deps)
+    def admin_set_verified(user_id: str, req: VerificationOverrideRequest):
+        """Mark an address confirmed (or not) by hand.
+
+        The escape hatch for a user who cannot receive mail, and the only way
+        to revoke a confirmation we sent to the wrong person.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        if not user_store.get(user_id):
+            raise HTTPException(status_code=404, detail="User not found")
+        return user_store.set_verified(user_id, verified=req.verified)
+
+    @app.get("/admin/emails", dependencies=admin_gate_deps)
+    def admin_list_emails(limit: int = 50, offset: int = 0):
+        """Outbox, newest first. Only populated when no SMTP relay is set."""
+        if app.state.admin_store is None:
+            raise HTTPException(status_code=503, detail="Admin store is disabled")
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        store = app.state.admin_store
+        return {
+            "emails": store.list_emails(limit=limit, offset=offset),
+            "count": store.count_emails(),
+            "pending": store.count_emails(include_consumed=False),
+            "smtp_configured": email_sender.smtp_configured(),
+        }
+
+    @app.post("/admin/emails/{email_id}/consume", dependencies=admin_gate_deps)
+    def admin_consume_email(email_id: int):
+        """Mark an outbox message dealt with."""
+        if app.state.admin_store is None:
+            raise HTTPException(status_code=503, detail="Admin store is disabled")
+        row = app.state.admin_store.consume_email(email_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="Message not found")
+        return dict(row)
 
     @app.get("/admin/invites", dependencies=admin_gate_deps)
     def admin_list_invites():
@@ -1690,8 +3756,39 @@ def create_app(
                 invite_meta = admin_store.peek_invite(req.invite)
             except ValueError as e:
                 raise HTTPException(status_code=403, detail=str(e))
+        # D18: Q22 keeps self-registration open, so the free tier is capped at
+        # the account count rather than the other way round. Checked only for
+        # the free path -- an invite or a paid seat is not metered against it,
+        # and the cap exists to bound unverified self-service spend, not to
+        # ration paying customers.
+        cap = max_free_accounts()
+        if invite_meta is None and user_store is not None:
+            existing = user_store.count_users_in_organisation(SAMPLE_ORGANISATION_ID)
+            if existing >= cap:
+                log_audit(request, "auth.signup_capped", "user", None,
+                          f"email={req.email} cap={cap}")
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Free sign-up is temporarily full. Please try again "
+                        "later or contact us."
+                    ),
+                )
         try:
-            user = user_store.create_user(req.email, req.password, req.name, req.category)
+            # An invited account was vouched for by whoever issued the invite,
+            # so it starts verified; a self-service signup does not. The invite
+            # also decides where the account lands: its organisation and its
+            # workspace win over whatever the request carried, so a token
+            # issued for a customer cannot be redeemed into the free-tier pool
+            # and a caller cannot claim an arbitrary workspace by editing the
+            # form. An invite minted before invitations carried an organisation
+            # has none, and create_user keeps its free-tier default for those.
+            user = user_store.create_user(
+                req.email, req.password, req.name,
+                (invite_meta or {}).get("category") or req.category,
+                organisation_id=(invite_meta or {}).get("organisation_id"),
+                verified=invite_meta is not None,
+            )
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
         if invite_meta is not None:
@@ -1700,10 +3797,158 @@ def create_app(
             except ValueError as e:
                 user_store.delete_user(user["id"])
                 raise HTTPException(status_code=403, detail=str(e))
+        # The first account a customer organisation gets is its owner, however
+        # it arrived - an Administrator creating it, or the first seat to
+        # redeem an invite. Q9 keeps owner singular, so this grants nothing
+        # once an owner exists, and nothing for the platform-owned free tier.
+        user_store.ensure_initial_owner(user.get("organisation_id"), user["id"])
+        # An invite is how a seat joins a paying organisation, so the seat
+        # count it adds is metered like any other.
+        refresh_seat_usage(user.get("organisation_id"))
+        verification = None
+        if not user.get("email_verified_at"):
+            verification = _issue_and_send_verification(user, request)
         log_audit(request, "auth.signup", "user", user.get("id"),
-                  f"email={req.email} category={req.category} invite={bool(req.invite)}")
+                  f"email={req.email} category={req.category} invite={bool(req.invite)} "
+                  f"verified={bool(user.get('email_verified_at'))}")
         token = user_store.token_for(user)
-        return AuthResponse(token=token, user=user, workspace=workspace_summary(user["category"]))
+        return AuthResponse(
+            token=token,
+            user=user,
+            workspace=workspace_summary(user["category"]),
+            workspaces=user_workspaces(user),
+            verification=verification,
+        )
+
+    @app.post("/auth/verify-email")
+    def verify_email(req: VerificationRequest, request: Request):
+        """Confirm an address from a token in the link.
+
+        No auth required: the token is the credential, which is why it is
+        single-use and signed with its own purpose claim.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        try:
+            user_id = user_store.verify_email(req.token)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        log_audit(request, "auth.verify_email", "user", user_id, "")
+        if app.state.admin_store is not None:
+            # Ties the message in the outbox to the action taken on it, so the
+            # pending list empties when the user follows the link themselves.
+            for row in app.state.admin_store.list_emails(limit=200):
+                if f"?token={req.token}" in (row["body"] or "") and not row["consumed_at"]:
+                    app.state.admin_store.consume_email(row["id"])
+                    break
+        user = user_store.get(user_id)
+        return {
+            "verified": True,
+            "email": user["email"] if user else None,
+            "message": "Your email address is confirmed.",
+        }
+
+    @app.post("/auth/resend-verification", dependencies=rate_deps)
+    def resend_verification(request: Request, user: dict = user_dep):
+        """Send the confirmation again, with a per-user cooldown.
+
+        Auth is required so this cannot be used to mail-bomb an address, and
+        the response never reveals whether the account exists.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        full = user_store.get(user["id"])
+        if not full:
+            raise HTTPException(status_code=404, detail="Account not found")
+        if full.get("email_verified_at"):
+            return {"sent": False, "verified": True,
+                    "message": "That address is already confirmed."}
+        status = user_store.verification_status(full["id"]) or {}
+        sent_at = status.get("sent_at")
+        if sent_at and not _cooldown_elapsed(sent_at):
+            return {
+                "sent": False,
+                "verified": False,
+                "message": "A confirmation email was sent recently. Try again shortly.",
+            }
+        result = _issue_and_send_verification(full, request)
+        log_audit(request, "auth.resend_verification", "user", full["id"],
+                  f"sent={result.get('sent')}")
+        return {
+            "sent": bool(result.get("sent")),
+            "verified": False,
+            "message": (
+                "Confirmation email sent."
+                if result.get("sent")
+                else "Could not send mail right now. Try again shortly."
+            ),
+            "link": result.get("link"),
+        }
+
+    @app.post("/auth/forgot-password", dependencies=rate_deps)
+    def forgot_password(req: ForgotPasswordRequest, request: Request):
+        """Start a password reset by email.
+
+        The response is identical whether or not the address is registered, so
+        this endpoint cannot be used to discover which emails have accounts.
+        Mail goes out only for a real account, and only the newest link works.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        email = (req.email or "").strip().lower()
+        if not EMAIL_RE.match(email):
+            raise HTTPException(status_code=422, detail="That is not a valid email address.")
+        message = (
+            "If that address has an account, a reset link is on its way."
+        )
+        user = user_store.get_by_email(email)
+        if user is None:
+            log_audit(request, "auth.forgot_password", "user", None,
+                      "unknown address")
+            return {"sent": True, "message": message}
+        result = _issue_and_send_password_reset(user, request)
+        log_audit(request, "auth.forgot_password", "user", user["id"],
+                  f"sent={result.get('sent')}")
+        response = {"sent": True, "message": message}
+        # Only an outbox deployment gets the link back, so the response shape
+        # itself (and not just the matter-of-fact message) refuses to be an
+        # account probe.
+        if result.get("link"):
+            response["link"] = result["link"]
+        return response
+
+    @app.post("/auth/reset-password", response_model=AuthResponse)
+    def reset_password(req: ResetPasswordRequest, request: Request):
+        """Finish a reset from the token in the link and sign the user in.
+
+        No auth required: the token is the credential. Success returns a fresh
+        session token because the reset bumped the account's session version,
+        which signs out every other device.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        try:
+            user_id = user_store.reset_password(req.token, req.password)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        log_audit(request, "auth.reset_password", "user", user_id, "")
+        if app.state.admin_store is not None:
+            # Mirror the verify-email behaviour: a reset link a user followed
+            # themselves clears its outbox entry.
+            for row in app.state.admin_store.list_emails(limit=200):
+                if f"?token={req.token}" in (row["body"] or "") and not row["consumed_at"]:
+                    app.state.admin_store.consume_email(row["id"])
+                    break
+        user = user_store.get(user_id)
+        token = user_store.token_for(user)
+        return AuthResponse(
+            token=token,
+            user=user,
+            workspace=workspace_summary(user["category"]),
+            workspaces=user_workspaces(user),
+            verification=user_store.verification_status(user["id"])
+            if not user.get("email_verified_at") else None,
+        )
 
     @app.post("/auth/login", response_model=AuthResponse, dependencies=rate_deps)
     def login(req: LoginRequest):
@@ -1713,18 +3958,116 @@ def create_app(
         if not user:
             raise HTTPException(status_code=401, detail="Invalid email or password")
         user_store.mark_login(user["id"])
-        user["last_login"] = user_store.get(user["id"])["last_login"]
+        row = user_store.get(user["id"])
+        user["last_login"] = row.get("last_login") if row else None
+        if row and (row.get("account_status") or "active") == "suspended":
+            raise HTTPException(status_code=401, detail="Account suspended. Please contact an administrator.")
         token = user_store.token_for(user)
-        return AuthResponse(token=token, user=user, workspace=workspace_summary(user["category"]))
+        # Report the same state as /me, so a user returning on another device
+        # learns they must confirm before asking anything.
+        verification = None
+        if not user.get("email_verified_at"):
+            verification = user_store.verification_status(user["id"])
+        return AuthResponse(
+            token=token,
+            user=user,
+            workspace=workspace_summary(user["category"]),
+            workspaces=user_workspaces(user),
+            verification=verification,
+        )
 
     @app.get("/me", response_model=MeResponse)
     def me(user: dict = user_dep):
         profile = user
+        reachable = None
         if user_store is not None:
+            # Re-read from the store rather than trusting the token, so a
+            # membership granted after the token was issued takes effect without
+            # waiting for the token to expire. This also means a revoked
+            # workspace disappears from the switcher on the next /me.
             full = user_store.get(user["id"])
             if full:
                 profile = full
-        return MeResponse(user=profile, workspace=workspace_summary(profile["category"]))
+                reachable = reachable_categories(profile)
+        if not reachable:
+            # No user store, or a user with no membership rows: the token's
+            # claim list, else the single category.
+            reachable = user.get("workspaces") or [profile["category"]]
+        # The store row carries no memberships, so the reachable list is spliced
+        # in before validation. Returning the bare row here is what made every
+        # /me report an empty workspace list.
+        scoped = {**profile, "workspaces": reachable}
+        verification = None
+        if user_store is not None and not profile.get("email_verified_at"):
+            verification = user_store.verification_status(profile["id"])
+        organisation = None
+        if user_store is not None:
+            org = user_store.get_organisation(profile["organisation_id"])
+            if org:
+                organisation = {
+                    "id": org["id"],
+                    "name": org["name"],
+                    "system_owned": org["system_owned"],
+                    "plan": org.get("plan"),
+                    "billing_status": org.get("billing_status"),
+                    "current_period_end": org.get("current_period_end"),
+                    "role": user_store.org_role(profile["id"]),
+                }
+        return MeResponse(
+            user=scoped,
+            workspace=workspace_summary(profile["category"]),
+            workspaces=user_workspaces(scoped),
+            verification=verification,
+            organisation=organisation,
+            free_tier=free_tier_status(profile),
+        )
+
+    @app.post("/me/workspace")
+    def switch_workspace(req: WorkspaceSwitchRequest, user: dict = user_dep):
+        """Set the caller's active workspace.
+
+        Chat answers from the primary workspace, so this is what lets an owner
+        or admin move between the workspaces they administer, and what a member
+        uses to pick between the ones they hold. The target is checked against
+        the workspaces the caller may reach, so a crafted request cannot point
+        the account at another organisation's content.
+        """
+        cat = (req.category or "").strip().lower()
+        if cat not in reachable_categories(user):
+            raise HTTPException(
+                status_code=403, detail="That workspace is not available to this account."
+            )
+        extra = None
+        if user_store.org_role(user["id"]) in (ORG_ROLE_OWNER, ORG_ROLE_ADMIN):
+            extra = org_workspace_categories(user["organisation_id"])
+        user_store.set_primary_workspace(user["id"], cat, extra_categories=extra)
+        switched = {**user, "category": cat}
+        return {
+            "workspace": workspace_summary(cat),
+            "workspaces": user_workspaces(switched),
+        }
+
+    @app.post("/me/password")
+    def me_change_password(req: ChangePasswordRequest, request: Request,
+                           user: dict = user_dep):
+        """A user changes their own password.
+
+        Changing it signs out every device, including this one, so the response
+        carries a fresh session token minted against the new version for the
+        frontend to store.
+        """
+        try:
+            user_store.change_password(
+                user["id"], req.current_password, req.new_password
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        log_audit(request, "auth.change_password", "user", user["id"], "")
+        updated = user_store.get(user["id"])
+        return {
+            "token": user_store.token_for(updated),
+            "message": "Your password has been changed.",
+        }
 
     @app.post("/chat", response_model=ChatResponse, dependencies=rate_deps)
     async def chat(
@@ -1733,13 +4076,16 @@ def create_app(
         user: dict = user_dep,
         store=store_dep,
     ):
+        require_verified(user)
+        require_active_billing(user)
         session_id = resolve_session(request, req.session_id, user["id"], store)
         history = store.history(session_id, limit=req.history_limit)
-        bot = get_bot(request, user["category"])
+        bot = get_bot(request, user["category"], user.get("organisation_id"))
         tz = tz_offset_minutes(request)
         reply = smalltalk.handle(req.question, user["name"], user["category"], tz)
         sources = []
         if reply is None:
+            require_free_tier_quota(user)
             usage_events = []
             try:
                 reply = await run_in_threadpool(
@@ -1755,6 +4101,7 @@ def create_app(
             record_usage_events(
                 request, usage_events,
                 category=user["category"], user_id=user["id"], session_id=session_id,
+                organisation_id=user.get("organisation_id"),
             )
             sources = citation_refs(
                 getattr(bot, "last_results", []), citation_token_for(user)
@@ -1773,11 +4120,19 @@ def create_app(
         user: dict = user_dep,
         store=store_dep,
     ):
+        require_verified(user)
+        require_active_billing(user)
         session_id = resolve_session(request, req.session_id, user["id"], store)
         history = store.history(session_id, limit=req.history_limit)
-        bot = get_bot(request, user["category"])
+        bot = get_bot(request, user["category"], user.get("organisation_id"))
         tz = tz_offset_minutes(request)
         reply = smalltalk.handle(req.question, user["name"], user["category"], tz)
+
+        # Checked here rather than inside the generator so an exhausted free
+        # account gets a plain 402 before the stream opens, which is what the
+        # composer can turn into an upgrade prompt.
+        if reply is None:
+            require_free_tier_quota(user)
 
         def event_stream():
             chunks = []
@@ -1808,6 +4163,7 @@ def create_app(
                 record_usage_events(
                     request, usage_events,
                     category=user["category"], user_id=user["id"], session_id=session_id,
+                    organisation_id=user.get("organisation_id"),
                 )
                 store.append(session_id, "user", req.question)
                 store.append(
@@ -1853,6 +4209,8 @@ def create_app(
         voice is an adapter, not a pipeline of its own. Audio is metered as
         kind "stt" in units of seconds.
         """
+        require_verified(user)
+        require_active_billing(user)
         max_mb = int_env("VOICE_MAX_UPLOAD_MB", 5)
         max_bytes = max_mb * 1024 * 1024
         data = await file.read(max_bytes + 1)
@@ -1900,6 +4258,8 @@ def create_app(
         the Azure OpenAI speech endpoint returns mp3. Both play in every
         browser, so the client just takes whatever arrives.
         """
+        require_verified(user)
+        require_active_billing(user)
         max_chars = int_env("VOICE_TTS_MAX_CHARS", 4000)
         if len(req.text) > max_chars:
             raise HTTPException(
@@ -1926,7 +4286,9 @@ def create_app(
         request: Request,
         user: dict = user_dep,
     ):
-        bot = get_bot(request, user["category"])
+        require_verified(user)
+        require_active_billing(user)
+        bot = get_bot(request, user["category"], user.get("organisation_id"))
         try:
             results = await run_in_threadpool(
                 bot.retrieve, question=req.question, k=req.k, source=req.source
@@ -1956,8 +4318,12 @@ def create_app(
         right for the common case but goes stale in a long-lived session. This
         re-issues one without reloading the conversation.
         """
+        require_verified(user)
+        require_active_billing(user)
         try:
-            resolve_document(user["category"], req.source)
+            resolve_document(
+                user["category"], req.source, user.get("organisation_id")
+            )
         except DocumentNotFound:
             raise HTTPException(status_code=404, detail="Document not found")
         mint = citation_token_for(user)
@@ -2035,7 +4401,12 @@ def create_app(
         if not effective:
             raise HTTPException(status_code=404, detail="Document not found")
         try:
-            path = resolve_document(identity["category"], effective)
+            # The organisation comes from the live user record, not the token, so
+            # moving a user between organisations immediately invalidates links
+            # already in their browser history.
+            path = resolve_document(
+                identity["category"], effective, identity.get("organisation_id")
+            )
         except DocumentNotFound:
             raise HTTPException(status_code=404, detail="Document not found")
         log_audit(
@@ -2077,6 +4448,68 @@ def create_app(
         for category in categories:
             yield get_bot(request, category)
 
+    def org_workspace_bots(request: Request):
+        """Per-organisation workspace bots for re-indexing.
+
+        The /ingest endpoints walk the global workspace tree, but assigned
+        content lives per organisation: copies are materialised under
+        data/organisations/<org>/<cat> and indexed into that organisation's own
+        vector store (get_org_bot). A re-index that stops at the global tree
+        reports success while rebuilding nothing, so an org-mode deployment also
+        walks every provisioned organisation workspace. Explicitly injected
+        registries (which supply their own bots for every organisation) and
+        single-bot apps keep winning, and empty user stores contribute nothing.
+        """
+        app_ = request.app
+        if app_.state.bot is not None or app_.state.workspace_registry:
+            return
+        if user_store is None:
+            return
+        for org in user_store.list_organisations():
+            for category in user_store.organisation_workspace_categories(org["id"]):
+                yield get_org_bot(request, org["id"], category)
+
+    def global_reindex_bots(request: Request):
+        """Legacy global-tree bots, but only for workspaces that hold files.
+
+        In a multi-tenant deployment the global tree is pre-organisation content:
+        usually empty, so indexing it answers nothing. Building a bot for an empty
+        workspace still creates its vector store file on open, so a re-index would
+        leave a fresh empty .index/vectors_<cat>.sqlite3 behind. Reconstructing a
+        global bot only when its data dir actually has content keeps legacy
+        single-tenant re-indexing working while an org-only deployment never
+        recreates the legacy stores. Injected bots and registries are authoritative
+        for every workspace, empty or not, so they bypass the check.
+        """
+        app_ = request.app
+        if app_.state.bot is not None or app_.state.workspace_registry:
+            yield from iter_workspace_bots(request)
+            return
+        if app_.state.workspace_config:
+            categories = list(app_.state.workspace_config)
+        else:
+            categories = workspace_names()
+        for category in categories:
+            data = Path(root_data_dir()) / category
+            if data.is_dir() and any(data.iterdir()):
+                yield get_bot(request, category)
+
+    def workspace_reindex_categories(request: Request, category: str | None):
+        """Organisations holding a workspace, the legacy global tree aside."""
+        if request.app.state.bot is not None or request.app.state.workspace_registry:
+            return []
+        if user_store is None:
+            return []
+        orgs = []
+        for org in user_store.list_organisations():
+            cats = user_store.organisation_workspace_categories(org["id"])
+            if category is None:
+                for cat in cats:
+                    orgs.append((org["id"], cat))
+            elif category in cats:
+                orgs.append((org["id"], category))
+        return orgs
+
     @app.post("/ingest", response_model=IngestResponse, dependencies=auth_deps)
     async def ingest(request: Request):
         started = time.time()
@@ -2087,7 +4520,11 @@ def create_app(
             "stale_chunks_removed": 0,
             "documents_failed": 0,
         }
-        for bot in iter_workspace_bots(request):
+        bots = [
+            get_org_bot(request, org_id, cat)
+            for org_id, cat in workspace_reindex_categories(request, None)
+        ] + list(global_reindex_bots(request))
+        for bot in bots:
             stats = await run_in_threadpool(bot.read_and_embed_data)
             for key in totals:
                 totals[key] += getattr(stats, key, 0)
@@ -2097,11 +4534,34 @@ def create_app(
 
     @app.post("/ingest/{category}", response_model=IngestResponse, dependencies=auth_deps)
     async def ingest_category(category: str, request: Request):
-        bot = get_bot(request, category)
         started = time.time()
-        stats = await run_in_threadpool(bot.read_and_embed_data)
+        if request.app.state.bot is not None or request.app.state.workspace_registry:
+            bots = [get_bot(request, category)]
+        else:
+            if category not in workspace_names():
+                raise HTTPException(
+                    status_code=403, detail=f"Unknown workspace: {category}"
+                )
+            bots = [
+                get_org_bot(request, org_id, cat)
+                for org_id, cat in workspace_reindex_categories(request, category)
+            ]
+            data = Path(root_data_dir()) / category
+            if data.is_dir() and any(data.iterdir()):
+                bots.append(get_bot(request, category))
+        totals = {
+            "documents_seen": 0,
+            "documents_reindexed": 0,
+            "chunks_upserted": 0,
+            "stale_chunks_removed": 0,
+            "documents_failed": 0,
+        }
+        for bot in bots:
+            stats = await run_in_threadpool(bot.read_and_embed_data)
+            for key in totals:
+                totals[key] += getattr(stats, key, 0)
         return IngestResponse(
-            **stats.__dict__, duration_seconds=round(time.time() - started, 1)
+            **totals, duration_seconds=round(time.time() - started, 1)
         )
 
     @app.get("/ingest/status", dependencies=auth_deps)
@@ -2130,6 +4590,32 @@ def create_app(
         if not store.delete(session_id, user_id=user["id"]):
             raise HTTPException(status_code=404, detail="Session not found")
         return {"deleted": session_id}
+
+    # Billing (D3): the receiving half of the payment loop. Registered inside
+    # create_app so the webhook can reach the per-request stores; it has no
+    # meaning without user accounts, which is why it is skipped when they are
+    # disabled. The checkout half is owner-only: buying and choosing a plan is
+    # an owner decision (proposal 4.5), so it rides on user_dep plus the
+    # owner-restricted org guard.
+    if user_store is not None:
+
+        def checkout_dep(caller: dict = user_dep):
+            org, role = _require_org_manager(caller, allow_owner_only=True)
+            return org, caller
+
+        def usage_dep(caller: dict = user_dep):
+            require_verified(caller)
+            org = user_store.get_organisation(caller.get("organisation_id"))
+            if org is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail="You are not in an organisation yet.",
+                )
+            return org, caller
+
+        billing.register_billing_routes(
+            app, user_store, checkout_dep=checkout_dep, usage_dep=usage_dep
+        )
 
     return app
 

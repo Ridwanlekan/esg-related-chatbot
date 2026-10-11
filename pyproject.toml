@@ -21,6 +21,7 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "prometheus-client",
+    "stripe>=12.0.0",
 ]
 
 [project.optional-dependencies]

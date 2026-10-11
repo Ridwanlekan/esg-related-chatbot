@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reset your password · ESG Assistant</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#127968;</text></svg>">
+  <style>
+    :root { --bg: #0b1220; --panel: #111c30; --line: #1f2d45;
+            --text: #e6edf7; --muted: #93a4bf; --ok: #34d399; --bad: #f87171; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center;
+      justify-content: center; background: var(--bg); color: var(--text);
+      font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 24px;
+    }
+    .card {
+      width: 100%; max-width: 460px; background: var(--panel);
+      border: 1px solid var(--line); border-radius: 14px; padding: 28px;
+    }
+    h1 { font-size: 20px; margin: 0 0 10px; }
+    p { color: var(--muted); margin: 0 0 14px; }
+    .status { padding: 12px 14px; border-radius: 9px; font-size: 14px; }
+    .status.pending { background: rgba(251,191,36,.1); border: 1px solid rgba(251,191,36,.4); }
+    .status.ok { background: rgba(52,211,153,.1); border: 1px solid rgba(52,211,153,.4); }
+    .status.bad { background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.4); }
+    .status.hidden { display: none; }
+    label { display: block; font-size: 13px; color: var(--muted); margin: 14px 0 4px; }
+    input[type=password] {
+      width: 100%; padding: 10px 12px; border-radius: 8px;
+      border: 1px solid var(--line); background: #0b1220; color: var(--text);
+      font-size: 15px;
+    }
+    a.button, button.button {
+      display: inline-block; margin-top: 18px; padding: 9px 16px; border-radius: 8px;
+      background: #1d4ed8; color: #fff; text-decoration: none; font-size: 14px;
+      border: none; cursor: pointer;
+    }
+    button.button:disabled { opacity: .5; cursor: default; }
+    .muted { font-size: 12px; color: var(--muted); margin-top: 14px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Reset your password</h1>
+    <p>Choose a new password for your ESG Assistant account.</p>
+    <div id="status" class="status hidden"></div>
+    <label for="pw1">New password</label>
+    <input id="pw1" type="password" autocomplete="new-password" minlength="8" required>
+    <label for="pw2">Repeat it</label>
+    <input id="pw2" type="password" autocomplete="new-password" minlength="8" required>
+    <button id="go" class="button">Set password</button>
+    <a id="continue" class="button hidden" href="/ui">Open the app</a>
+    <p class="muted">
+      The link works once and expires in 2 hours. Signing in with your new
+      password signs other devices out.
+    </p>
+  </div>
+<script>
+const $ = (id) => document.getElementById(id);
+const status = $("status");
+const token = new URLSearchParams(location.search).get("token");
+
+function show(text, cls) {
+  status.className = "status " + cls;
+  status.textContent = text;
+}
+
+async function submit() {
+  const pw1 = $("pw1").value;
+  const pw2 = $("pw2").value;
+  if (!pw1 || pw1.length < 8) { show("Password must be at least 8 characters.", "bad"); return; }
+  if (pw1 !== pw2) { show("The two passwords do not match.", "bad"); return; }
+  if (!token) {
+    show("This link is missing its reset code. Request a new reset link.", "bad");
+    return;
+  }
+  $("go").disabled = true;
+  $("go").textContent = "Saving…";
+  status.classList.add("hidden");
+  try {
+    const res = await fetch("/auth/reset-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, password: pw1 }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      localStorage.setItem("esg_token", data.token);
+      show("Your password is set and you are signed in.", "ok");
+      $("continue").classList.remove("hidden");
+      return;
+    }
+    show(data.detail || "That link could not be used. Request a new reset link.", "bad");
+  } catch (e) {
+    show("We could not reach the server. Try again in a moment.", "bad");
+  } finally {
+    $("go").disabled = false;
+    $("go").textContent = "Set password";
+  }
+}
+$("go").addEventListener("click", submit);
+["pw1", "pw2"].forEach((id) =>
+  $(id).addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); }));
+</script>
+</body>
+</html>

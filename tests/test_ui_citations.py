@@ -34,7 +34,10 @@ function el(tag) {
     focus() {},
   };
 }
-global.document = { createElement: el, getElementById: () => el("div") };
+global.document = {
+  createElement: el, getElementById: () => el("div"),
+  addEventListener() {},
+};
 global.location = { search: "", hash: "", href: "", assign() {} };
 global.window = { location: global.location };
 global.localStorage = { getItem: () => null, setItem() {}, removeItem() {} };

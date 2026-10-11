@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Confirm your email · ESG Assistant</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#127968;</text></svg>">
+  <style>
+    :root { --bg: #0b1220; --panel: #111c30; --line: #1f2d45;
+            --text: #e6edf7; --muted: #93a4bf; --ok: #34d399; --bad: #f87171; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center;
+      justify-content: center; background: var(--bg); color: var(--text);
+      font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 24px;
+    }
+    .card {
+      width: 100%; max-width: 460px; background: var(--panel);
+      border: 1px solid var(--line); border-radius: 14px; padding: 28px;
+    }
+    h1 { font-size: 20px; margin: 0 0 10px; }
+    p { color: var(--muted); margin: 0 0 14px; }
+    .status { padding: 12px 14px; border-radius: 9px; font-size: 14px; }
+    .status.pending { background: rgba(251,191,36,.1); border: 1px solid rgba(251,191,36,.4); }
+    .status.ok { background: rgba(52,211,153,.1); border: 1px solid rgba(52,211,153,.4); }
+    .status.bad { background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.4); }
+    .status.hidden { display: none; }
+    a.button, button.button {
+      display: inline-block; margin-top: 18px; padding: 9px 16px; border-radius: 8px;
+      background: #1d4ed8; color: #fff; text-decoration: none; font-size: 14px;
+      border: none; cursor: pointer;
+    }
+    button.button:disabled { opacity: .5; cursor: default; }
+    .muted { font-size: 12px; color: var(--muted); margin-top: 14px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Confirm your email address</h1>
+    <p>One step and your ESG Assistant workspace is ready.</p>
+    <div id="status" class="status pending">Confirming…</div>
+    <a id="continue" class="button hidden" href="/ui">Open the app</a>
+    <p class="muted">
+      The link works once and expires in 48 hours. If it has expired, sign in
+      and use “Resend email”.
+    </p>
+  </div>
+<script>
+const $ = (id) => document.getElementById(id);
+const status = $("status");
+
+function show(text, cls) {
+  status.className = "status " + cls;
+  status.textContent = text;
+}
+
+const token = new URLSearchParams(location.search).get("token");
+
+async function confirm() {
+  if (!token) {
+    show("This link is missing its confirmation code. Sign in and request a new one.", "bad");
+    return;
+  }
+  try {
+    const res = await fetch("/auth/verify-email", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      show("Your address is confirmed. You can start asking questions.", "ok");
+      $("continue").classList.remove("hidden");
+      return;
+    }
+    show(data.detail || "That link could not be used.", "bad");
+  } catch (e) {
+    show("We could not reach the server. Try again in a moment.", "bad");
+  }
+}
+confirm();
+</script>
+</body>
+</html>

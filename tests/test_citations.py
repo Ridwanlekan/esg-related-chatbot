@@ -237,6 +237,7 @@ def client(data_dir):
 
 
 def _token(client, email, category):
+    """A confirmed account: these tests are about citations, not D18."""
     res = client.post(
         "/auth/signup",
         json={
@@ -247,6 +248,7 @@ def _token(client, email, category):
         },
     )
     assert res.status_code == 200, res.text
+    client.app.state.user_store.set_verified(res.json()["user"]["id"])
     return res.json()["token"]
 
 

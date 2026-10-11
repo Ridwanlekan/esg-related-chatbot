@@ -50,6 +50,7 @@ global.document = {
   createElement: el,
   getElementById(id) { return byId[id] || (byId[id] = el("div")); },
   querySelectorAll: () => [],
+  addEventListener() {},
 };
 global.location = { search: "", hash: "", href: "", assign() {} };
 global.window = { location: global.location, isSecureContext: true };

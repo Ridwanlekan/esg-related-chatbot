@@ -58,6 +58,7 @@ class RAGBot:
         self.store = SQLiteVecStore(db_path=store_path, dim=EMBEDDING_DIM)
         self.last_results = []
         self._reranker = None
+        self._ingest_lock = threading.Lock()
         self.candidate_k = int(os.environ.get("CANDIDATE_K", "30"))
         self.max_generation_tokens = int(os.environ.get("MAX_GENERATION_TOKENS", "600"))
 
@@ -183,6 +184,25 @@ class RAGBot:
         telemetry.index_chunks.set(self.store.count())
         return stats
 
+    def _ensure_indexed(self):
+        """Index this workspace on first use when nothing is indexed yet.
+
+        Copying a document into a workspace is not the same as making it
+        askable. The sample pack is materialised at startup with no reindex
+        behind it, so on a fresh deployment - or in any workspace content was
+        just assigned into - the first question would otherwise reach this
+        code and fail with an engineering message. Ingestion is incremental
+        and keyed on the document hash, so an empty store is the only state
+        in which this does any work, and the lock keeps two first questions
+        from embedding the same file at the same time.
+        """
+        if self.store.count() > 0:
+            return
+        with self._ingest_lock:
+            if self.store.count() > 0:
+                return
+            self.ingest()
+
     def read_and_embed_data(self, folder_path=None):
         return self.ingest(folder_path=folder_path)
 
@@ -205,7 +225,15 @@ class RAGBot:
 
     def retrieve(self, question, k=3, source=None, history=None, usage_sink=None):
         if self.store.count() == 0:
-            raise RuntimeError("call ingest() before retrieve()")
+            # A workspace nobody has indexed yet: index it now, and if that
+            # finds nothing to index, say so in words a visitor can read
+            # rather than handing them the call that would fix it.
+            self._ensure_indexed()
+            if self.store.count() == 0:
+                raise RuntimeError(
+                    "This workspace has no documents yet. An administrator "
+                    "has to assign some to it."
+                )
         started = time.monotonic()
         rewritten = self.rewrite_question_for_retrieval(question, history, usage_sink)
         query_embedding = self._embed([rewritten])[0]

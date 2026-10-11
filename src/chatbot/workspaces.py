@@ -127,6 +127,23 @@ def system_prompt_for(category):
     )
 
 
+def organisation_workspace_config(organisation_id, category):
+    """Config for one organisation's workspace: its own data dir and its own index.
+
+    Phase 2 made assignment the only access control (Section 3.4). Serving content
+    per organisation is only real if the index is per organisation too: two
+    organisations both holding a "finance" workspace would otherwise share one
+    vector store, and one could retrieve the other's material. The imported
+    module is local because content_library imports this one.
+    """
+    from chatbot import content_library
+
+    return {
+        "data_dir": str(content_library.workspace_dir(organisation_id, category)),
+        "store_path": str(content_library.index_dir_for(organisation_id, category)),
+    }
+
+
 def make_workspace_bot(category, config=None):
     from chatbot.rag import RAGBot
 

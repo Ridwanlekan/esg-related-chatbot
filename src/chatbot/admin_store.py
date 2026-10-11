@@ -78,7 +78,8 @@ class AdminStore:
             "uses INTEGER NOT NULL DEFAULT 0, "
             "created_at TEXT NOT NULL, "
             "expires_at TEXT NOT NULL, "
-            "actor TEXT)"
+            "actor TEXT, "
+            "organisation_id TEXT)"
         )
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS usage ("
@@ -93,7 +94,8 @@ class AdminStore:
             "category TEXT, "
             "user_id TEXT, "
             "session_id TEXT, "
-            "request_id TEXT)"
+            "request_id TEXT, "
+            "organisation_id TEXT)"
         )
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS settings ("
@@ -123,13 +125,192 @@ class AdminStore:
             "created_at TEXT NOT NULL, "
             "PRIMARY KEY (filename, category))"
         )
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS library_docs ("
+            "filename TEXT PRIMARY KEY, "
+            "subject TEXT, "
+            "jurisdiction TEXT, "
+            "effective_date TEXT, "
+            "version TEXT, "
+            "size INTEGER NOT NULL DEFAULT 0, "
+            "created_at TEXT NOT NULL, "
+            "actor TEXT)"
+        )
+        # Section 3.4: assignment is the only access control, and each act is
+        # recorded with who made it and when, so the audit log can answer which
+        # content an organisation was given. Scoped per organisation rather than
+        # per workspace so an org's full content set is one query.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS content_assignments ("
+            "organisation_id TEXT NOT NULL, "
+            "category TEXT NOT NULL, "
+            "filename TEXT NOT NULL, "
+            "assigned_at TEXT NOT NULL, "
+            "actor TEXT, "
+            "PRIMARY KEY (organisation_id, category, filename))"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_content_assignments_org "
+            "ON content_assignments(organisation_id)"
+        )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_usage_at ON usage(at)")
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_usage_category ON usage(category)"
         )
+        # Outgoing mail (D18). Present so a deployment without an SMTP relay can
+        # still complete verification by hand instead of blocking signups.
+        # `consumed_at` is set when someone acts on the message, which is the
+        # event that matters for onboarding, not when it is read.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS email_outbox ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "to_address TEXT NOT NULL, "
+            "subject TEXT NOT NULL, "
+            "body TEXT NOT NULL, "
+            "html_body TEXT, "
+            "created_at TEXT NOT NULL, "
+            "consumed_at TEXT)"
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_email_outbox_created "
+            "ON email_outbox(created_at)"
+        )
         self.conn.commit()
         self._migrate_usage_units()
+        self._migrate_usage_organisation()
+        self._migrate_invites_organisation()
+
+    # ---- outbox (D18) ------------------------------------------------------
+
+    def record_email(self, to_address, subject, body, html_body=None):
+        cursor = self.conn.execute(
+            "INSERT INTO email_outbox (to_address, subject, body, html_body, "
+            "created_at) VALUES (?, ?, ?, ?, ?)",
+            (to_address, subject, body, html_body, _now()),
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
+    def list_emails(self, limit=50, offset=0, include_consumed=True):
+        """Newest first, so the message a new signup awaits sits at the top."""
+        sql = "SELECT * FROM email_outbox"
+        if not include_consumed:
+            sql += " WHERE consumed_at IS NULL"
+        sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        return [dict(r) for r in self.conn.execute(sql, (limit, offset)).fetchall()]
+
+    def count_emails(self, include_consumed=False):
+        sql = "SELECT COUNT(*) FROM email_outbox"
+        if not include_consumed:
+            sql += " WHERE consumed_at IS NULL"
+        return self.conn.execute(sql).fetchone()[0]
+
+    def consume_email(self, email_id):
+        """Mark a message dealt with, so it drops off the pending list."""
+        self.conn.execute(
+            "UPDATE email_outbox SET consumed_at = ? "
+            "WHERE id = ? AND consumed_at IS NULL",
+            (_now(), email_id),
+        )
+        self.conn.commit()
+        return self.conn.execute(
+            "SELECT * FROM email_outbox WHERE id = ?", (email_id,)
+        ).fetchone()
+
+    # ---- master library and content assignment (Section 3.4) ---------------
+
+    def add_library_doc(
+        self, filename, size=0, subject=None, jurisdiction=None,
+        effective_date=None, version=None, actor="",
+    ):
+        """Register a curated master document. Idempotent on filename."""
+        self.conn.execute(
+            "INSERT INTO library_docs (filename, subject, jurisdiction, "
+            "effective_date, version, size, created_at, actor) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(filename) DO UPDATE SET subject=excluded.subject, "
+            "jurisdiction=excluded.jurisdiction, "
+            "effective_date=excluded.effective_date, version=excluded.version, "
+            "size=excluded.size, actor=excluded.actor",
+            (filename, subject, jurisdiction, effective_date, version, size,
+             _now(), actor),
+        )
+        self.conn.commit()
+        return self.get_library_doc(filename)
+
+    def get_library_doc(self, filename):
+        row = self.conn.execute(
+            "SELECT * FROM library_docs WHERE filename = ?", (filename,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_library_docs(self, subject=None):
+        """The curated master library, for the admin console to assign from."""
+        if subject:
+            rows = self.conn.execute(
+                "SELECT * FROM library_docs WHERE subject = ? ORDER BY filename",
+                (subject,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM library_docs ORDER BY filename"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def remove_library_doc(self, filename):
+        cur = self.conn.execute(
+            "DELETE FROM library_docs WHERE filename = ?", (filename,)
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def add_content_assignment(self, organisation_id, category, filename, actor=""):
+        """Record that an organisation was given a document (idempotent)."""
+        self.conn.execute(
+            "INSERT OR IGNORE INTO content_assignments "
+            "(organisation_id, category, filename, assigned_at, actor) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (organisation_id, category, filename, _now(), actor),
+        )
+        self.conn.commit()
+
+    def remove_content_assignment(self, organisation_id, category, filename):
+        cur = self.conn.execute(
+            "DELETE FROM content_assignments "
+            "WHERE organisation_id = ? AND category = ? AND filename = ?",
+            (organisation_id, category, filename),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def list_content_assignments(self, organisation_id=None, category=None):
+        if organisation_id and category:
+            rows = self.conn.execute(
+                "SELECT * FROM content_assignments "
+                "WHERE organisation_id = ? AND category = ? ORDER BY filename",
+                (organisation_id, category),
+            ).fetchall()
+        elif organisation_id:
+            rows = self.conn.execute(
+                "SELECT * FROM content_assignments "
+                "WHERE organisation_id = ? ORDER BY category, filename",
+                (organisation_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM content_assignments ORDER BY organisation_id, "
+                "category, filename"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def assigned_filenames(self, organisation_id, category):
+        rows = self.conn.execute(
+            "SELECT filename FROM content_assignments "
+            "WHERE organisation_id = ? AND category = ?",
+            (organisation_id, category),
+        ).fetchall()
+        return [r["filename"] for r in rows]
 
     def _migrate_usage_units(self):
         """Add the generic non-token unit count (voice seconds/characters).
@@ -143,6 +324,42 @@ class AdminStore:
         }
         if "units" not in cols:
             self.conn.execute("ALTER TABLE usage ADD COLUMN units REAL")
+            self.conn.commit()
+
+    def _migrate_usage_organisation(self):
+        """Attribute usage rows to an organisation, which is what billing counts.
+
+        Questions are billed to the organisation rather than the person who
+        asked, and the question pool is per organisation per period, so a row
+        without an owner cannot be counted at all. Rows written before this
+        column existed simply read NULL and are excluded from the pool, which
+        under-counts rather than over-counts a customer.
+        """
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(usage)").fetchall()
+        }
+        if "organisation_id" not in cols:
+            self.conn.execute("ALTER TABLE usage ADD COLUMN organisation_id TEXT")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_org_period "
+            "ON usage(organisation_id, kind, at)"
+        )
+        self.conn.commit()
+
+    def _migrate_invites_organisation(self):
+        """Add the organisation an invite belongs to.
+
+        Lazy ALTER, so a database opened by an older build keeps working: its
+        invites simply have no organisation and redeem into the free tier,
+        which is what those tokens always did.
+        """
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(invites)").fetchall()
+        }
+        if "organisation_id" not in cols:
+            self.conn.execute("ALTER TABLE invites ADD COLUMN organisation_id TEXT")
             self.conn.commit()
 
     def list_workspaces(self):
@@ -301,16 +518,20 @@ class AdminStore:
     def _hash_token(token):
         return hashlib.sha256((token or "").encode("utf-8")).hexdigest()
 
-    def create_invite(self, category, label=None, max_uses=1, ttl_hours=168, actor=""):
+    def create_invite(self, category, label=None, max_uses=1, ttl_hours=168,
+                      actor="", organisation_id=None):
         cat = validate_category(category)
         token = secrets.token_urlsafe(24)
         now = datetime.now(timezone.utc)
         expires = now + timedelta(hours=int(ttl_hours))
+        org = (organisation_id or "").strip() or None
         self.conn.execute(
             "INSERT INTO invites (token, category, label, max_uses, uses, "
-            "created_at, expires_at, actor) VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
+            "created_at, expires_at, actor, organisation_id) "
+            "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)",
             (self._hash_token(token), cat, (label or "").strip() or None,
-             int(max(1, max_uses)), now.isoformat(), expires.isoformat(), actor or ""),
+             int(max(1, max_uses)), now.isoformat(), expires.isoformat(),
+             actor or "", org),
         )
         self.conn.commit()
         return {
@@ -321,12 +542,13 @@ class AdminStore:
             "uses": 0,
             "created_at": now.isoformat(),
             "expires_at": expires.isoformat(),
+            "organisation_id": org,
         }
 
     def _invite_row(self, token_hash):
         return self.conn.execute(
-            "SELECT category, label, max_uses, uses, expires_at FROM invites "
-            "WHERE token = ?",
+            "SELECT category, label, max_uses, uses, expires_at, organisation_id "
+            "FROM invites WHERE token = ?",
             (token_hash,),
         ).fetchone()
 
@@ -342,6 +564,7 @@ class AdminStore:
             "category": row["category"],
             "label": row["label"],
             "expires_at": row["expires_at"],
+            "organisation_id": row["organisation_id"],
         }
 
     @staticmethod
@@ -357,7 +580,7 @@ class AdminStore:
         return True, None
 
     def redeem_invite(self, token):
-        """Consume one use of an invite and return its category/label."""
+        """Consume one use of an invite and return its category/org binding."""
         token_hash = self._hash_token(token)
         row = self._invite_row(token_hash)
         if row is None:
@@ -369,14 +592,22 @@ class AdminStore:
             "UPDATE invites SET uses = uses + 1 WHERE token = ?", (token_hash,)
         )
         self.conn.commit()
-        return {"category": row["category"], "label": row["label"]}
+        return {"category": row["category"], "label": row["label"],
+                "organisation_id": row["organisation_id"]}
 
-    def list_invites(self):
+    def list_invites(self, organisation_id=None):
         now = datetime.now(timezone.utc)
-        rows = self.conn.execute(
-            "SELECT category, label, max_uses, uses, created_at, expires_at, actor "
-            "FROM invites ORDER BY created_at DESC"
-        ).fetchall()
+        sql = (
+            "SELECT category, label, max_uses, uses, created_at, expires_at, "
+            "actor, organisation_id "
+            "FROM invites"
+        )
+        params = []
+        if organisation_id:
+            sql += " WHERE organisation_id = ?"
+            params.append(organisation_id)
+        sql += " ORDER BY created_at DESC"
+        rows = self.conn.execute(sql, params).fetchall()
         invites = []
         for r in rows:
             usable, reason = self._invite_status(r)
@@ -405,18 +636,22 @@ class AdminStore:
         user_id=None,
         session_id=None,
         request_id=None,
+        organisation_id=None,
     ):
         """Append one metered usage row. Best-effort, never raises.
 
         `units` is the generic non-token meter: seconds of audio for kind
         "stt", characters for kind "tts". Token-based kinds leave it None.
+        `organisation_id` is what makes the row billable: the question pool
+        belongs to the organisation, not to the person who asked.
         """
         try:
             with self._lock:
                 self.conn.execute(
                     "INSERT INTO usage (at, kind, model, prompt_tokens, "
                     "completion_tokens, duration_s, units, category, user_id, "
-                    "session_id, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "session_id, request_id, organisation_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         _now(),
                         kind,
@@ -429,11 +664,61 @@ class AdminStore:
                         user_id,
                         session_id,
                         request_id,
+                        organisation_id,
                     ),
                 )
                 self.conn.commit()
         except sqlite3.Error:
             pass
+
+    def questions_in_period(self, organisation_id, since=None):
+        """Questions an organisation has asked since `since` (ISO-8601).
+
+        Counted from rows written as kind "question" - one per request that
+        reached the model - rather than from the LLM rows underneath it, which
+        are several per question (a rewrite and an answer both log usage).
+        Voice and search rows are therefore never counted either: speech is
+        bundled (Q18) and a search generates no answer.
+        """
+        if not organisation_id:
+            return 0
+        sql = (
+            "SELECT COUNT(*) FROM usage "
+            "WHERE organisation_id = ? AND kind = 'question'"
+        )
+        params = [organisation_id]
+        if since:
+            sql += " AND at >= ?"
+            params.append(since)
+        try:
+            with self._lock:
+                row = self.conn.execute(sql, params).fetchone()
+            return int(row[0] or 0)
+        except sqlite3.Error:
+            return 0
+
+    def questions_for_user(self, user_id, since=None):
+        """Questions one account has asked since `since` (ISO-8601).
+
+        The free tier has no owner to bill and no period, so its cap is
+        per account rather than per organisation: this is the counterpart of
+        `questions_in_period` keyed on `user_id` instead. Rows of kind
+        "question" are one per answered request, so the count is the number of
+        model answers the account has had.
+        """
+        if not user_id:
+            return 0
+        sql = "SELECT COUNT(*) FROM usage WHERE user_id = ? AND kind = 'question'"
+        params = [user_id]
+        if since:
+            sql += " AND at >= ?"
+            params.append(since)
+        try:
+            with self._lock:
+                row = self.conn.execute(sql, params).fetchone()
+            return int(row[0] or 0)
+        except sqlite3.Error:
+            return 0
 
     @staticmethod
     def _nonneg_float(value, default):
@@ -444,6 +729,22 @@ class AdminStore:
             return parsed
         except (TypeError, ValueError):
             return default
+
+    def get_setting(self, key, default=None):
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        return row[0] if row and row[0] is not None else default
+
+    def set_setting(self, key, value):
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(value)),
+            )
+            self.conn.commit()
+        return self.get_setting(key)
 
     def get_rates(self):
         rows = self.conn.execute("SELECT key, value FROM settings").fetchall()
@@ -511,8 +812,12 @@ class AdminStore:
             + (completion_tokens or 0) / 1_000_000 * rates["price_output_per_m"]
         )
 
-    def _usage_rows(self, range_days=None, category=None):
+    def _usage_rows(self, range_days=None, category=None, organisation_id=None):
         where, params = [], []
+        # Billing's question rows share this table but are not LLM calls:
+        # including them would inflate the call count on the cost page and
+        # count the same request twice, once as tokens and once as a question.
+        where.append("kind <> 'question'")
         if range_days:
             cutoff = (datetime.now(timezone.utc) - timedelta(days=range_days)).isoformat()
             where.append("at >= ?")
@@ -520,20 +825,32 @@ class AdminStore:
         if category:
             where.append("category = ?")
             params.append(category)
-        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        if organisation_id:
+            # Scopes an owner's cost view to their own organisation. The
+            # platform console leaves it unset and keeps seeing everything.
+            where.append("organisation_id = ?")
+            params.append(organisation_id)
+        clause = " WHERE " + " AND ".join(where)
         return self.conn.execute(
             f"SELECT * FROM usage{clause} ORDER BY id", params
         ).fetchall()
 
-    def usage_stats(self, range_days=None, category=None, top_users=DEFAULT_USAGE_TOP_USERS):
+    def usage_stats(self, range_days=None, category=None, top_users=DEFAULT_USAGE_TOP_USERS,
+                    organisation_id=None):
         """Aggregate usage and estimate cost. All aggregation in Python to
-        stay robust against ISO-8601/offset variants in the stored timestamps.
+        stay robust to ISO-8601/offset variants in the stored timestamps.
 
         Cost is accumulated per row because a bucket (workspace, user, day)
         can mix token kinds with voice kinds, whose rates are not comparable:
         a bucket's cost is the sum of its rows' costs, each computed by kind.
+
+        `organisation_id` restricts the aggregation to one organisation's rows,
+        which is what lets an owner see their own cost without the platform
+        console's cross-customer totals.
         """
-        rows = self._usage_rows(range_days=range_days, category=category)
+        rows = self._usage_rows(
+            range_days=range_days, category=category, organisation_id=organisation_id
+        )
         rates = self.get_rates()
 
         totals = {"calls": len(rows), "prompt_tokens": 0, "completion_tokens": 0,

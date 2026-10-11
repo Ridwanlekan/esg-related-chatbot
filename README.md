@@ -126,10 +126,37 @@ POST /chat (Authorization: Bearer <jwt>, X-Timezone-Offset: <minutes>) →
 | `POST /auth/signup` | create account (`email`, `password` ≥8 chars, `name`, `category`) → `{token, user, workspace}` |
 | `POST /auth/login` | verify credentials → new token (default 7-day TTL, configurable via `TOKEN_TTL_SECONDS`) |
 | `GET /me` | current user profile + workspace meta (label, emoji, blurb) |
+| `POST /auth/verify-email` | confirm an address from the link (`token`) |
+| `POST /auth/resend-verification` | send the confirmation again (auth required, rate-limited) |
+| `GET /verify-email` | the landing page the emailed link opens |
 
 User chat endpoints require `Authorization: Bearer <jwt>`. `AUTH_SECRET` signs the tokens — set it in production (tokens are invalidated on restart if it's missing, since an ephemeral secret is used).
 
 - Account passwords are hashed with PBKDF2-HMAC-SHA256 (200k iterations, per-user salt).
+
+#### Free-account verification and cap (D18)
+
+Free self-registration stays open (Q22), so it is bounded by an email
+confirmation and a cap on how many free accounts exist. Both only apply to the
+shared free organisation; paid, invited and admin-created seats start confirmed.
+
+| Variable | Default | Effect |
+| -------- | ------- | ------ |
+| `MAX_FREE_ACCOUNTS` | `500` | Cap on free accounts. At the cap, self-signup returns 503; `0` closes it entirely. |
+| `EMAIL_VERIFICATION_REQUIRED` | `1` | Set `0` to run without the gate (a deployment with no mail path can still onboard). |
+| `VERIFICATION_TOKEN_TTL_HOURS` | `48` | Lifetime of a confirmation link. |
+
+`SMTP_HOST` (plus `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`) sends
+real mail through a relay. **With no `SMTP_HOST`, mail is written to the admin
+outbox instead**: the signup response and `GET /admin/emails` both carry the
+confirmation link, so nobody is locked out for want of a relay. Set
+`public_base_url` in admin settings so links match the public hostname.
+
+An unconfirmed free account is refused at `/chat`, `/chat/stream`, `/search`,
+`/voice/*` and `/documents/link`, with 403 and an explanation. `/me` and
+`/auth/resend-verification` stay reachable so the user can recover. Operators
+can confirm or revoke from `/admin/verifications` and
+`POST /admin/users/{id}/verify`.
 
 ## Retrieval pipeline
 
