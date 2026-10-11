@@ -16,4 +16,4 @@ models/
 build/
 dist/
 *.log
-.DS_Store
+.DS_Storedata
