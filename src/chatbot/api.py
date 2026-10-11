@@ -71,12 +71,14 @@ from chatbot.security import RateLimiter, int_env, make_auth_check, make_rate_li
 from chatbot.session_store import SessionStore
 from chatbot import users as users_mod
 from chatbot.users import (
+    EMAIL_RE,
     ORG_ROLE_ADMIN,
     ORG_ROLE_OWNER,
     ORG_ROLES,
     SAMPLE_ORGANISATION_ID,
     UserStore,
     max_free_accounts,
+    max_free_questions,
     verification_required,
     verify_jwt,
 )
@@ -101,10 +103,18 @@ DEFAULT_SESSIONS_PATH = os.path.join(INDEX_DIR, "sessions.sqlite3")
 DEFAULT_USERS_PATH = os.path.join(INDEX_DIR, "users.sqlite3")
 UI_FILE = Path(__file__).with_name("static") / "ui.html"
 ADMIN_FILE = Path(__file__).with_name("static") / "admin.html"
+# The organisation console (owner/admin analytics and billing). Separate from
+# the chat UI because it answers a different question - how the organisation is
+# doing - and its Chat link hands the reader back to the chat UI.
+OWNER_FILE = Path(__file__).with_name("static") / "owner.html"
 # Landing page for the email-confirmation link (D18). Separate from the app UI
 # because the person following the link has usually not signed in on this
 # device, so there is no session to show them the app with.
 VERIFY_FILE = Path(__file__).with_name("static") / "verify.html"
+# Landing page for the password-reset link. Same reasoning as the verification
+# page: the person clicking has usually not signed in, so there is no app
+# session to render into.
+RESET_FILE = Path(__file__).with_name("static") / "reset.html"
 DEFAULT_WORKSPACES_DB = os.path.join(INDEX_DIR, "workspaces.sqlite3")
 
 _DEFAULT = object()
@@ -296,6 +306,7 @@ class UserResponse(BaseModel):
     # D18: absent on rows predating the column and on tokens minted before it
     # existed, so it stays optional rather than breaking those sessions.
     email_verified: bool | None = None
+    account_status: str | None = "active"
 
 
 class AuthResponse(BaseModel):
@@ -316,6 +327,35 @@ class ResendVerificationRequest(BaseModel):
     pass
 
 
+class ForgotPasswordRequest(BaseModel):
+    # The address to send a reset link to. The response is the same whether or
+    # not the account exists, so this form cannot be used to probe for emails.
+    email: str = Field(min_length=3, max_length=320)
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=8, max_length=2048)
+    password: str = Field(min_length=8, max_length=256)
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
+class AdminPasswordResetRequest(BaseModel):
+    # An owner/admin resetting a member's password. The password is set
+    # directly and must be shared out of band; the member can change it after
+    # signing in. The account's other sessions are signed out.
+    password: str = Field(min_length=8, max_length=256)
+
+
+class WorkspaceSwitchRequest(BaseModel):
+    # The workspace the caller wants to make active. Validated against the
+    # workspaces they may actually reach, never trusted as a category name.
+    category: str = Field(min_length=1, max_length=64)
+
+
 class MeResponse(BaseModel):
     user: UserResponse
     workspace: dict
@@ -330,6 +370,11 @@ class MeResponse(BaseModel):
     # owner subscribes). Stripe ids are deliberately not included: this is a
     # user-facing payload, not an admin one.
     organisation: dict | None = None
+    # Free-tier runway, non-null only for an account in the shared sample
+    # workspace: cap, used, remaining and whether the cap has been reached. The
+    # frontend uses it to show the remaining count and, at zero, why asking is
+    # blocked and how to upgrade.
+    free_tier: dict | None = None
 
 
 class WorkspaceCreateRequest(BaseModel):
@@ -417,6 +462,16 @@ class OrgMemberCreateRequest(BaseModel):
 
 class OrgSelfRoleRequest(BaseModel):
     role: str = Field(default="", max_length=20)
+    account_status: str | None = Field(default=None, max_length=20)
+
+
+class OrgSelfInviteRequest(BaseModel):
+    # No organisation_id: an owner/admin may only mint seats for their own
+    # organisation, so the target is taken from the caller's account.
+    category: str = Field(min_length=2, max_length=40)
+    label: str | None = Field(default=None, max_length=120)
+    max_uses: int = Field(default=1, ge=1, le=100)
+    ttl_hours: int = Field(default=168, ge=1, le=2160)
 
 
 class OrgSelfWorkspacesRequest(BaseModel):
@@ -864,6 +919,17 @@ def create_app(
             row = user_store.get(payload["sub"])
             if not row:
                 raise HTTPException(status_code=401, detail="Missing or invalid token")
+            if (row.get("account_status") or "active") == "suspended":
+                raise HTTPException(status_code=401, detail="Account suspended. Please contact an administrator.")
+            # A password change moves the account's session generation. A token
+            # minted before that carries an older number and is refused here,
+            # which is what makes "change password" sign the other devices out.
+            # Tokens with no claim read as 0, the value of an untouched account.
+            if int(payload.get("v", 0)) != user_store.token_version(row["id"]):
+                raise HTTPException(
+                    status_code=401,
+                    detail="Your session has ended. Please sign in again.",
+                )
             return {
                 "id": row["id"],
                 "email": row["email"],
@@ -872,9 +938,10 @@ def create_app(
                 "organisation_id": row["organisation_id"],
                 # Membership is read live for the same reason: a grant or a
                 # move should take effect without waiting for a new token.
-                "workspaces": user_store.workspace_categories(row["id"]),
+                "workspaces": reachable_categories(row),
                 "created_at": row["created_at"],
                 "email_verified_at": row.get("email_verified_at"),
+                "account_status": (row.get("account_status") or "active"),
             }
 
     else:
@@ -1149,6 +1216,48 @@ def create_app(
             ),
         )
 
+    def free_tier_status(user):
+        """How much of the free allowance an account has left, or None.
+
+        Only an account in the shared sample organisation is on the free tier;
+        a seat in a customer organisation is governed by that organisation's
+        plan instead. `cap` of 0 means the ceiling is switched off.
+        """
+        if user_store is None or user.get("organisation_id") != SAMPLE_ORGANISATION_ID:
+            return None
+        cap = max_free_questions()
+        store = app.state.admin_store
+        used = store.questions_for_user(user["id"]) if store is not None else 0
+        remaining = max(0, cap - used) if cap else None
+        return {
+            "cap": cap,
+            "used": used,
+            "remaining": remaining,
+            "limited": bool(cap),
+            "reached": bool(cap) and used >= cap,
+        }
+
+    def require_free_tier_quota(user):
+        """Refuse a free-tier account that has used up its question allowance.
+
+        Checked only once a question is known to need the model - small talk
+        never reaches the model and does not count - and answered with 402 so
+        the frontend renders it as an upgrade prompt rather than a generic
+        error. A paid seat is never subject to this: only the ownerless sample
+        organisation is.
+        """
+        status = free_tier_status(user)
+        if not status or not status["reached"]:
+            return
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "You've used all {} questions on the free plan. Upgrade to a "
+                "paid workspace to keep asking — open the Billing page to "
+                "choose a plan.".format(status["cap"])
+            ),
+        )
+
     def public_base_url(request: Request):
         """The origin a verification link should point at.
 
@@ -1215,6 +1324,45 @@ def create_app(
             # Surface the link so a no-SMTP deployment can onboard the user
             # without reading the database.
             result["link"] = f"{base_url.rstrip('/')}/verify-email?token={token}"
+        return result
+
+    def _issue_and_send_password_reset(user, request=None):
+        """Mint a reset token and get the message away.
+
+        Mirrors `_issue_and_send_verification`: the plaintext token is returned
+        only so an outbox deployment can hand the link over directly. A send
+        failure is swallowed because the account still exists and a fresh link
+        can be requested; failing here would turn a mail outage into a locked
+        account.
+        """
+        token = user_store.issue_password_reset_token(user["id"])
+        sender = email_sender.build_sender(app.state.admin_store)
+        base_url = public_base_url(request) if request is not None else None
+        if base_url is None:
+            base_url = public_base_url_from_settings(app.state.admin_store)
+        result = {"sent": False}
+        try:
+            delivered = email_sender.send_password_reset_email(
+                sender, user["email"], base_url, token
+            )
+            result["sent"] = bool(delivered)
+        except Exception as exc:  # pragma: no cover - exercised via sender failure
+            logger.warning(
+                "password reset mail failed for %s: %s; falling back to outbox",
+                user.get("id"), exc,
+            )
+            if app.state.admin_store is not None:
+                app.state.admin_store.record_email(
+                    user["email"],
+                    email_sender.password_reset_subject(base_url),
+                    email_sender.password_reset_body(base_url, token),
+                    html_body=email_sender.password_reset_html(base_url, token),
+                )
+            result["sent"] = False
+        if sender.name() == "outbox" and base_url:
+            # Surface the link so a no-SMTP deployment can still exercise the
+            # flow; a real relay never returns it.
+            result["link"] = f"{base_url.rstrip('/')}/reset-password?token={token}"
         return result
 
     @app.get("/metrics")
@@ -1295,10 +1443,23 @@ def create_app(
             else "<h1>Verification page not found</h1>"
         )
 
+    @app.get("/reset-password", response_class=HTMLResponse)
+    def reset_password_page():
+        return _ui_html(
+            RESET_FILE.read_text() if RESET_FILE.exists()
+            else "<h1>Password reset page not found</h1>"
+        )
+
     @app.get("/admin", response_class=HTMLResponse)
     def admin():
         return _ui_html(
             ADMIN_FILE.read_text() if ADMIN_FILE.exists() else "<h1>Admin UI not found</h1>"
+        )
+
+    @app.get("/owner", response_class=HTMLResponse)
+    def owner():
+        return _ui_html(
+            OWNER_FILE.read_text() if OWNER_FILE.exists() else "<h1>Owner UI not found</h1>"
         )
 
     @app.get("/admin/config")
@@ -1578,6 +1739,43 @@ def create_app(
             return source_names, chunk_count
         except sqlite3.Error:
             return set(), 0
+
+    def org_workspace_categories(organisation_id):
+        """Every workspace that belongs to an organisation.
+
+        The union of the workspaces its members hold seats in and the workspaces
+        it has content indexed under. Owners and admins reach all of these, so a
+        manager is never locked out of a workspace they can administer. The
+        content half cannot be read from the user store, which is why this lives
+        where the index paths are known.
+        """
+        cats = set(user_store.organisation_workspace_categories(organisation_id))
+        for cat in workspace_names():
+            if cat in cats:
+                continue
+            try:
+                data_dir = _scope_data_dir(cat, organisation_id)
+                index_path = _scope_index_path(cat, organisation_id)
+            except HTTPException:
+                continue
+            if data_dir.is_dir() or index_path.exists():
+                cats.add(cat)
+        return sorted(cats)
+
+    def reachable_categories(user):
+        """Workspaces a user may reach, organisation managers included.
+
+        A member reaches exactly their own memberships. An organisation owner or
+        admin additionally reaches every workspace in their organisation, so
+        they can enter what they administer. Read live on every authenticated
+        request, so granting or revoking takes effect without a new token.
+        """
+        if user_store is None:
+            return list(user.get("workspaces") or [user.get("category")])
+        extra = None
+        if user_store.org_role(user["id"]) in (ORG_ROLE_OWNER, ORG_ROLE_ADMIN):
+            extra = org_workspace_categories(user["organisation_id"])
+        return user_store.reachable_workspaces(user["id"], extra)
 
     def _indexed_sources(cat, organisation_id=None):
         return _vector_stats(cat, organisation_id)[0]
@@ -2694,17 +2892,47 @@ def create_app(
                 status_code=409, detail="You cannot remove your own admin role."
             )
         try:
-            if wanted:
-                user_store.set_org_role(org["id"], user_id, wanted)
-            else:
-                user_store.revoke_org_role(org["id"], user_id)
+            if req.role is not None:
+                if wanted:
+                    user_store.set_org_role(org["id"], user_id, wanted)
+                else:
+                    user_store.revoke_org_role(org["id"], user_id)
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e))
+        if req.account_status is not None:
+            try:
+                user_store.update_user(user_id, account_status=req.account_status)
+            except ValueError as e:
+                raise HTTPException(status_code=422, detail=str(e))
         log_audit(
             request, "org.role_change", "user", user_id,
             f"org={org['id']} role={wanted or 'none'} actor_role={role}",
         )
-        return {"user_id": user_id, "role": wanted or None}
+        final = user_store.get(user_id)
+        role_after = user_store.org_role(user_id) if final else None
+        return {"user_id": user_id, "role": role_after, "account_status": (final.get("account_status") or "active") if final else (req.account_status or (final.get("account_status") if final else "active"))}
+
+    @app.post("/org/members/{user_id}/reset-password")
+    def org_reset_member_password(user_id: str, req: AdminPasswordResetRequest,
+                                  request: Request, caller: dict = user_dep):
+        """An owner or admin sets a member's password directly.
+
+        The new password has to be handed to the member out of band (email,
+        chat, or in person). Setting it signs every existing session of that
+        account out, so a member whose access has been compromised cannot
+        stay logged in. A member can change it themselves afterwards.
+        """
+        org, role = _require_org_manager(caller)
+        target = _member_in_caller_org(caller, user_id)
+        try:
+            user_store.update_user(user_id, password=req.password)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        log_audit(
+            request, "org.member_password_reset", "user", user_id,
+            f"org={org['id']} actor_role={role}",
+        )
+        return {"user_id": user_id, "sent": True}
 
     @app.post("/org/members/{user_id}/workspaces")
     def org_set_member_workspaces(user_id: str, req: OrgSelfWorkspacesRequest,
@@ -2761,6 +2989,168 @@ def create_app(
             f"org={org['id']} from={caller['id']}",
         )
         return {"organisation_id": org["id"], "owner": target["id"]}
+
+    # ---- organisation console (owner/admin analytics) ----------------------
+    #
+    # The owner's dashboard is the org-scoped twin of the platform console:
+    # same questions (how much have we used, who is here, what is indexed),
+    # answered from the caller's own organisation and nothing else. Every route
+    # is manager-gated and takes the organisation from the caller's account, so
+    # none of them can be pointed at another customer.
+
+    def _org_content_workspaces(org):
+        """Per-workspace index and content status for one organisation."""
+        seats = {r["category"]: r for r in user_store.organisation_workspace_seats(org["id"])}
+        member_cats = set(user_store.organisation_workspace_categories(org["id"]))
+        rows = []
+        total_chunks = 0
+        for cat in workspace_names():
+            db = _scope_index_path(cat, org["id"])
+            chunks = sources = 0
+            if db.exists():
+                try:
+                    conn = sqlite3.connect(db)
+                    chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+                    sources = len(
+                        conn.execute("SELECT DISTINCT source FROM chunks").fetchall()
+                    )
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            data = _scope_data_dir(cat, org["id"])
+            files = sorted(p.name for p in data.iterdir()) if data.is_dir() else []
+            seat_count = int((seats.get(cat) or {}).get("seats") or 0)
+            if not seat_count and not chunks and not files and cat not in member_cats:
+                # Neither assigned content, nor a seat, nor an index: the
+                # workspace is not part of this organisation, so it is left out
+                # rather than shown empty the way the global console does.
+                continue
+            total_chunks += chunks or 0
+            meta = workspace_meta(cat)
+            rows.append(
+                {
+                    "category": cat,
+                    "label": meta.get("label", cat.title()),
+                    "emoji": meta.get("emoji"),
+                    "blurb": meta.get("blurb"),
+                    "chunks": chunks,
+                    "sources": sources,
+                    "data_file_count": len(files),
+                    "data_files": files,
+                    "seats": seat_count,
+                    "indexed": (chunks or 0) > 0,
+                }
+            )
+        return rows, total_chunks
+
+    @app.get("/org/overview")
+    def org_overview(caller: dict = user_dep):
+        """One organisation's dashboard: plan, usage, seats, people, content."""
+        org, role = _require_org_manager(caller)
+        store = app.state.admin_store
+        members = user_store.list_users_in_organisation(org["id"], limit=1000)
+        roles = {u["id"]: user_store.org_role(u["id"]) for u in members}
+        by_role = {}
+        for u in members:
+            key = roles.get(u["id"]) or "member"
+            by_role[key] = by_role.get(key, 0) + 1
+        workspaces, total_chunks = _org_content_workspaces(org)
+        billing_usage = billing.usage_summary(user_store, store, org)
+        invites = store.list_invites(organisation_id=org["id"]) if store else []
+        return {
+            "organisation": {
+                "id": org["id"],
+                "name": org["name"],
+                "system_owned": org["system_owned"],
+                "plan": org.get("plan"),
+                "billing_status": org.get("billing_status"),
+                "current_period_start": org.get("current_period_start"),
+                "current_period_end": org.get("current_period_end"),
+            },
+            "your_role": role,
+            "billing": billing_usage,
+            "members": {"total": len(members), "by_role": by_role},
+            "invites": {
+                "total": len(invites),
+                "pending": len([i for i in invites if i.get("valid")]),
+            },
+            "workspaces": workspaces,
+            "totals": {
+                "workspaces": len(workspaces),
+                "chunks": total_chunks,
+                "members": len(members),
+                "questions_used": billing_usage["questions"]["used"],
+            },
+        }
+
+    @app.get("/org/plans")
+    def org_plans(caller: dict = user_dep):
+        """Plan tiers an owner may purchase, with what each includes."""
+        _require_org_manager(caller)
+        return {"plans": billing.plan_catalog()}
+
+    @app.get("/org/usage")
+    def org_usage(range: str = "7d", category: str | None = None,
+                  caller: dict = user_dep):
+        """Token and cost analytics for the caller's own organisation."""
+        org, _role = _require_org_manager(caller)
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Usage tracking is disabled")
+        range_days = {"24h": 1, "7d": 7, "30d": 30}.get(range)
+        if range != "all" and range_days is None:
+            raise HTTPException(status_code=422, detail="range must be 24h, 7d, 30d or all")
+        return store.usage_stats(
+            range_days=range_days,
+            category=category or None,
+            organisation_id=org["id"],
+        )
+
+    @app.get("/org/content")
+    def org_content(caller: dict = user_dep):
+        """What is indexed under each of the caller's organisation workspaces."""
+        org, _role = _require_org_manager(caller)
+        workspaces, total_chunks = _org_content_workspaces(org)
+        return {
+            "organisation_id": org["id"],
+            "workspaces": workspaces,
+            "totals": {"workspaces": len(workspaces), "chunks": total_chunks},
+        }
+
+    @app.get("/org/invites")
+    def org_invites(caller: dict = user_dep):
+        """Invitations minted for the caller's own organisation."""
+        org, _role = _require_org_manager(caller)
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Invites are not enabled")
+        return {"organisation_id": org["id"], "invites": store.list_invites(org["id"])}
+
+    @app.post("/org/invites")
+    def org_create_invite(req: OrgSelfInviteRequest, request: Request,
+                          caller: dict = user_dep):
+        """Mint a seat invitation for the caller's own organisation."""
+        org, role = _require_org_manager(caller)
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Invites are not enabled")
+        if req.category not in workspace_names():
+            raise HTTPException(
+                status_code=422, detail=f"Unknown workspace: {req.category}"
+            )
+        invite = store.create_invite(
+            req.category,
+            label=req.label,
+            max_uses=req.max_uses,
+            ttl_hours=req.ttl_hours,
+            actor=caller.get("email", ""),
+            organisation_id=org["id"],
+        )
+        log_audit(
+            request, "org.invite_create", "workspace", req.category,
+            f"org={org['id']} max_uses={req.max_uses} actor_role={role}",
+        )
+        return invite
 
     @app.get("/admin/organisations/{organisation_id}/members",
              dependencies=admin_gate_deps)
@@ -3495,6 +3885,71 @@ def create_app(
             "link": result.get("link"),
         }
 
+    @app.post("/auth/forgot-password", dependencies=rate_deps)
+    def forgot_password(req: ForgotPasswordRequest, request: Request):
+        """Start a password reset by email.
+
+        The response is identical whether or not the address is registered, so
+        this endpoint cannot be used to discover which emails have accounts.
+        Mail goes out only for a real account, and only the newest link works.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        email = (req.email or "").strip().lower()
+        if not EMAIL_RE.match(email):
+            raise HTTPException(status_code=422, detail="That is not a valid email address.")
+        message = (
+            "If that address has an account, a reset link is on its way."
+        )
+        user = user_store.get_by_email(email)
+        if user is None:
+            log_audit(request, "auth.forgot_password", "user", None,
+                      "unknown address")
+            return {"sent": True, "message": message}
+        result = _issue_and_send_password_reset(user, request)
+        log_audit(request, "auth.forgot_password", "user", user["id"],
+                  f"sent={result.get('sent')}")
+        response = {"sent": True, "message": message}
+        # Only an outbox deployment gets the link back, so the response shape
+        # itself (and not just the matter-of-fact message) refuses to be an
+        # account probe.
+        if result.get("link"):
+            response["link"] = result["link"]
+        return response
+
+    @app.post("/auth/reset-password", response_model=AuthResponse)
+    def reset_password(req: ResetPasswordRequest, request: Request):
+        """Finish a reset from the token in the link and sign the user in.
+
+        No auth required: the token is the credential. Success returns a fresh
+        session token because the reset bumped the account's session version,
+        which signs out every other device.
+        """
+        if user_store is None:
+            raise HTTPException(status_code=503, detail="User accounts are disabled")
+        try:
+            user_id = user_store.reset_password(req.token, req.password)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        log_audit(request, "auth.reset_password", "user", user_id, "")
+        if app.state.admin_store is not None:
+            # Mirror the verify-email behaviour: a reset link a user followed
+            # themselves clears its outbox entry.
+            for row in app.state.admin_store.list_emails(limit=200):
+                if f"?token={req.token}" in (row["body"] or "") and not row["consumed_at"]:
+                    app.state.admin_store.consume_email(row["id"])
+                    break
+        user = user_store.get(user_id)
+        token = user_store.token_for(user)
+        return AuthResponse(
+            token=token,
+            user=user,
+            workspace=workspace_summary(user["category"]),
+            workspaces=user_workspaces(user),
+            verification=user_store.verification_status(user["id"])
+            if not user.get("email_verified_at") else None,
+        )
+
     @app.post("/auth/login", response_model=AuthResponse, dependencies=rate_deps)
     def login(req: LoginRequest):
         if user_store is None:
@@ -3503,7 +3958,10 @@ def create_app(
         if not user:
             raise HTTPException(status_code=401, detail="Invalid email or password")
         user_store.mark_login(user["id"])
-        user["last_login"] = user_store.get(user["id"])["last_login"]
+        row = user_store.get(user["id"])
+        user["last_login"] = row.get("last_login") if row else None
+        if row and (row.get("account_status") or "active") == "suspended":
+            raise HTTPException(status_code=401, detail="Account suspended. Please contact an administrator.")
         token = user_store.token_for(user)
         # Report the same state as /me, so a user returning on another device
         # learns they must confirm before asking anything.
@@ -3530,7 +3988,7 @@ def create_app(
             full = user_store.get(user["id"])
             if full:
                 profile = full
-                reachable = user_store.workspace_categories(user["id"])
+                reachable = reachable_categories(profile)
         if not reachable:
             # No user store, or a user with no membership rows: the token's
             # claim list, else the single category.
@@ -3561,7 +4019,55 @@ def create_app(
             workspaces=user_workspaces(scoped),
             verification=verification,
             organisation=organisation,
+            free_tier=free_tier_status(profile),
         )
+
+    @app.post("/me/workspace")
+    def switch_workspace(req: WorkspaceSwitchRequest, user: dict = user_dep):
+        """Set the caller's active workspace.
+
+        Chat answers from the primary workspace, so this is what lets an owner
+        or admin move between the workspaces they administer, and what a member
+        uses to pick between the ones they hold. The target is checked against
+        the workspaces the caller may reach, so a crafted request cannot point
+        the account at another organisation's content.
+        """
+        cat = (req.category or "").strip().lower()
+        if cat not in reachable_categories(user):
+            raise HTTPException(
+                status_code=403, detail="That workspace is not available to this account."
+            )
+        extra = None
+        if user_store.org_role(user["id"]) in (ORG_ROLE_OWNER, ORG_ROLE_ADMIN):
+            extra = org_workspace_categories(user["organisation_id"])
+        user_store.set_primary_workspace(user["id"], cat, extra_categories=extra)
+        switched = {**user, "category": cat}
+        return {
+            "workspace": workspace_summary(cat),
+            "workspaces": user_workspaces(switched),
+        }
+
+    @app.post("/me/password")
+    def me_change_password(req: ChangePasswordRequest, request: Request,
+                           user: dict = user_dep):
+        """A user changes their own password.
+
+        Changing it signs out every device, including this one, so the response
+        carries a fresh session token minted against the new version for the
+        frontend to store.
+        """
+        try:
+            user_store.change_password(
+                user["id"], req.current_password, req.new_password
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        log_audit(request, "auth.change_password", "user", user["id"], "")
+        updated = user_store.get(user["id"])
+        return {
+            "token": user_store.token_for(updated),
+            "message": "Your password has been changed.",
+        }
 
     @app.post("/chat", response_model=ChatResponse, dependencies=rate_deps)
     async def chat(
@@ -3579,6 +4085,7 @@ def create_app(
         reply = smalltalk.handle(req.question, user["name"], user["category"], tz)
         sources = []
         if reply is None:
+            require_free_tier_quota(user)
             usage_events = []
             try:
                 reply = await run_in_threadpool(
@@ -3620,6 +4127,12 @@ def create_app(
         bot = get_bot(request, user["category"], user.get("organisation_id"))
         tz = tz_offset_minutes(request)
         reply = smalltalk.handle(req.question, user["name"], user["category"], tz)
+
+        # Checked here rather than inside the generator so an exhausted free
+        # account gets a plain 402 before the stream opens, which is what the
+        # composer can turn into an upgrade prompt.
+        if reply is None:
+            require_free_tier_quota(user)
 
         def event_stream():
             chunks = []

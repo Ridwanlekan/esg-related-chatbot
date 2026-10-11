@@ -1,0 +1,744 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Organisation Console · ESG Workspace Chatbot</title>
+<style>
+  :root {
+    --bg: #0f1520; --panel: #17202f; --panel-2: #1e293b; --border: #2b3a52;
+    --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; --accent-2: #0ea5e9;
+    --ok: #4ade80; --warn: #fbbf24; --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); min-height: 100vh;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .spacer { flex: 1; }
+  .badge {
+    font-size: 11px; padding: 3px 10px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted); white-space: nowrap;
+  }
+  .badge.ok { color: var(--ok); border-color: rgba(74,222,128,.4); }
+  .badge.warn { color: var(--warn); border-color: rgba(251,191,36,.4); }
+  .badge.err { color: var(--err); border-color: rgba(248,113,113,.4); }
+  .badge.accent { color: var(--accent); border-color: rgba(56,189,248,.4); }
+  main { max-width: 1040px; margin: 0 auto; padding: 22px 20px 60px; }
+  a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  button {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent-2); color: #062033; border-color: transparent; font-weight: 600; }
+  button.danger { color: var(--err); border-color: rgba(248,113,113,.4); }
+  button.small { padding: 5px 10px; font-size: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  input, select {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 10px; font-size: 14px;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+  .muted { color: var(--muted); font-size: 12px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 18px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .tabs button {
+    border-radius: 8px 8px 0 0; border: 1px solid transparent; border-bottom: none;
+    background: transparent; color: var(--muted); padding: 10px 16px; font-weight: 600;
+  }
+  .tabs button.active { background: var(--panel); border-color: var(--border); color: var(--text); }
+  .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .total { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }
+  .total .num { font-size: 26px; font-weight: 700; }
+  .total .lbl { color: var(--muted); font-size: 12px; margin-top: 2px; text-transform: uppercase; letter-spacing: .04em; }
+  .workspace {
+    display: flex; align-items: center; gap: 14px; padding: 12px 14px;
+    border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); margin-bottom: 10px;
+  }
+  .ws-emoji { font-size: 22px; }
+  .ws-meta { flex: 1; min-width: 0; }
+  .ws-meta .title { font-weight: 600; font-size: 14px; }
+  .ws-meta .stats { color: var(--muted); font-size: 12px; margin-top: 3px; overflow-wrap: anywhere; }
+  .ws-meta .stats b { color: var(--text); }
+  .ws-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .actions { display: flex; gap: 10px; margin: 14px 0; flex-wrap: wrap; }
+  .table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .table th { text-align: left; color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 8px; border-bottom: 1px solid var(--border); }
+  .table td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .table tr:last-child td { border-bottom: none; }
+  .tag { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+  .tag.custom { color: var(--accent); border-color: rgba(56,189,248,.4); }
+  .tag.ok { color: var(--ok); border-color: rgba(74,222,128,.4); }
+  .tag.warn { color: var(--warn); border-color: rgba(251,191,36,.4); }
+  .tag.err { color: var(--err); border-color: rgba(248,113,113,.4); }
+  .row-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; align-items: end; }
+  .row-form .field label { display: block; font-size: 11px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: .04em; }
+  .bar-row { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 12px; }
+  .bar-row .bl { flex: 0 0 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  .bar-track { flex: 1; background: var(--panel-2); border-radius: 6px; height: 12px; overflow: hidden; }
+  .bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent-2), var(--accent)); }
+  .bar-row .bv { flex: 0 0 140px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .legend { display: flex; gap: 16px; font-size: 11px; color: var(--muted); margin: 6px 0 10px; flex-wrap: wrap; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: middle; }
+  .usage-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .plans { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+  .plan { border: 1px solid var(--border); border-radius: 12px; padding: 16px; background: var(--panel-2); display: flex; flex-direction: column; gap: 10px; }
+  .plan.current { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(56,189,248,.3); }
+  .plan .pname { font-size: 15px; font-weight: 700; }
+  .plan .pmeta { font-size: 12px; color: var(--muted); flex: 1; }
+  .plan .pmeta b { color: var(--text); }
+  .meter { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; height: 14px; overflow: hidden; margin: 6px 0 2px; }
+  .meter .fill { height: 100%; background: linear-gradient(90deg, var(--accent-2), var(--accent)); }
+  .meter .fill.over { background: linear-gradient(90deg, var(--warn), var(--err)); }
+  .footer { text-align: center; color: var(--muted); font-size: 11px; margin-top: 30px; }
+  .hidden { display: none !important; }
+  #toasts { position: fixed; bottom: 18px; right: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 100; max-width: 380px; }
+  .toast {
+    background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 10px; padding: 12px 14px; font-size: 13px; box-shadow: 0 6px 20px rgba(0,0,0,.4);
+    animation: slidein .18s ease;
+  }
+  .toast.ok { border-left-color: var(--ok); }
+  .toast.err { border-left-color: var(--err); }
+  .toast.warn { border-left-color: var(--warn); }
+  @keyframes slidein { from { opacity: 0; transform: translateX(10px); } to { opacity: 1; transform: none; } }
+  @media (max-width: 760px) { .usage-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🏢 <span id="org-name">Organisation</span></h1>
+  <span id="plan-badge" class="badge">…</span>
+  <span class="spacer"></span>
+  <button id="change-pass" class="small">Change password</button>
+  <a href="/ui">↗ Chat app</a>
+  <button id="logout" class="small">Log out</button>
+</header>
+
+<main>
+  <div id="gate" class="card hidden">
+    <h2>Sign in required</h2>
+    <p class="muted">The organisation console is for organisation owners and admins. Sign in to the workspace first, then return here.</p>
+    <a href="/ui"><button class="primary">Go to sign in</button></a>
+  </div>
+
+  <div id="console" class="hidden">
+    <div class="tabs">
+      <button id="tab-overview" class="active">Overview</button>
+      <button id="tab-analytics">Analytics</button>
+      <button id="tab-people">People</button>
+      <button id="tab-billing">Billing</button>
+    </div>
+
+    <section id="view-overview">
+      <div class="totals" id="overview-totals"></div>
+      <div class="card">
+        <h2>Workspaces &amp; content</h2>
+        <div id="overview-workspaces"><div class="muted">Loading…</div></div>
+      </div>
+      <div class="card" id="overview-notice-wrap">
+        <h2>Subscription</h2>
+        <div id="overview-billing"><div class="muted">Loading…</div></div>
+      </div>
+    </section>
+
+    <section id="view-analytics" class="hidden">
+      <div class="toolbar" style="display:flex;gap:10px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+        <select id="usage-range">
+          <option value="24h">Last 24 hours</option>
+          <option value="7d" selected>Last 7 days</option>
+          <option value="30d">Last 30 days</option>
+          <option value="all">All time</option>
+        </select>
+        <button id="btn-refresh-usage" class="primary">Refresh</button>
+        <span class="muted" id="usage-note"></span>
+      </div>
+      <div class="totals" id="analytics-totals"></div>
+      <div class="card"><h2>Tokens per period</h2><div id="usage-chart"><div class="muted">Loading…</div></div></div>
+      <div class="usage-grid">
+        <div class="card"><h2>By workspace</h2><div id="usage-by-category"><div class="muted">Loading…</div></div></div>
+        <div class="card"><h2>By call type</h2><div id="usage-by-kind"><div class="muted">Loading…</div></div></div>
+      </div>
+    </section>
+
+    <section id="view-people" class="hidden">
+      <div class="card">
+        <h2>Add a seat</h2>
+        <div class="row-form">
+          <div class="field"><label>Email</label><input id="m-email" type="email" placeholder="name@company.com"></div>
+          <div class="field"><label>Full name</label><input id="m-name" type="text" placeholder="Jane Smith"></div>
+          <div class="field"><label>Password</label><input id="m-pass" type="password" placeholder="8+ characters"></div>
+          <div class="field"><label>Primary workspace</label><select id="m-cat"></select></div>
+          <div class="field"><label>&nbsp;</label><button id="m-add" class="primary">Add member</button></div>
+        </div>
+        <div class="hint">The member is verified on creation and joins your organisation, not the free tier.</div>
+      </div>
+      <div class="card">
+        <h2>Members</h2>
+        <div id="members-list"><div class="muted">Loading…</div></div>
+      </div>
+      <div class="card">
+        <h2>Invite links <span class="muted">(shown once)</span></h2>
+        <div class="row-form">
+          <div class="field"><label>Workspace</label><select id="i-cat"></select></div>
+          <div class="field"><label>Label</label><input id="i-label" type="text" placeholder="optional"></div>
+          <div class="field"><label>Max uses</label><input id="i-uses" type="number" min="1" max="100" value="1"></div>
+          <div class="field"><label>Expires (hours)</label><input id="i-ttl" type="number" min="1" max="2160" value="168"></div>
+          <div class="field"><label>&nbsp;</label><button id="i-create" class="primary">Create invite</button></div>
+        </div>
+        <div id="invites-list" style="margin-top:14px"><div class="muted">Loading…</div></div>
+      </div>
+    </section>
+
+    <section id="view-billing" class="hidden">
+      <div class="card">
+        <h2>Current plan</h2>
+        <div id="billing-current"><div class="muted">Loading…</div></div>
+      </div>
+      <div class="card">
+        <h2>Plans</h2>
+        <div id="billing-plans" class="plans"><div class="muted">Loading…</div></div>
+        <div class="hint" id="billing-hint"></div>
+      </div>
+      <div class="card">
+        <h2>Seats by workspace</h2>
+        <div id="billing-seats"><div class="muted">Loading…</div></div>
+      </div>
+    </section>
+  </div>
+
+  <div class="footer">Organisation Console · scoped to your organisation · chat in <a href="/ui">/ui</a></div>
+</main>
+
+<div id="toasts"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const TOKEN_KEY = "esg_token";
+let token = localStorage.getItem(TOKEN_KEY) || null;
+let org = null;
+let role = null;
+let currentUserId = null;
+let usageRange = "7d";
+let availableWorkspaces = [];
+
+function authHeaders(json) {
+  const h = {};
+  if (json) h["content-type"] = "application/json";
+  if (token) h["authorization"] = "Bearer " + token;
+  return h;
+}
+
+function notify(msg, kind = "") {
+  const el = document.createElement("div");
+  el.className = "toast " + kind;
+  el.textContent = msg;
+  $("toasts").appendChild(el);
+  setTimeout(() => el.remove(), 4200);
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { headers: authHeaders(opts.body != null), ...opts });
+  if (res.status === 401) { showGate(); throw new Error("Please sign in first."); }
+  if (!res.ok) {
+    let detail = res.status + " " + res.statusText;
+    try { const d = await res.json(); if (d.detail) detail = d.detail; }
+    catch (e) { /* non-JSON */ }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+async function getJson(path) {
+  const res = await fetch(path, { headers: authHeaders(false) });
+  if (res.status === 401) { showGate(); throw new Error("Please sign in first."); }
+  if (!res.ok) {
+    let detail = res.status + " " + res.statusText;
+    try { const d = await res.json(); if (d.detail) detail = d.detail; }
+    catch (e) { /* non-JSON */ }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+function fmtTokens(n) {
+  if (n == null || isNaN(n)) return "—";
+  if (n < 1000) return String(Math.round(n));
+  if (n < 1e6) return (n / 1e3).toFixed(1) + "K";
+  return (n / 1e6).toFixed(2) + "M";
+}
+
+function fmtUsd(n) {
+  if (n == null || isNaN(n)) return "—";
+  if (n === 0) return "$0.00";
+  const a = Math.abs(n);
+  if (a < 0.001) return "$" + n.toExponential(1);
+  if (a < 0.01) return "$" + n.toFixed(4);
+  if (a < 1) return "$" + n.toFixed(3);
+  return "$" + n.toFixed(2);
+}
+
+function planBadge(status) {
+  if (!status) return '<span class="badge">no subscription</span>';
+  const cls = status === "active" ? "ok" : (status === "past_due" || status === "trialing" ? "warn" : "err");
+  return `<span class="badge ${cls}">${esc(status)}</span>`;
+}
+
+function showGate() {
+  $("console").classList.add("hidden");
+  $("gate").classList.remove("hidden");
+}
+function showConsole() {
+  $("gate").classList.add("hidden");
+  $("console").classList.remove("hidden");
+}
+
+function setActiveTab(tab) {
+  ["overview", "analytics", "people", "billing"].forEach((t) => {
+    $("tab-" + t).classList.toggle("active", t === tab);
+    $("view-" + t).classList.toggle("hidden", t !== tab);
+  });
+  if (tab === "analytics") loadUsage();
+  if (tab === "people") loadPeople();
+  if (tab === "billing") loadBilling();
+}
+
+// ---- overview ------------------------------------------------------------
+
+function renderOverview(data) {
+  org = data.organisation;
+  role = data.your_role;
+  $("org-name").textContent = org.name || "Organisation";
+  const badgeCls = org.billing_status === "active" ? "ok"
+    : (org.billing_status === "past_due" || org.billing_status === "trialing" ? "warn"
+      : (org.billing_status ? "err" : ""));
+  $("plan-badge").className = "badge " + badgeCls;
+  $("plan-badge").textContent = org.billing_status || "no subscription";
+  const t = data.totals;
+  const q = data.billing.questions || {};
+  const qLabel = q.included == null ? `${q.used || 0}` : `${q.used || 0} / ${q.included}`;
+  $("overview-totals").innerHTML = [
+    ["Workspaces", t.workspaces],
+    ["Members", t.members],
+    ["Indexed chunks", t.chunks],
+    ["Questions this period", qLabel],
+  ].map(([lbl, num]) => `<div class="total"><div class="num">${esc(num)}</div><div class="lbl">${esc(lbl)}</div></div>`).join("");
+
+  $("overview-workspaces").innerHTML = data.workspaces.length
+    ? data.workspaces.map((w) => `
+      <div class="workspace">
+        <div class="ws-emoji">${esc(w.emoji || "📁")}</div>
+        <div class="ws-meta">
+          <div class="title">${esc(w.label)}</div>
+          <div class="stats"><b>${w.chunks}</b> chunks · <b>${w.sources}</b> sources · <b>${w.data_file_count}</b> files · <b>${w.seats}</b> seats${w.indexed ? "" : " · not indexed"}</div>
+        </div>
+        <div class="ws-actions"><a href="/ui"><button class="small">Open chat</button></a></div>
+      </div>`).join("")
+    : '<div class="muted">No workspaces are assigned to your organisation yet. Add a member to a workspace to get started.</div>';
+
+  const b = data.billing;
+  const used = q.used || 0;
+  const inc = q.included;
+  const over = inc != null && used > inc;
+  const pct = inc ? Math.min(100, Math.round((used / inc) * 100)) : 0;
+  $("overview-billing").innerHTML =
+    `<div class="muted">Plan <b>${esc(b.plan || "none")}</b> · ${esc(b.billing_status || "no subscription")}` +
+    (b.period_end ? ` · renews ${new Date(b.period_end).toLocaleDateString()}` : "") + `</div>` +
+    (inc != null
+      ? `<div class="meter"><div class="fill ${over ? "over" : ""}" style="width:${over ? 100 : pct}%"></div></div>
+         <div class="muted">${used} of ${inc} questions used${q.overage ? ` · ${q.overage} overage` : ""}</div>`
+      : `<div class="muted">${used} questions used · unmetered plan</div>`) +
+    `<div class="actions"><button class="small" onclick="setActiveTab('billing')">Manage billing</button></div>`;
+}
+
+async function loadOverview() {
+  try {
+    const data = await getJson("/org/overview");
+    renderOverview(data);
+    showConsole();
+  } catch (e) {
+    notify(e.message, "err");
+    showGate();
+  }
+}
+
+// ---- analytics -----------------------------------------------------------
+
+function usageBarRow(label, value, max, display) {
+  const pct = max > 0 ? Math.max(1.5, (value / max) * 100) : 0;
+  return `<div class="bar-row"><span class="bl">${esc(label)}</span>` +
+    `<div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>` +
+    `<span class="bv">${esc(display)}</span></div>`;
+}
+
+function usageChartSVG(series) {
+  if (!series || !series.length) return '<div class="muted">No usage in this period yet.</div>';
+  const W = 840, H = 240, padL = 46, padR = 10, padT = 14, padB = 26;
+  const n = series.length;
+  const maxVal = Math.max(...series.map((s) => (s.prompt_tokens || 0) + (s.completion_tokens || 0)), 1);
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const spacing = plotW / n;
+  const bw = Math.max(6, spacing - 5);
+  const hourly = series[0].bucket.length > 10;
+  let s = '<div class="legend">' +
+    '<span><span class="swatch" style="background:#0ea5e9"></span>input tokens</span>' +
+    '<span><span class="swatch" style="background:#4ade80"></span>output tokens</span>' +
+    `<span class="muted">per ${hourly ? "hour" : "day"}</span></div>`;
+  s += `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto" role="img">`;
+  s += `<line x1="${padL}" y1="${H - padB}" x2="${W - padR}" y2="${H - padB}" stroke="#2b3a52"/>`;
+  s += `<text x="${padL - 6}" y="${H - padB + 4}" text-anchor="end" fill="#94a3b8" font-size="10">0</text>`;
+  s += `<text x="${padL - 6}" y="${padT - 2}" text-anchor="end" fill="#94a3b8" font-size="10">${fmtTokens(maxVal)}</text>`;
+  series.forEach((row, i) => {
+    const x = padL + i * spacing + 2.5;
+    const inputH = plotH * ((row.prompt_tokens || 0) / maxVal);
+    const outputH = plotH * ((row.completion_tokens || 0) / maxVal);
+    const inputY = H - padB - inputH;
+    const outputY = inputY - outputH;
+    if (outputH > 0) s += `<rect x="${x}" y="${outputY}" width="${bw}" height="${outputH}" fill="#4ade80" opacity="0.95"></rect>`;
+    if (inputH > 0) s += `<rect x="${x}" y="${inputY}" width="${bw}" height="${inputH}" fill="#0ea5e9" opacity="0.95"></rect>`;
+    s += `<title>${esc(row.bucket)} · in ${row.prompt_tokens || 0} / out ${row.completion_tokens || 0}</title>`;
+  });
+  s += "</svg>";
+  return s;
+}
+
+function renderUsage(data) {
+  const t = data.totals || {};
+  $("analytics-totals").innerHTML = [
+    ["LLM calls", t.calls || 0],
+    ["Tokens in", fmtTokens(t.prompt_tokens)],
+    ["Tokens out", fmtTokens(t.completion_tokens)],
+    ["Est. cost", fmtUsd(t.cost)],
+  ].map(([lbl, num]) => `<div class="total"><div class="num">${esc(num)}</div><div class="lbl">${esc(lbl)}</div></div>`).join("");
+  $("usage-chart").innerHTML = usageChartSVG(data.series);
+  const cats = data.by_category || [];
+  const maxCat = Math.max(...cats.map((r) => r.cost), 0);
+  $("usage-by-category").innerHTML = cats.length
+    ? cats.map((r) => usageBarRow(r.key, r.cost, maxCat, fmtUsd(r.cost))).join("")
+    : '<div class="muted">No usage yet.</div>';
+  const kinds = data.by_kind || [];
+  const maxKind = Math.max(...kinds.map((r) => r.cost), 0);
+  $("usage-by-kind").innerHTML = kinds.length
+    ? kinds.map((r) => usageBarRow(r.key, r.cost, maxKind, fmtUsd(r.cost))).join("")
+    : '<div class="muted">No usage yet.</div>';
+}
+
+async function loadUsage() {
+  try {
+    const data = await getJson("/org/usage?range=" + encodeURIComponent(usageRange));
+    renderUsage(data);
+    $("usage-note").textContent = "range: " + usageRange;
+  } catch (e) {
+    notify(e.status === 403 ? "You need owner or admin access for analytics." : e.message, "err");
+  }
+}
+
+// ---- people --------------------------------------------------------------
+
+function roleTag(m) {
+  const r = m.org_role || "member";
+  const cls = r === "owner" ? "ok" : (r === "admin" ? "custom" : "");
+  return `<span class="tag ${cls}">${esc(r)}</span>`;
+}
+
+function renderMembers(data) {
+  availableWorkspaces = data.available_workspaces || [];
+  const members = data.members || [];
+  const canManage = role === "owner" || role === "admin";
+  $("members-list").innerHTML = members.length ? `<table class="table">
+    <tr><th>Member</th><th>Role</th><th>Workspaces</th><th></th></tr>
+    ${members.map((m) => `
+      <tr>
+        <td>${esc(m.name || "—")}<div class="muted">${esc(m.email)}</div></td>
+        <td>${canManage && m.org_role !== "owner"
+          ? `<select data-uid="${esc(m.id)}" class="m-role">
+               <option value="" ${!m.org_role ? "selected" : ""}>member</option>
+               <option value="admin" ${m.org_role === "admin" ? "selected" : ""}>admin</option>
+             </select>`
+          : roleTag(m)}</td>
+        <td>${(m.workspaces || []).map((w) => `<span class="tag">${esc(w)}</span>`).join(" ") || '<span class="muted">none</span>'}</td>
+        <td>${canManage && m.org_role !== "owner"
+          ? `<button class="small danger" data-remove="${esc(m.id)}">Remove</button>
+             ${m.id !== currentUserId ? `<button class="small" data-reset-pw="${esc(m.id)}">Reset password</button>` : ""}
+             ${m.id !== currentUserId ? `<button class="small" data-toggle-status="${esc(m.id)}" data-status="${m.account_status || 'active'}">${(m.account_status === 'suspended') ? 'Reactivate' : 'Suspend'}</button>` : ""}`
+          : ""}</td>
+      </tr>`).join("")}
+    </table>` : '<div class="muted">No members yet.</div>';
+
+  $("members-list").querySelectorAll(".m-role").forEach((sel) => {
+    sel.addEventListener("change", async () => {
+      try {
+        await api("/org/members/" + encodeURIComponent(sel.dataset.uid) + "/role", {
+          method: "POST", body: JSON.stringify({ role: sel.value }),
+        });
+        notify("Role updated.", "ok");
+        loadPeople();
+      } catch (e) { notify(e.message, "err"); loadPeople(); }
+    });
+  });
+  $("members-list").querySelectorAll("[data-remove]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (!confirm("Remove this member's seat? They will lose access to this organisation.")) return;
+      try {
+        await api("/org/members/" + encodeURIComponent(btn.dataset.remove), { method: "DELETE" });
+        notify("Member removed.", "ok");
+        loadPeople();
+      } catch (e) { notify(e.message, "err"); }
+    });
+  });
+  $("members-list").querySelectorAll("[data-reset-pw]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const pw = prompt("Enter a new temporary password for this member (8+ characters). Their other sessions will be signed out.");
+      if (!pw) return;
+      if (pw.length < 8) { notify("Password must be at least 8 characters.", "err"); return; }
+      try {
+        await api("/org/members/" + encodeURIComponent(btn.dataset.resetPw) + "/reset-password", {
+          method: "POST", body: JSON.stringify({ password: pw }),
+        });
+        notify("Password set. Share it with the member out of band.", "ok");
+      } catch (e) { notify(e.message, "err"); }
+    });
+  });
+  $("members-list").querySelectorAll("[data-toggle-status]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const uid = btn.dataset.toggleStatus;
+      const cur = btn.dataset.status || "active";
+      const next = cur === "suspended" ? "active" : "suspended";
+      const msg = next === "suspended" ? "Suspend this member? They will be signed out and unable to log in until reactivated." : "Reactivate this member?";
+      if (!confirm(msg)) return;
+      try {
+        await api("/org/members/" + encodeURIComponent(uid) + "/role", {
+          method: "POST", body: JSON.stringify({ account_status: next }),
+        });
+        notify(next === "suspended" ? "Member suspended." : "Member reactivated.", "ok");
+        loadPeople();
+      } catch (e) { notify(e.message, "err"); }
+    });
+  });
+}
+
+async function changePassword() {
+  const current = prompt("Enter your current password");
+  if (!current) return;
+  const next = prompt("Enter a new password (8+ characters)");
+  if (!next) return;
+  if (next.length < 8) { notify("Password must be at least 8 characters.", "err"); return; }
+  try {
+    await api("/me/password", {
+      method: "POST", body: JSON.stringify({ current_password: current, new_password: next }),
+    });
+    notify("Password changed. Other devices were signed out.", "ok");
+  } catch (e) { notify(e.message, "err"); }
+}
+
+function renderInvites(data) {
+  const invites = data.invites || [];
+  $("invites-list").innerHTML = invites.length ? `<table class="table">
+    <tr><th>Workspace</th><th>Label</th><th>Uses</th><th>Expires</th><th>Status</th></tr>
+    ${invites.map((i) => `
+      <tr>
+        <td>${esc(i.category)}</td>
+        <td>${esc(i.label || "—")}</td>
+        <td>${i.uses} / ${i.max_uses}</td>
+        <td class="muted">${i.expires_at ? new Date(i.expires_at).toLocaleDateString() : "—"}</td>
+        <td>${i.valid ? '<span class="tag ok">active</span>' : `<span class="tag err">${esc(i.reason || "expired")}</span>`}</td>
+      </tr>`).join("")}
+    </table>` : '<div class="muted">No invites yet. Create one above — the shareable link is shown once.</div>';
+}
+
+async function loadPeople() {
+  try {
+    const [members, invites] = await Promise.all([
+      getJson("/org/members"),
+      getJson("/org/invites").catch(() => ({ invites: [] })),
+    ]);
+    renderMembers(members);
+    renderInvites(invites);
+    const opts = availableWorkspaces.map((w) => `<option value="${esc(w)}">${esc(w)}</option>`).join("");
+    $("m-cat").innerHTML = opts;
+    $("i-cat").innerHTML = opts;
+  } catch (e) { notify(e.message, "err"); }
+}
+
+async function addMember() {
+  const category = $("m-cat").value;
+  const body = {
+    email: $("m-email").value.trim(),
+    password: $("m-pass").value,
+    name: $("m-name").value.trim(),
+    category: category || "finance",
+    workspaces: category ? [category] : [],
+  };
+  if (!body.email || !body.password) { notify("Email and password are required.", "err"); return; }
+  try {
+    await api("/org/members", { method: "POST", body: JSON.stringify(body) });
+    $("m-email").value = $("m-name").value = $("m-pass").value = "";
+    notify("Member added.", "ok");
+    loadPeople();
+  } catch (e) { notify(e.message, "err"); }
+}
+
+async function createInvite() {
+  const body = {
+    category: $("i-cat").value,
+    label: $("i-label").value.trim() || null,
+    max_uses: parseInt($("i-uses").value, 10) || 1,
+    ttl_hours: parseInt($("i-ttl").value, 10) || 168,
+  };
+  if (!body.category) { notify("Pick a workspace first.", "err"); return; }
+  try {
+    const created = await api("/org/invites", { method: "POST", body: JSON.stringify(body) });
+    const link = location.origin + "/ui?invite=" + created.token;
+    prompt("Shareable invite link (shown once):", link);
+    $("i-label").value = "";
+    loadPeople();
+  } catch (e) { notify(e.message, "err"); }
+}
+
+// ---- billing -------------------------------------------------------------
+
+function meter(used, included) {
+  if (included == null) return `<div class="muted">${used} used · unmetered</div>`;
+  const over = used > included;
+  const pct = included > 0 ? Math.min(100, Math.round((used / included) * 100)) : 0;
+  return `<div class="meter"><div class="fill ${over ? "over" : ""}" style="width:${over ? 100 : pct}%"></div></div>
+    <div class="muted">${used} of ${included} used${over ? ` · ${used - included} overage` : ""}</div>`;
+}
+
+function renderBilling(usage, plans) {
+  const q = usage.questions || {};
+  const s = usage.seats || {};
+  const active = ["active", "past_due", "trialing"].includes(usage.billing_status);
+  const hasCustomer = usage.reporting && usage.reporting.configured;
+
+  $("billing-current").innerHTML =
+    `<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+       <span class="tag custom">${esc(usage.plan || "no plan")}</span>
+       ${planBadge(usage.billing_status)}
+       <span class="muted">${usage.period_end ? "renews " + new Date(usage.period_end).toLocaleDateString() : ""}</span>
+     </div>
+     <div style="margin-top:12px"><b>Questions</b>${meter(q.used || 0, q.included)}</div>
+     <div style="margin-top:12px"><b>Seats</b>
+       <div class="muted">${s.total || 0} total · ${s.extra || 0} extra billed · ${s.included_per_workspace == null ? "unlimited per workspace" : s.included_per_workspace + " included per workspace"}</div>
+     </div>
+     <div class="actions">${hasCustomer ? '<button id="btn-portal" class="primary">Manage / change plan</button>' : ""}</div>`;
+
+  $("billing-plans").innerHTML = (plans || []).map((p) => {
+    const current = p.plan === usage.plan;
+    const pool = p.question_pool == null ? "Unmetered questions" : `${p.question_pool} questions / period`;
+    const seats = p.included_seats == null ? "Unlimited seats" : `${p.included_seats} seats / workspace`;
+    const canBuy = p.purchasable && !active && role === "owner";
+    return `<div class="plan ${current ? "current" : ""}">
+      <div class="pname">${esc(p.label)} ${current ? '<span class="tag ok">current</span>' : ""}</div>
+      <div class="pmeta"><b>${esc(pool)}</b><br><b>${esc(seats)}</b></div>
+      ${canBuy ? `<button class="primary" data-buy="${esc(p.plan)}">Choose ${esc(p.label)}</button>` : ""}
+      ${!p.purchasable ? '<div class="muted">Not configured on this deployment</div>' : ""}
+      ${active && role === "owner" ? '<div class="muted">Use the billing portal to change the live subscription.</div>' : ""}
+    </div>`;
+  }).join("");
+
+  $("billing-plans").querySelectorAll("[data-buy]").forEach((btn) => {
+    btn.addEventListener("click", () => checkout(btn.dataset.buy));
+  });
+  const portal = $("btn-portal");
+  if (portal) portal.addEventListener("click", openPortal);
+
+  const byWs = s.by_workspace || [];
+  $("billing-seats").innerHTML = byWs.length ? `<table class="table">
+    <tr><th>Workspace</th><th>Seats</th><th>Included / workspace</th><th>Extra billed</th></tr>
+    ${byWs.map((row) => `
+      <tr>
+        <td>${esc(row.category)}</td>
+        <td>${row.seats}</td>
+        <td>${s.included_per_workspace == null ? "unlimited" : s.included_per_workspace}</td>
+        <td>${s.included_per_workspace == null ? "—" : Math.max(0, row.seats - s.included_per_workspace)}</td>
+      </tr>`).join("")}
+    </table>` : '<div class="muted">No seats yet.</div>';
+
+  $("billing-hint").textContent = active
+    ? "The live subscription is managed in Stripe's billing portal: change plan, update the card, or cancel."
+    : (role === "owner"
+      ? "Choose a plan to activate this organisation's workspaces. You will be redirected to Stripe Checkout."
+      : "Only the organisation owner can purchase or change a plan.");
+}
+
+async function loadBilling() {
+  try {
+    const [usage, plansData] = await Promise.all([
+      getJson("/billing/usage"),
+      getJson("/org/plans").catch(() => ({ plans: [] })),
+    ]);
+    renderBilling(usage, plansData.plans || []);
+  } catch (e) { notify(e.message, "err"); }
+}
+
+async function checkout(plan) {
+  try {
+    const res = await api("/billing/checkout", {
+      method: "POST",
+      body: JSON.stringify({ plan, interval: plan === "enterprise" ? "year" : "month" }),
+    });
+    openStripe(res.url);
+  } catch (e) { notify(e.message, "err"); }
+}
+
+async function openPortal() {
+  try {
+    const res = await api("/billing/portal", {
+      method: "POST", body: JSON.stringify({ return_url: location.href }),
+    });
+    openStripe(res.url);
+  } catch (e) { notify(e.message, "err"); }
+}
+
+// Stripe is a separate site: open it in the same tab to avoid double openings.
+function openStripe(url) {
+  window.location = url;
+}
+
+// ---- boot ----------------------------------------------------------------
+
+$("tab-overview").addEventListener("click", () => setActiveTab("overview"));
+$("tab-analytics").addEventListener("click", () => setActiveTab("analytics"));
+$("tab-people").addEventListener("click", () => setActiveTab("people"));
+$("tab-billing").addEventListener("click", () => setActiveTab("billing"));
+$("usage-range").addEventListener("change", () => { usageRange = $("usage-range").value; loadUsage(); });
+$("btn-refresh-usage").addEventListener("click", loadUsage);
+$("m-add").addEventListener("click", addMember);
+$("i-create").addEventListener("click", createInvite);
+$("change-pass").addEventListener("click", changePassword);
+$("logout").addEventListener("click", () => {
+  localStorage.removeItem(TOKEN_KEY);
+  window.location = "/ui";
+});
+
+(async function boot() {
+  if (!token) { showGate(); return; }
+  try {
+    const me = await getJson("/me");
+    role = me.organisation && me.organisation.role;
+    currentUserId = me.user && me.user.id;
+    if (!me.organisation || !["owner", "admin"].includes(role)) { showGate(); return; }
+    await loadOverview();
+  } catch (e) { showGate(); }
+})();
+</script>
+</body>
+</html>

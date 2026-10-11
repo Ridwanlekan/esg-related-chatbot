@@ -143,3 +143,39 @@ def send_verification_email(sender, to_address, base_url, token):
         verification_body(base_url, token),
         html_body=verification_html(base_url, token),
     )
+
+
+def password_reset_subject(base_url):
+    return "Reset your password"
+
+
+def password_reset_body(base_url, token):
+    link = f"{base_url.rstrip('/')}/reset-password?token={token}"
+    return (
+        "Reset your ESG Assistant password\n\n"
+        "Open this link to choose a new password:\n\n"
+        f"{link}\n\n"
+        "The link works once and expires in 2 hours. If you did not ask to "
+        "reset your password you can ignore this message; nothing has changed.\n"
+    )
+
+
+def password_reset_html(base_url, token):
+    link = f"{base_url.rstrip('/')}/reset-password?token={token}"
+    return (
+        "<p>Reset your ESG Assistant password</p>"
+        f'<p><a href="{link}">Choose a new password</a></p>'
+        "<p>The link works once and expires in 2 hours. If you did not ask to "
+        "reset your password you can ignore this message; nothing has "
+        "changed.</p>"
+    )
+
+
+def send_password_reset_email(sender, to_address, base_url, token):
+    """Returns True when the message went somewhere recoverable."""
+    return sender.send(
+        to_address,
+        password_reset_subject(base_url),
+        password_reset_body(base_url, token),
+        html_body=password_reset_html(base_url, token),
+    )

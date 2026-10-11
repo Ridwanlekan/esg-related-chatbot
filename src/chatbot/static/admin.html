@@ -414,7 +414,7 @@
       <h2>Create user</h2>
       <div class="row-form">
         <div class="field"><label>Email</label><input id="user-email" type="email"></div>
-        <div class="field"><label>Password (min 8)</label><input id="user-pass" type="password"></div>
+        <div class="field"><label>Password (min 8)</label><div style="display:flex; gap:8px;"><input id="user-pass" type="password" style="flex:1"><button type="button" id="btn-gen-pass" class="small">Generate</button></div></div>
         <div class="field"><label>Name</label><input id="user-name"></div>
         <div class="field"><label>Category</label><select id="user-cat"></select></div>
         <div class="field"><label>Organisation</label><select id="user-org"></select></div>
@@ -2718,6 +2718,8 @@ $("btn-shared-upload").addEventListener("click", uploadShared);
 $("btn-refresh-shared").addEventListener("click", loadSharedDocuments);
 $("btn-create-ws").addEventListener("click", createWorkspace);
 $("btn-create-user").addEventListener("click", createUser);
+const g = $("btn-gen-pass");
+if (g) g.addEventListener("click", () => { $("user-pass").value = randomPassword(); $("user-pass").type = "text"; });
 $("btn-refresh-docs").addEventListener("click", loadDocuments);
 $("btn-refresh-ws").addEventListener("click", loadWorkspaces);
 $("btn-refresh-users").addEventListener("click", () => loadUsers(false));

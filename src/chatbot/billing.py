@@ -292,7 +292,50 @@ def refresh_subscription_from_stripe(user_store, subscription_id):
     )
 
 
+def _provision_self_serve(user_store, metadata):
+    """Materialise a free account's own organisation once it has actually paid.
+
+    The conversion from the free tier (proposal Q1) is deferred to this point on
+    purpose: a free account that abandons the Stripe page must stay on the free
+    tier, capped, rather than land in an ownerless customer organisation it
+    never paid for. Idempotent - the organisation is created once, the account
+    moved once, ownership granted once - because the webhook and the on-return
+    sync may both call it. The account keeps the workspaces it already had, so
+    upgrading does not silently strip the one it was using.
+    """
+    org_id = (metadata.get("organisation_id") or "").strip()
+    user_id = metadata.get("user_id")
+    if not org_id or not user_id:
+        return False
+    user = user_store.get(user_id)
+    if user is None:
+        logger.warning("self-serve upgrade for unknown user %s", user_id)
+        return False
+    if user_store.get_organisation(org_id) is None:
+        try:
+            user_store.create_organisation(
+                org_id, metadata.get("organisation_name") or org_id
+            )
+        except ValueError:
+            # The id is derived from the user, so a collision means the row was
+            # already created (a concurrent webhook, most likely); carry on.
+            logger.info("self-serve upgrade: organisation %s already exists", org_id)
+    if user.get("organisation_id") != org_id:
+        user_store.set_user_organisation(user_id, org_id)
+        cats = user_store.workspace_categories(user_id)
+        if cats and user.get("category") not in cats:
+            user_store.set_primary_workspace(user_id, cats[0])
+    user_store.ensure_initial_owner(org_id, user_id)
+    return True
+
+
 def _apply_checkout_event(app, event_type, session, event_id):
+    # A self-serve upgrade carries its whole organisation in metadata because
+    # the organisation does not exist until payment: create it and move the
+    # payer in first, then the usual billing columns land on it below.
+    metadata = _metadata_of(session)
+    if metadata.get("self_serve") == "true":
+        _provision_self_serve(app.state.user_store, metadata)
     org = _org_for_event(app, session)
     if org is None or org.get("system_owned"):
         return None
@@ -412,6 +455,8 @@ def register_billing_routes(app, user_store, checkout_dep=None, usage_dep=None):
         _register_portal(app, user_store, checkout_dep)
     if usage_dep is not None:
         _register_usage(app, user_store, usage_dep)
+        _register_upgrade(app, user_store, usage_dep)
+        _register_sync(app, user_store, usage_dep)
 
 
 class BillingUnconfigured(Exception):
@@ -443,6 +488,20 @@ class CheckoutRequest(BaseModel):
 
 class PortalRequest(BaseModel):
     return_url: str | None = None
+
+
+class UpgradeRequest(BaseModel):
+    """A free account's self-serve upgrade request."""
+
+    plan: str
+    interval: str = "month"
+    organisation_name: str | None = None
+
+
+class SyncRequest(BaseModel):
+    """Confirm a checkout on return, or refresh the current subscription."""
+
+    session_id: str | None = None
 
 
 def _base_price_for(plan, interval):
@@ -535,6 +594,145 @@ def build_checkout_session(user_store, org, caller, *, plan, interval,
     return session["url"], session["id"]
 
 
+def _pending_organisation_id(user_id):
+    """The organisation a free account will own once it pays.
+
+    Derived from the user id so the same id is produced by the checkout builder,
+    the webhook and the on-return sync, and a retry can never create a second
+    organisation for the same payer.
+    """
+    return "org-" + user_id
+
+
+def build_upgrade_session(user_store, user, *, plan, interval, organisation_name=None,
+                          success_url=None, cancel_url=None):
+    """Checkout for a free account converting to its own paid organisation.
+
+    The organisation is deliberately not created here: a free account that
+    abandons Stripe must stay on the free tier, capped, rather than land in an
+    ownerless customer organisation it never paid for. Everything the webhook
+    needs to materialise it rides in the session metadata; success lands back on
+    /ui carrying the checkout session id so the on-return sync can confirm it
+    even where no webhook is being delivered.
+    """
+    try:
+        import stripe
+    except ImportError:  # pragma: no cover - deps declared, guard kept for safety
+        stripe = None
+    secret_key = _env("STRIPE_SECRET_KEY")
+    if stripe is None or not secret_key:
+        raise BillingUnconfigured("Billing is not configured")
+    stripe.api_key = secret_key
+
+    plan = (plan or "").strip().lower()
+    interval = (interval or "month").strip().lower()
+    if plan not in _PLANS:
+        raise InvalidBillingRequest("plan must be one of: team, business, enterprise")
+    if interval not in _INTERVALS:
+        raise InvalidBillingRequest("interval must be 'month' or 'year'")
+    if plan == "enterprise" and interval != "year":
+        raise InvalidBillingRequest("enterprise is an annual-commitment plan")
+    base_price = _base_price_for(plan, interval)
+    if base_price is None:
+        raise BillingUnconfigured(f"no base price configured for {plan} {interval}")
+
+    intended = _pending_organisation_id(user["id"])
+    metadata = {
+        "organisation_id": intended,
+        "organisation_name": (organisation_name or "").strip()
+        or user.get("name") or user["email"],
+        "user_id": user["id"],
+        "self_serve": "true",
+        "plan": plan,
+        "interval": interval,
+        "workspaces": "1",
+    }
+    existing = user_store.get_organisation(intended)
+    customer_id = existing.get("stripe_customer_id") if existing else None
+    if not customer_id:
+        customer = stripe.Customer.create(
+            email=user.get("email"),
+            metadata={"organisation_id": intended, "user_id": user["id"]},
+        )
+        customer_id = customer["id"]
+        if existing:
+            user_store.set_organisation_billing(
+                intended, stripe_customer_id=customer_id
+            )
+
+    # One workspace, the one the account already occupies; extra seats and the
+    # question pool ride exactly as they do on an existing organisation.
+    line_items = [{"price": base_price, "quantity": 1}]
+    extra_seat_var = _EXTRA_SEAT_PRICE_ENV.get((plan, interval))
+    if extra_seat_var and _env(extra_seat_var):
+        line_items.append({"price": _env(extra_seat_var)})
+    overage_var = _QUESTION_OVERAGE_ENV.get(interval)
+    if plan != "enterprise" and overage_var and _env(overage_var):
+        line_items.append({"price": _env(overage_var)})
+
+    base_url = _env("PUBLIC_BASE_URL") or "http://localhost:8000"
+    session = stripe.checkout.Session.create(
+        mode="subscription",
+        customer=customer_id,
+        line_items=line_items,
+        metadata=metadata,
+        subscription_data={"metadata": metadata},
+        success_url=success_url
+        or f"{base_url}/ui?upgrade=1&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=cancel_url or f"{base_url}/ui?upgrade=0",
+        allow_promotion_codes=False,
+    )
+    return session["url"], session["id"]
+
+
+def reconcile_checkout(user_store, session_id):
+    """Apply a completed checkout that no webhook has delivered yet.
+
+    The webhook is the writer of record, but a deployment without a public
+    endpoint (or with one briefly behind) would otherwise leave a paid account
+    looking unpaid. Stripe is only read; the same idempotent provisioning the
+    webhook does runs here. Returns the updated organisation, or None when the
+    session is not (yet) paid.
+    """
+    if not billing_enabled():
+        raise BillingUnconfigured("Billing is not configured in this environment")
+    if not session_id:
+        raise InvalidBillingRequest("A checkout session id is required")
+    import stripe
+
+    stripe.api_key = _env("STRIPE_SECRET_KEY")
+    try:
+        session = _object_data(stripe.checkout.Session.retrieve(session_id))
+    except Exception as exc:
+        if _is_stripe_error(exc):
+            raise BillingUpstreamError(
+                f"Stripe refused the checkout read: {exc}"
+            ) from exc
+        raise
+
+    paid = session.get("payment_status") in ("paid", "no_payment_required") or (
+        session.get("status") == "complete"
+    )
+    if not paid:
+        return None
+    metadata = _metadata_of(session)
+    if metadata.get("self_serve") == "true":
+        _provision_self_serve(user_store, metadata)
+    subscription_id = session.get("subscription")
+    if subscription_id:
+        # The subscription carries the plan, the period and the customer id, so
+        # reading it writes every column the account needs in one place.
+        return refresh_subscription_from_stripe(user_store, subscription_id)
+    org = _org_for_data(user_store, session)
+    if org is None or org.get("system_owned"):
+        return None
+    return user_store.set_organisation_billing(
+        org["id"],
+        stripe_customer_id=session.get("customer"),
+        billing_status="active",
+    )
+
+
 def _is_stripe_error(exc):
     """Whether an exception is Stripe's own, when the SDK is installed.
 
@@ -548,6 +746,128 @@ def _is_stripe_error(exc):
         return False
     stripe_error = getattr(stripe, "StripeError", None)
     return isinstance(exc, stripe_error) if stripe_error else False
+
+
+# ---- plan switching in Stripe's customer portal ---------------------------
+#
+# The portal is Stripe's page, so the controls on it are Stripe's configuration.
+# Out of the box that configuration shows the current subscription and lets the
+# customer cancel it, but not move between plans - which would leave an existing
+# subscriber with no way to change tier. A portal configuration with
+# `subscription_update` enabled, restricted to this deployment's own base
+# prices, is what turns switching on. One is looked up by name and created once,
+# then reused; a deployment can pin its own via STRIPE_PORTAL_CONFIGURATION_ID.
+
+_PORTAL_CONFIGURATION_NAME = "esg-plan-switcher"
+_portal_configuration_cache = {}
+
+
+def _switchable_prices():
+    """Base prices a subscriber may switch between, enterprise excluded.
+
+    Enterprise is an annual commitment agreed per customer, so a self-serve
+    move into or out of it is not something the portal should offer.
+    """
+    prices = []
+    for (plan, _interval), env_var in _BASE_PRICE_ENV.items():
+        if plan == "enterprise":
+            continue
+        price_id = _env(env_var)
+        if price_id and price_id not in prices:
+            prices.append(price_id)
+    return prices
+
+
+def _portal_products(stripe, prices):
+    """Group switchable prices under their Stripe product, the API's shape."""
+    products = {}
+    for price_id in prices:
+        try:
+            price = _object_data(stripe.Price.retrieve(price_id))
+        except Exception:
+            logger.warning(
+                "portal configuration: price %s not readable", price_id,
+                exc_info=True,
+            )
+            continue
+        product_id = price.get("product")
+        if product_id:
+            products.setdefault(product_id, []).append(price_id)
+    return [{"product": pid, "prices": ps} for pid, ps in products.items()]
+
+
+def _config_switches(config):
+    """Whether a portal configuration already lets customers change plans."""
+    features = _object_data(config.get("features") or {})
+    update = _object_data(features.get("subscription_update") or {})
+    return bool(update.get("enabled"))
+
+
+def portal_configuration_id(stripe):
+    """The portal configuration that enables plan switching, or None.
+
+    Priority order, highest first:
+
+    1. `STRIPE_PORTAL_CONFIGURATION_ID` - an operator pinning a config.
+    2. The account's **default** config, *if it already enables plan
+       switching*. An operator who turned switching on in the Stripe dashboard
+       has said what they want; overriding it with one of ours is what makes a
+       correctly-configured portal silently drop the switch control.
+    3. A configuration this app created earlier (reused by name).
+    4. A freshly created one, when there are prices to switch between.
+
+    Every failure degrades to None - the portal still opens, just with Stripe's
+    default - because a subscriber who cannot switch plans is still better off
+    than one who cannot pay.
+    """
+    explicit = _env("STRIPE_PORTAL_CONFIGURATION_ID")
+    if explicit:
+        return explicit
+    cached = _portal_configuration_cache.get("id")
+    if cached:
+        return cached
+    try:
+        listed = _object_data(stripe.billing_portal.Configuration.list(limit=100))
+        configs = [
+            _object_data(config) for config in (listed.get("data") or [])
+        ]
+    except Exception:
+        logger.warning("portal configuration: list failed", exc_info=True)
+        configs = []
+
+    for config in configs:
+        if config.get("is_default") and _config_switches(config):
+            _portal_configuration_cache["id"] = config["id"]
+            return config["id"]
+    for config in configs:
+        if config.get("name") == _PORTAL_CONFIGURATION_NAME and config.get("active"):
+            _portal_configuration_cache["id"] = config["id"]
+            return config["id"]
+
+    products = _portal_products(stripe, _switchable_prices())
+    if not products:
+        return None
+    try:
+        config = _object_data(
+            stripe.billing_portal.Configuration.create(
+                name=_PORTAL_CONFIGURATION_NAME,
+                features={
+                    "subscription_update": {
+                        "enabled": True,
+                        "default_allowed_updates": ["price"],
+                        "proration_behavior": "create_prorations",
+                        "products": products,
+                    },
+                },
+            )
+        )
+    except Exception:
+        logger.warning("portal configuration: create failed", exc_info=True)
+        return None
+    config_id = config.get("id")
+    if config_id:
+        _portal_configuration_cache["id"] = config_id
+    return config_id
 
 
 def build_portal_session(org, *, return_url=None):
@@ -577,11 +897,18 @@ def build_portal_session(org, *, return_url=None):
         )
 
     base_url = _env("PUBLIC_BASE_URL") or "http://localhost:8000"
+    session_kwargs = {
+        "customer": customer_id,
+        "return_url": return_url or f"{base_url}/ui",
+    }
+    # Only pass `configuration` when we actually have a switcher; passing None
+    # would be a request Stripe rejects, and Stripe's default is still a working
+    # portal (just without plan changes).
+    config_id = portal_configuration_id(stripe)
+    if config_id:
+        session_kwargs["configuration"] = config_id
     try:
-        session = stripe.billing_portal.Session.create(
-            customer=customer_id,
-            return_url=return_url or f"{base_url}/ui",
-        )
+        session = stripe.billing_portal.Session.create(**session_kwargs)
     except Exception as exc:
         if _is_stripe_error(exc):
             # The common case is a customer deleted from the dashboard, which
@@ -607,6 +934,39 @@ def question_pool(plan):
 def included_seats(plan):
     """Users a plan includes per workspace, or None when seats are unlimited."""
     return _INCLUDED_SEATS.get(plan) if plan else None
+
+
+PLAN_LABELS = {"team": "Team", "business": "Business", "enterprise": "Enterprise"}
+
+
+def plan_catalog():
+    """The tiers an owner can choose, and what each includes.
+
+    `purchasable` is true only when a base Stripe price is configured for at
+    least one interval, so the upgrade page disables a tier the deployment has
+    not provisioned rather than offering a button that would fail checkout.
+    """
+    plans = []
+    for plan in ("team", "business", "enterprise"):
+        env_var = _BASE_PRICE_ENV.get((plan, "month")) or _BASE_PRICE_ENV.get(
+            (plan, "year")
+        )
+        intervals = [
+            interval
+            for interval in ("month", "year")
+            if (plan, interval) in _BASE_PRICE_ENV and _env(_BASE_PRICE_ENV[(plan, interval)])
+        ]
+        plans.append(
+            {
+                "plan": plan,
+                "label": PLAN_LABELS.get(plan, plan.title()),
+                "question_pool": question_pool(plan),
+                "included_seats": included_seats(plan),
+                "intervals": intervals,
+                "purchasable": bool(env_var and intervals),
+            }
+        )
+    return plans
 
 
 def send_meter_event(event_name, customer_id, value, *, identifier=None):
@@ -832,3 +1192,80 @@ def _register_portal(app, user_store, checkout_dep):
                 detail="Stripe could not open the billing portal. Try again shortly.",
             )
         return {"url": url}
+
+
+def _register_upgrade(app, user_store, usage_dep):
+    """POST /billing/upgrade: a free account converts to a paid organisation.
+
+    Authenticated but not owner-gated: the caller is a free-tier member of the
+    sample organisation, which has no owner to grant them authority. The guard
+    is instead that only a system-owned (free) organisation may self-upgrade -
+    a seat in a customer organisation is governed by that organisation's own
+    billing and is told to use the portal.
+    """
+
+    @app.post("/billing/upgrade")
+    def billing_upgrade(body: UpgradeRequest, ctx=Depends(usage_dep)):
+        org, caller = ctx
+        if not org.get("system_owned"):
+            raise HTTPException(
+                status_code=409,
+                detail="You are already in a paid organisation. Use the billing "
+                "portal to change your plan.",
+            )
+        try:
+            url, session_id = build_upgrade_session(
+                user_store, caller,
+                plan=body.plan, interval=body.interval,
+                organisation_name=body.organisation_name,
+            )
+        except BillingUnconfigured:
+            raise HTTPException(status_code=503, detail="Billing is not configured")
+        except InvalidBillingRequest as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        return {"session_id": session_id, "url": url}
+
+
+def _register_sync(app, user_store, usage_dep):
+    """POST /billing/sync: reconcile a checkout, or refresh the subscription.
+
+    The webhook is the writer of record, but a deployment without a public
+    endpoint needs a pull path or a paid account looks unpaid. With a session id
+    it reads that checkout from Stripe; without one it re-reads the caller's own
+    subscription. Either way it only reads Stripe and writes the same idempotent
+    columns the webhook would.
+    """
+
+    @app.post("/billing/sync")
+    def billing_sync(body: SyncRequest, ctx=Depends(usage_dep)):
+        org, caller = ctx
+        try:
+            if body.session_id:
+                updated = reconcile_checkout(user_store, body.session_id)
+            else:
+                current = user_store.get_organisation(org["id"]) or org
+                subscription_id = current.get("stripe_subscription_id")
+                updated = (
+                    refresh_subscription_from_stripe(user_store, subscription_id)
+                    if subscription_id
+                    else None
+                )
+        except BillingUnconfigured:
+            raise HTTPException(status_code=503, detail="Billing is not configured")
+        except InvalidBillingRequest as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except BillingUpstreamError:
+            raise HTTPException(
+                status_code=502,
+                detail="Stripe could not confirm the subscription. Try again shortly.",
+            )
+        # A self-serve upgrade moves the caller, so the current organisation is
+        # re-read from their account rather than assumed to be the one they had.
+        fresh = user_store.get(caller["id"]) or caller
+        current = user_store.get_organisation(fresh.get("organisation_id")) or org
+        return {
+            "synced": updated is not None,
+            "organisation_id": current["id"],
+            "plan": current.get("plan"),
+            "billing_status": current.get("billing_status"),
+        }

@@ -595,13 +595,19 @@ class AdminStore:
         return {"category": row["category"], "label": row["label"],
                 "organisation_id": row["organisation_id"]}
 
-    def list_invites(self):
+    def list_invites(self, organisation_id=None):
         now = datetime.now(timezone.utc)
-        rows = self.conn.execute(
+        sql = (
             "SELECT category, label, max_uses, uses, created_at, expires_at, "
             "actor, organisation_id "
-            "FROM invites ORDER BY created_at DESC"
-        ).fetchall()
+            "FROM invites"
+        )
+        params = []
+        if organisation_id:
+            sql += " WHERE organisation_id = ?"
+            params.append(organisation_id)
+        sql += " ORDER BY created_at DESC"
+        rows = self.conn.execute(sql, params).fetchall()
         invites = []
         for r in rows:
             usable, reason = self._invite_status(r)
@@ -681,6 +687,29 @@ class AdminStore:
             "WHERE organisation_id = ? AND kind = 'question'"
         )
         params = [organisation_id]
+        if since:
+            sql += " AND at >= ?"
+            params.append(since)
+        try:
+            with self._lock:
+                row = self.conn.execute(sql, params).fetchone()
+            return int(row[0] or 0)
+        except sqlite3.Error:
+            return 0
+
+    def questions_for_user(self, user_id, since=None):
+        """Questions one account has asked since `since` (ISO-8601).
+
+        The free tier has no owner to bill and no period, so its cap is
+        per account rather than per organisation: this is the counterpart of
+        `questions_in_period` keyed on `user_id` instead. Rows of kind
+        "question" are one per answered request, so the count is the number of
+        model answers the account has had.
+        """
+        if not user_id:
+            return 0
+        sql = "SELECT COUNT(*) FROM usage WHERE user_id = ? AND kind = 'question'"
+        params = [user_id]
         if since:
             sql += " AND at >= ?"
             params.append(since)
@@ -783,7 +812,7 @@ class AdminStore:
             + (completion_tokens or 0) / 1_000_000 * rates["price_output_per_m"]
         )
 
-    def _usage_rows(self, range_days=None, category=None):
+    def _usage_rows(self, range_days=None, category=None, organisation_id=None):
         where, params = [], []
         # Billing's question rows share this table but are not LLM calls:
         # including them would inflate the call count on the cost page and
@@ -796,20 +825,32 @@ class AdminStore:
         if category:
             where.append("category = ?")
             params.append(category)
+        if organisation_id:
+            # Scopes an owner's cost view to their own organisation. The
+            # platform console leaves it unset and keeps seeing everything.
+            where.append("organisation_id = ?")
+            params.append(organisation_id)
         clause = " WHERE " + " AND ".join(where)
         return self.conn.execute(
             f"SELECT * FROM usage{clause} ORDER BY id", params
         ).fetchall()
 
-    def usage_stats(self, range_days=None, category=None, top_users=DEFAULT_USAGE_TOP_USERS):
+    def usage_stats(self, range_days=None, category=None, top_users=DEFAULT_USAGE_TOP_USERS,
+                    organisation_id=None):
         """Aggregate usage and estimate cost. All aggregation in Python to
-        stay robust against ISO-8601/offset variants in the stored timestamps.
+        stay robust to ISO-8601/offset variants in the stored timestamps.
 
         Cost is accumulated per row because a bucket (workspace, user, day)
         can mix token kinds with voice kinds, whose rates are not comparable:
         a bucket's cost is the sum of its rows' costs, each computed by kind.
+
+        `organisation_id` restricts the aggregation to one organisation's rows,
+        which is what lets an owner see their own cost without the platform
+        console's cross-customer totals.
         """
-        rows = self._usage_rows(range_days=range_days, category=category)
+        rows = self._usage_rows(
+            range_days=range_days, category=category, organisation_id=organisation_id
+        )
         rates = self.get_rates()
 
         totals = {"calls": len(rows), "prompt_tokens": 0, "completion_tokens": 0,

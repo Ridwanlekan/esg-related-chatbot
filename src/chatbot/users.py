@@ -49,6 +49,13 @@ VERIFICATION_TOKEN_TTL_HOURS = 48
 # token invalidates the previous link, so the window is enforced per user.
 VERIFICATION_RESEND_COOLDOWN_SECONDS = 60
 
+# Password-reset links are more sensitive than verification links: they grant
+# full control of an account rather than confirming an address, so they are
+# short-lived. Two hours is enough for mail to arrive and a person to act, and
+# short enough that a leaked inbox copy is unlikely to still be live.
+PASSWORD_RESET_TOKEN_TTL_HOURS = 2
+PASSWORD_RESET_PURPOSE = "password_reset"
+
 
 def _token_hash(token):
     """Digest of a bearer token, for storing instead of the token itself."""
@@ -93,6 +100,30 @@ def verification_required():
         "no",
         "off",
     )
+
+
+# How many questions a free-tier account (the shared sample workspace) may ask
+# before it has to choose a plan. This is the per-account twin of
+# MAX_FREE_ACCOUNTS: that bounds how many throwaway accounts can exist, this
+# bounds what any one of them can cost in model time. Ownerless by design, so
+# the count is per user rather than per organisation.
+DEFAULT_FREE_TIER_QUESTION_CAP = 50
+
+
+def max_free_questions():
+    """Questions a free-tier account gets before it is asked to upgrade.
+
+    Read as "no limit" when unset, non-numeric, zero or negative: unlike the
+    account cap, a free tier with no question ceiling is the sensible default
+    for a deployment that has not decided a number yet, and an operator turns
+    the gate off by setting it to 0 rather than by deleting the variable.
+    """
+    raw = os.environ.get("FREE_TIER_QUESTION_CAP", str(DEFAULT_FREE_TIER_QUESTION_CAP))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_FREE_TIER_QUESTION_CAP
+    return value if value > 0 else 0
 
 # Membership role within one workspace. This is deliberately NOT the Section 3.3
 # role set: org-level roles (owner/admin) belong to the organisation, and the
@@ -191,6 +222,9 @@ def _row_to_user(row):
         "email_verified_at": row["email_verified_at"]
         if "email_verified_at" in keys
         else None,
+        "account_status": row["account_status"]
+        if "account_status" in keys
+        else "active",
     }
 
 
@@ -314,6 +348,22 @@ class UserStore:
             self.conn.execute("ALTER TABLE users ADD COLUMN verification_token_hash TEXT")
         if "verification_sent_at" not in cols:
             self.conn.execute("ALTER TABLE users ADD COLUMN verification_sent_at TEXT")
+        if "password_reset_token_hash" not in cols:
+            self.conn.execute("ALTER TABLE users ADD COLUMN password_reset_token_hash TEXT")
+        if "password_reset_sent_at" not in cols:
+            self.conn.execute("ALTER TABLE users ADD COLUMN password_reset_sent_at TEXT")
+        if "account_status" not in cols:
+            self.conn.execute(
+                "ALTER TABLE users ADD COLUMN account_status TEXT NOT NULL DEFAULT 'active'"
+            )
+        # Session tokens are stateless, so the only way to invalidate the ones
+        # already out there when a password changes is a value the token and the
+        # row both carry. Tokens minted before this column existed have no
+        # version claim and read as version 0, so grandfathering is automatic.
+        if "token_version" not in cols:
+            self.conn.execute(
+                "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0"
+            )
         org_cols = {
             r[1] for r in self.conn.execute("PRAGMA table_info(organisations)").fetchall()
         }
@@ -827,6 +877,34 @@ class UserStore:
     def workspace_categories(self, user_id):
         return [m["category"] for m in self.memberships(user_id)]
 
+    def reachable_workspaces(self, user_id, extra_categories=None):
+        """Workspaces a user may reach, primary-first order preserved.
+
+        A member reaches exactly the workspaces they hold. An organisation owner
+        or admin additionally reaches every workspace in their organisation:
+        they can already provision, grant and revoke workspaces, so leaving them
+        unable to enter one they administer was a gap between authority and
+        access. `extra_categories` carries workspaces the store cannot see on its
+        own (those holding assigned content but no member seat); the caller adds
+        them only for a manager.
+        """
+        cats = self.workspace_categories(user_id)
+        seen = set(cats)
+        user = self.get(user_id)
+        if user and self.org_role(user_id) in (ORG_ROLE_OWNER, ORG_ROLE_ADMIN):
+            org_id = user.get("organisation_id")
+            if org_id:
+                for cat in self.organisation_workspace_categories(org_id):
+                    if cat not in seen:
+                        seen.add(cat)
+                        cats.append(cat)
+        for cat in (extra_categories or ()):
+            cat = (cat or "").strip().lower()
+            if cat and cat not in seen:
+                seen.add(cat)
+                cats.append(cat)
+        return cats
+
     def has_workspace(self, user_id, category):
         return self.conn.execute(
             "SELECT 1 FROM workspace_memberships WHERE user_id = ? AND category = ?",
@@ -876,12 +954,20 @@ class UserStore:
         self.conn.commit()
         return cur.rowcount > 0
 
-    def set_primary_workspace(self, user_id, category):
-        """Make an existing workspace primary. Membership is required first."""
+    def set_primary_workspace(self, user_id, category, extra_categories=None):
+        """Make a reachable workspace the user's active one.
+
+        Reachability, not mere membership, is the test: an organisation owner or
+        admin may switch to any workspace in their organisation, including one
+        they do not hold a seat in. Switching must not create a membership, or
+        every workspace an owner visits would be billed as an extra seat.
+        """
         cat = (category or "").strip().lower()
-        if not self.has_workspace(user_id, cat):
-            raise ValueError(f"User has no membership in workspace '{cat}'.")
-        self.conn.execute("UPDATE users SET category = ? WHERE id = ?", (cat, user_id))
+        if cat not in self.reachable_workspaces(user_id, extra_categories):
+            raise ValueError("Workspace is not one this user may reach.")
+        self.conn.execute(
+            "UPDATE users SET category = ? WHERE id = ?", (cat, user_id)
+        )
         self.conn.commit()
         return self.get(user_id)
 
@@ -908,6 +994,16 @@ class UserStore:
         if not hmac.compare_digest(digest, bytes(row["password_hash"])):
             return None
         return _row_to_user(row)
+
+    def verify_password(self, user_id, password):
+        """Check a password against one account, without signing anyone in."""
+        row = self.conn.execute(
+            "SELECT salt, password_hash FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if not row:
+            return False
+        _, digest = _hash_password(password or "", salt=bytes(row["salt"]))
+        return hmac.compare_digest(digest, bytes(row["password_hash"]))
 
     def list_users(self, limit=100, offset=0, category=None):
         where, params = "", []
@@ -1029,6 +1125,112 @@ class UserStore:
         self.conn.commit()
         return self.get(user_id)
 
+    # ---- password reset ----------------------------------------------------
+
+    def token_version(self, user_id):
+        row = self.conn.execute(
+            "SELECT token_version FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    def _bump_token_version(self, user_id):
+        """Invalidate every session token already issued for this account.
+
+        Called whenever a password is set, because a password change is the
+        moment a person expects the sessions they do not control to stop
+        working. The row's version moves and every old token's claim no longer
+        matches, so `require_user` turns them away on their next request.
+        """
+        self.conn.execute(
+            "UPDATE users SET token_version = token_version + 1 WHERE id = ?",
+            (user_id,),
+        )
+
+    def issue_password_reset_token(self, user_id, ttl_hours=None):
+        """Mint a single-use reset token and remember only its hash.
+
+        Same shape as a verification token - signed, purpose-tagged, stored as
+        a digest - so a copied database cannot be used to reset anyone's
+        password. Reissuing overwrites the previous hash, so only the newest
+        link works.
+        """
+        user = self.get(user_id)
+        if user is None:
+            return None
+        hours = ttl_hours or int(
+            os.environ.get("PASSWORD_RESET_TOKEN_TTL_HOURS", PASSWORD_RESET_TOKEN_TTL_HOURS)
+        )
+        token = sign_jwt(
+            self.secret,
+            {
+                "sub": user_id,
+                "purpose": PASSWORD_RESET_PURPOSE,
+                "jti": secrets.token_urlsafe(9),
+            },
+            ttl_seconds=hours * 3600,
+        )
+        self.conn.execute(
+            "UPDATE users SET password_reset_token_hash = ?, password_reset_sent_at = ? "
+            "WHERE id = ?",
+            (_token_hash(token), _now(), user_id),
+        )
+        self.conn.commit()
+        return token
+
+    def reset_password(self, token, new_password):
+        """Consume a reset token and set a new password.
+
+        Returns the user id. Raises ValueError with a message for the caller.
+        The old token is cleared on success so the link works once, and the
+        session version is bumped so every previous sign-in is signed out.
+        """
+        if len(new_password or "") < MIN_PASSWORD_LENGTH:
+            raise ValueError(
+                f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+            )
+        payload = verify_jwt(self.secret, token or "")
+        if not payload or payload.get("purpose") != PASSWORD_RESET_PURPOSE:
+            raise ValueError("That password reset link is not valid.")
+        user_id = payload.get("sub")
+        row = self.conn.execute(
+            "SELECT password_reset_token_hash FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if row is None or not row["password_reset_token_hash"]:
+            raise ValueError("That password reset link has been replaced. Request a new one.")
+        if not hmac.compare_digest(row["password_reset_token_hash"], _token_hash(token)):
+            raise ValueError("That password reset link is not valid.")
+        salt, digest = _hash_password(new_password)
+        self.conn.execute(
+            "UPDATE users SET salt = ?, password_hash = ?, password_reset_token_hash = NULL "
+            "WHERE id = ?",
+            (salt, digest, user_id),
+        )
+        self._bump_token_version(user_id)
+        self.conn.commit()
+        return user_id
+
+    def change_password(self, user_id, current_password, new_password):
+        """Self-service change: verify the old password, set and re-hash.
+
+        Bumping the session version signs out every device, including the one
+        making the change, so the caller is handed a fresh token afterwards.
+        """
+        if not self.verify_password(user_id, current_password):
+            raise ValueError("Your current password is not correct.")
+        if len(new_password or "") < MIN_PASSWORD_LENGTH:
+            raise ValueError(
+                f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
+            )
+        salt, digest = _hash_password(new_password)
+        self.conn.execute(
+            "UPDATE users SET salt = ?, password_hash = ?, password_reset_token_hash = NULL "
+            "WHERE id = ?",
+            (salt, digest, user_id),
+        )
+        self._bump_token_version(user_id)
+        self.conn.commit()
+        return self.get(user_id)
+
     def list_unverified(self, organisation_id=None, limit=100, offset=0):
         """Unverified accounts for the admin console, oldest first."""
         sql = (
@@ -1080,7 +1282,8 @@ class UserStore:
         ).fetchall()
         return [_row_to_user(r) for r in rows]
 
-    def update_user(self, user_id, name=None, category=None, password=None):
+    def update_user(self, user_id, name=None, category=None, password=None,
+                    account_status=None):
         existing = self.get(user_id)
         if existing is None:
             return None
@@ -1111,11 +1314,22 @@ class UserStore:
                 "WHERE id=?",
                 (salt, digest, new_name, new_cat, user_id),
             )
+            self._bump_token_version(user_id)
         else:
             self.conn.execute(
                 "UPDATE users SET name=?, category=? WHERE id=?",
                 (new_name, new_cat, user_id),
             )
+        if account_status is not None:
+            status = (account_status or "").strip().lower()
+            if status not in ("active", "suspended"):
+                raise ValueError("account_status must be 'active' or 'suspended'")
+            self.conn.execute(
+                "UPDATE users SET account_status=? WHERE id=?",
+                (status, user_id),
+            )
+            if status == "suspended":
+                self._bump_token_version(user_id)
         self.conn.commit()
         return self.get(user_id)
 
@@ -1148,6 +1362,11 @@ class UserStore:
                 # Read from the store rather than the passed row, because a row
                 # from get() carries no memberships.
                 "workspaces": self.workspace_categories(user["id"]),
+                # Session generation. Bumped whenever the password changes, so
+                # a stolen or shared token stops working the moment the owner
+                # resets. Absent on tokens minted before this existed, which
+                # read as 0 - the same value an untouched account has.
+                "v": self.token_version(user["id"]),
                 # Stamped explicitly so the download endpoint can refuse a session
                 # token. Tokens issued before this claim existed have no purpose
                 # and are still accepted as sessions.

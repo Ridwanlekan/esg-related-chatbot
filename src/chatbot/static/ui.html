@@ -28,6 +28,15 @@
   .badge.warn { color: #fbbf24; border-color: rgba(251,191,36,.4); }
   .badge.err { color: #f87171; border-color: rgba(248,113,113,.4); }
   .badge.theme { color: var(--accent); border-color: rgba(56,189,248,.4); }
+  /* The workspace switcher: shown only when the account can reach more than one
+     workspace, so a single-workspace seat sees nothing new. An owner or admin
+     reaches every workspace in their organisation, which is where it earns its
+     place in the header. */
+  #workspace-switch {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 5px 8px; font-size: 12px; cursor: pointer;
+  }
+  #workspace-switch:hover { border-color: var(--accent); }
   .spacer { flex: 1; }
   button {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
@@ -157,6 +166,10 @@
   .auth-card select:disabled { opacity: .6; cursor: not-allowed; }
   .auth-card .primary { width: 100%; margin-top: 16px; padding: 10px; font-size: 14px; }
   .auth-err { margin-top: 12px; font-size: 12px; color: #f87171; min-height: 16px; white-space: pre-wrap; }
+  .auth-ok { font-size: 12px; color: #34d399; margin-top: 8px; }
+  .meta-row { margin-top: 10px; font-size: 12px; }
+  .meta-row a { color: #93a4bf; text-decoration: none; }
+  .meta-row a:hover { color: #e6edf7; }
   .hidden { display: none !important; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { border-top: 1px solid var(--border); } }
 </style>
@@ -166,7 +179,7 @@
 <div id="auth-view">
   <div class="auth-card">
     <h1>ESG Workspace Chatbot</h1>
-    <p class="sub">Sign in to your Finance or HR workspace. Every user is bound to one workspace.</p>
+    <p class="sub">Sign in to your workspace. Owners and admins can reach every workspace in their organisation.</p>
     <div class="tabs">
       <div id="tab-login" class="tab active">Sign in</div>
       <div id="tab-signup" class="tab">Create account</div>
@@ -178,6 +191,10 @@
       <label for="login-password">Password</label>
       <input id="login-password" type="password" autocomplete="current-password" placeholder="••••••••">
       <button id="login-btn" class="primary">Sign in</button>
+      <div class="meta-row">
+        <a id="forgot-link" href="#">Forgot password?</a>
+        <div id="forgot-note" class="auth-ok hidden"></div>
+      </div>
     </div>
 
     <div id="signup-form" class="hidden">
@@ -200,10 +217,12 @@
 <div id="chat-view" class="hidden">
 <header>
   <h1 id="workspace-title">ESG Assistant</h1>
+  <select id="workspace-switch" class="hidden" title="Active workspace"></select>
   <span id="health" class="badge">checking…</span>
   <span id="user-badge" class="badge theme"></span>
   <span id="org-badge" class="badge hidden"></span>
   <span class="spacer"></span>
+  <a id="org-console-link" class="hidden" href="/owner" style="font-size:12px">Organisation console</a>
   <span id="session-label" class="badge">session: —</span>
   <button id="new-session">New session</button>
   <button id="logout">Log out</button>
@@ -391,7 +410,7 @@ async function submitAuth(endpoint) {
   const body = isLogin
     ? { email, password }
     : { email, password, name: $("signup-name").value.trim(), category: selectedCat, invite: inviteToken || undefined };
-  setAuthError(""); setBusy(btn, true, "…");
+  setAuthError(""); setBusy(btn, true, isLogin ? "Signing in…" : "Creating account…");
   try {
     const res = await fetch("/auth/" + endpoint, {
       method: "POST", headers: authHeaders(true), body: JSON.stringify(body),
@@ -404,6 +423,28 @@ async function submitAuth(endpoint) {
     enterChat(data.verification);
   } catch (e) { setAuthError(e.message); }
   finally { setBusy(btn, false); }
+}
+
+async function submitForgot() {
+  const email = $("login-email").value.trim();
+  const note = $("forgot-note");
+  if (!email) { setAuthError("Enter your email address first."); return; }
+  setAuthError(""); note.classList.add("hidden");
+  try {
+    const res = await fetch("/auth/forgot-password", {
+      method: "POST", headers: authHeaders(true),
+      body: JSON.stringify({ email }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { setAuthError(data.detail || "Request failed"); return; }
+    note.textContent = data.message;
+    note.classList.remove("hidden");
+    if (data.link) {
+      // No SMTP relay in this deployment: the outbox handed us the link
+      // directly so the flow stays testable.
+      note.textContent += " Dev link: " + data.link;
+    }
+  } catch (e) { setAuthError(e.message); }
 }
 
 async function enterChat(verification) {
@@ -424,8 +465,50 @@ async function enterChat(verification) {
     addMsg("bot", welcome());
     renderSessions();
     renderOrgBadge();
+    renderWorkspaceSwitcher();
     showUsagePanel();
   } catch (e) { setAuthError(e.message); }
+}
+
+// A switcher only when there is a choice to make. Members see the workspaces
+// they hold; an owner or admin sees every workspace in their organisation,
+// which /me now reports, so "owners can reach everything they administer" is
+// visible here rather than only true on the server.
+function renderWorkspaceSwitcher() {
+  const sel = $("workspace-switch");
+  if (!sel) return;
+  const list = (me && me.workspaces) || [];
+  if (list.length < 2) { sel.classList.add("hidden"); return; }
+  const current = me.workspace && me.workspace.category;
+  sel.innerHTML = list.map((w) =>
+    '<option value="' + escHtml(w.category) + '"' +
+    (w.category === current ? " selected" : "") + ">" +
+    escHtml(w.emoji || "📄") + " " + escHtml(w.label || w.category) +
+    "</option>"
+  ).join("");
+  sel.classList.remove("hidden");
+}
+
+async function switchWorkspace(cat) {
+  const sel = $("workspace-switch");
+  if (!me || !cat || cat === me.workspace.category) return;
+  sel.disabled = true;
+  try {
+    const res = await api("/me/workspace", {
+      method: "POST", headers: authHeaders(true),
+      body: JSON.stringify({ category: cat }), auth: true,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Could not switch workspace");
+    // Re-enter so the header, welcome message and session reset against the new
+    // active workspace, the same state a fresh sign-in would produce.
+    await enterChat();
+  } catch (e) {
+    if (sel && me && me.workspace) sel.value = me.workspace.category;
+    addMsg("bot", "⚠ " + e.message);
+  } finally {
+    if (sel) sel.disabled = false;
+  }
 }
 
 // A paid organisation's plan and billing state ride on /me so the owner can
@@ -435,8 +518,36 @@ async function enterChat(verification) {
 function renderOrgBadge() {
   const badge = $("org-badge");
   const org = me && me.organisation;
+  // Owners and admins get a door to the organisation console. The free sample
+  // organisation has no owner and no console, so it is excluded with the rest.
+  const link = $("org-console-link");
+  if (link) {
+    const canConsole = org && !org.system_owned &&
+      (org.role === "owner" || org.role === "admin");
+    link.classList.toggle("hidden", !canConsole);
+  }
+  // Free-tier runway, so an account can see the wall coming instead of meeting
+  // it mid-question. Hidden on a paid seat, which has no per-account cap.
+  const free = me && me.free_tier;
+  badge.onclick = null;
+  badge.style.cursor = "";
+  if (free && free.limited) {
+    badge.classList.remove("hidden");
+    badge.textContent = free.reached
+      ? "Free plan · limit reached"
+      : `Free plan · ${free.remaining} question${free.remaining === 1 ? "" : "s"} left`;
+    badge.className = "badge " + (free.reached ? "err" : "warn");
+    // The badge is the account's upgrade door: clicking it opens the upgrade
+    // card rather than leaving a warning nothing acts on.
+    badge.style.cursor = "pointer";
+    badge.onclick = () => {
+      const card = $("billing-setup-section");
+      if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+    };
+    if (org) return;
+  }
   if (!org || org.system_owned || (!org.plan && !org.billing_status)) {
-    badge.classList.add("hidden");
+    if (!(free && free.limited)) badge.classList.add("hidden");
     return;
   }
   const status = org.billing_status || "—";
@@ -877,6 +988,19 @@ async function send() {
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       body.textContent = data.detail || "Request failed (" + res.status + ")";
+      // The free-tier wall answers 402; put the door in the message itself
+      // rather than making the account find the billing card on its own.
+      if (res.status === 402 && me && me.free_tier && me.free_tier.limited) {
+        const up = document.createElement("button");
+        up.type = "button";
+        up.textContent = "Upgrade now";
+        up.style.marginTop = "8px";
+        up.addEventListener("click", () => {
+          const card = $("billing-setup-section");
+          if (card) card.scrollIntoView({ behavior: "smooth", block: "center" });
+        });
+        bot.append(up);
+      }
       return;
     }
     const sid = res.headers.get("X-Session-ID");
@@ -1268,10 +1392,18 @@ $("search-btn").addEventListener("click", doSearch);
 $("search-q").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
 $("load-more").addEventListener("click", () => { sessionOffset += SESSION_PAGE; renderSessions(); });
 $("new-session").addEventListener("click", () => { stopSpeaking(); setSession(null); clearMessages(); renderWelcomeMsg(); });
+$("workspace-switch").addEventListener("change", (e) => switchWorkspace(e.target.value));
 $("logout").addEventListener("click", logout);
 $("tab-login").addEventListener("click", () => setActiveTab("login"));
 $("tab-signup").addEventListener("click", () => setActiveTab("signup"));
 $("login-btn").addEventListener("click", () => submitAuth("login"));
+$("login-password").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { submitAuth("login"); }
+});
+$("forgot-link").addEventListener("click", (e) => {
+  e.preventDefault();
+  submitForgot();
+});
 $("signup-btn").addEventListener("click", () => submitAuth("signup"));
 $("signup-cat").addEventListener("change", (e) => selectCat(e.target.value));
 
@@ -1381,6 +1513,11 @@ function billingSetupNote(box, message) {
   }));
 }
 
+// Stripe is a separate site; open in the same tab to avoid double openings.
+function openStripe(url) {
+  location.href = url;
+}
+
 async function openBillingPortal(btn) {
   const previous = btn.textContent;
   setBusy(btn, true, "Opening…");
@@ -1391,7 +1528,7 @@ async function openBillingPortal(btn) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || "Could not open the billing portal");
-    location.href = data.url;
+    openStripe(data.url);
   } catch (e) {
     // Stay on the page and say why: a failed redirect would otherwise look
     // like nothing happened.
@@ -1409,7 +1546,7 @@ async function startCheckout(btn, plan, interval) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || "Could not start the subscription");
-    location.href = data.url;
+    openStripe(data.url);
   } catch (e) {
     billingSetupNote($("billing-setup"), e.message);
   } finally { setBusy(btn, false); btn.textContent = previous; }
@@ -1422,12 +1559,82 @@ function pickupLabel(name, sel) {
   return el;
 }
 
+// A free account is in the shared sample organisation, which has no owner, so
+// the owner-only card would never show and there would be no way to pay. This
+// is the door that shows the same free account how to leave the cap behind.
+function freeTierView() {
+  const free = me && me.free_tier;
+  return !!(free && free.limited && !ownerView());
+}
+
+function renderUpgradeCard(box) {
+  const free = me.free_tier || {};
+  const plan = document.createElement("select");
+  plan.innerHTML = "<option value=\"team\">Team</option><option value=\"business\">Business</option>";
+  const interval = document.createElement("select");
+  interval.innerHTML = "<option value=\"month\">Monthly</option><option value=\"year\">Yearly</option>";
+  const row = document.createElement("div");
+  row.className = "u-row";
+  row.append(pickupLabel("Plan", plan), pickupLabel("Billing", interval));
+  box.append(row);
+  const note = document.createElement("div");
+  note.className = "u-note";
+  note.textContent = free.reached
+    ? "You've used all " + free.cap + " free questions. Choose a paid plan to keep asking."
+    : "Free plan: " + free.remaining + " of " + free.cap +
+      " questions left. Choose a paid plan to remove the cap.";
+  box.append(note);
+  const start = document.createElement("button");
+  start.type = "button";
+  start.textContent = "Upgrade";
+  start.addEventListener("click", () => startUpgrade(start, plan.value, interval.value));
+  box.append(start);
+}
+
+// The upgrade is not a plan change on an existing organisation: the server
+// creates the organisation and moves the account in only once Stripe confirms
+// payment, so an abandoned checkout leaves the free account exactly as it was.
+async function startUpgrade(btn, plan, interval) {
+  const previous = btn.textContent;
+  setBusy(btn, true, "Opening checkout…");
+  try {
+    const res = await api("/billing/upgrade", {
+      method: "POST", headers: authHeaders(true), auth: true,
+      body: JSON.stringify({ plan: String(plan || "team").toLowerCase(), interval: String(interval || "month").toLowerCase() }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || "Could not start the upgrade");
+    openStripe(data.url);
+  } catch (e) {
+    billingSetupNote($("billing-setup"), e.message);
+  } finally { setBusy(btn, false); btn.textContent = previous; }
+}
+
+// Confirming a checkout usually arrives as a webhook, but a deployment without
+// a public endpoint has no webhook to receive it, so returning from Stripe
+// re-confirms the checkout directly and flips the account into its new
+// organisation before /me is read. Idempotent, so a later webhook is harmless.
+async function syncUpgrade(sessionId) {
+  try {
+    const res = await api("/billing/sync", {
+      method: "POST", headers: authHeaders(true), auth: true,
+      body: JSON.stringify({ session_id: sessionId || null }),
+    });
+    const data = await res.json().catch(() => ({}));
+    return res.ok ? data : null;
+  } catch (e) { return null; }
+}
+
 function renderBillingSetup() {
   const card = $("billing-setup-section");
-  if (!ownerView()) { card.classList.add("hidden"); return; }
+  if (!ownerView() && !freeTierView()) { card.classList.add("hidden"); return; }
   card.classList.remove("hidden");
   const box = $("billing-setup");
   box.innerHTML = "";
+  // A free account has no owner to buy a plan for it, so the same card is
+  // where it buys its own organisation. Deferred until payment server-side, so
+  // this only ever starts a checkout.
+  if (freeTierView()) { renderUpgradeCard(box); return; }
   const org = me.organisation;
   const status = org.billing_status || null;
 
@@ -1488,6 +1695,7 @@ document.addEventListener("visibilitychange", async () => {
     renderBillingNotice();
     renderBillingSetup();
     renderOrgBadge();
+    renderWorkspaceSwitcher();
     showUsagePanel();
   } catch (e) {}
 });
@@ -1538,13 +1746,28 @@ $("verify-resend").addEventListener("click", async () => {
       inviteToken = "";
     }
   }
+  health();
+  setInterval(health, 30000);
   if (token) {
-    try { await enterChat(); return; } catch {}
+    try {
+      // Returning from an upgrade checkout: confirm it before /me so the
+      // account is already in its new organisation when the page renders.
+      const params = new URLSearchParams(location.search);
+      let upgraded = null;
+      if (params.has("upgrade")) {
+        upgraded = await syncUpgrade(params.get("session_id"));
+        history.replaceState(null, "", location.pathname);
+      }
+      await enterChat();
+      if (upgraded && upgraded.synced) {
+        addMsg("bot", "🎉 Your workspace is upgraded and the free-question cap is gone. " +
+          "When you have documents to add, the admin console is where they go.");
+      }
+      return;
+    } catch {}
   }
   showAuth();
   loadWorkspaces();
-  health();
-  setInterval(health, 30000);
 })();
 </script>
 </body>

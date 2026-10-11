@@ -13,6 +13,7 @@ from chatbot.admin_store import AdminStore
 from chatbot.api import create_app
 from chatbot.session_store import SessionStore
 from chatbot.users import UserStore
+from chatbot import content_library
 
 KEY = "platform-key"
 PASSWORD = "password123"
@@ -405,3 +406,82 @@ class TestSeatCreation:
             "category": "finance"})
         kinds = [e["event"] for e in c.app.state.admin_store.list_events()["events"]]
         assert "org.member_create" in kinds
+
+
+class TestManagerWorkspaceReach:
+    """Managing a workspace and entering it are one permission for an owner.
+
+    Q11 gives owner/admin the right to provision and revoke workspaces, but
+    access was still membership-only, so a manager could administer a workspace
+    they could not open. These lock the two together, and keep a plain member's
+    reach exactly what they hold.
+    """
+
+    def _categories(self, me):
+        return [w["category"] for w in me["workspaces"]]
+
+    def test_owner_reaches_a_workspace_held_by_another_member(self, env):
+        c, _ = env
+        _owner, token = owner_of(c, "acme")
+        seat(c, "hr@acme.test", "acme", category="hr")
+        me = c.get("/me", headers=auth(token)).json()
+        assert "hr" in self._categories(me)
+        assert "finance" in self._categories(me)
+
+    def test_owner_reaches_a_workspace_that_only_has_content(self, env):
+        """A workspace the organisation has indexed but nobody has joined yet."""
+        c, _ = env
+        _owner, token = owner_of(c, "acme")
+        content_library.workspace_dir("acme", "hr").mkdir(parents=True, exist_ok=True)
+        assert "hr" in self._categories(c.get("/me", headers=auth(token)).json())
+
+    def test_an_admin_reaches_the_same_way(self, env):
+        c, _ = env
+        owner_of(c, "acme")
+        _admin, token = admin_of(c, "acme")
+        seat(c, "hr@acme.test", "acme", category="hr")
+        assert "hr" in self._categories(c.get("/me", headers=auth(token)).json())
+
+    def test_a_plain_member_reaches_only_what_they_hold(self, env):
+        c, _ = env
+        owner_of(c, "acme")
+        seat(c, "hr@acme.test", "acme", category="hr")
+        _member, token = seat(c, "member@acme.test", "acme")
+        assert self._categories(c.get("/me", headers=auth(token)).json()) == ["finance"]
+
+    def test_owner_can_switch_to_a_workspace_they_do_not_hold(self, env):
+        c, _ = env
+        owner, token = owner_of(c, "acme")
+        seat(c, "hr@acme.test", "acme", category="hr")
+        res = c.post("/me/workspace", headers=auth(token), json={"category": "hr"})
+        assert res.status_code == 200, res.text
+        assert res.json()["workspace"]["category"] == "hr"
+        assert c.get("/me", headers=auth(token)).json()["workspace"]["category"] == "hr"
+        # Switching must not mint a membership, or every workspace the owner
+        # visits would be billed as an extra seat.
+        assert c.app.state.user_store.has_workspace(owner["id"], "hr") is False
+
+    def test_a_member_cannot_switch_to_a_workspace_they_do_not_hold(self, env):
+        c, _ = env
+        owner_of(c, "acme")
+        seat(c, "hr@acme.test", "acme", category="hr")
+        _member, token = seat(c, "member@acme.test", "acme")
+        res = c.post("/me/workspace", headers=auth(token), json={"category": "hr"})
+        assert res.status_code == 403
+        assert c.get("/me", headers=auth(token)).json()["workspace"]["category"] == "finance"
+
+    def test_an_unknown_workspace_is_refused(self, env):
+        c, _ = env
+        _owner, token = owner_of(c, "acme")
+        res = c.post("/me/workspace", headers=auth(token), json={"category": "nope"})
+        assert res.status_code == 403
+
+    def test_an_owner_cannot_reach_another_organisations_workspace(self, env):
+        """A workspace that only belongs to globex is not acme's to switch to."""
+        c, _ = env
+        _owner, token = owner_of(c, "acme")
+        make_org(c, "globex")
+        owner_of(c, "globex")
+        content_library.workspace_dir("globex", "hr").mkdir(parents=True, exist_ok=True)
+        res = c.post("/me/workspace", headers=auth(token), json={"category": "hr"})
+        assert res.status_code == 403

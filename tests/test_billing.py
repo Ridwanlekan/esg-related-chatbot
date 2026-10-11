@@ -47,6 +47,10 @@ def _wire_stripe_env(monkeypatch, tmp_path):
     monkeypatch.setenv("STRIPE_PRICE_EXTRA_SEAT_BUSINESS_ANNUAL", "price_extra_seat_business_year")
     monkeypatch.setenv("STRIPE_PRICE_QUESTION_OVERAGE", "price_overage")
     monkeypatch.setenv("STRIPE_PRICE_QUESTION_OVERAGE_ANNUAL", "price_overage_year")
+    # Pin a portal configuration so the plan-switching lookup never reaches the
+    # network in tests; the auto-create path is exercised explicitly where it
+    # matters.
+    monkeypatch.setenv("STRIPE_PORTAL_CONFIGURATION_ID", "bpc_test")
 
 
 @pytest.fixture
@@ -1480,3 +1484,323 @@ class TestRefreshFromStripe:
         res = c.post("/admin/organisations/_sample/billing/refresh", headers=key)
         assert res.status_code == 422
         assert "not billed" in res.json()["detail"]
+
+
+# ---- Self-serve upgrade from the free tier --------------------------------
+#
+# A free account lives in the system sample organisation, which has no owner to
+# upgrade it. The self-serve path lets it buy its own organisation, but the move
+# itself is deferred until payment so an abandoned checkout cannot hand out a
+# paid-looking customer organisation for free.
+
+def _free_user(store, email="free@sample.com"):
+    user = store.create_user(
+        email, "password123", "Free Bird", "finance",
+        organisation_id="_sample", verified=True,
+    )
+    return user, {"authorization": f"Bearer {store.token_for(user)}"}
+
+
+def _stub_checkout_retrieve(monkeypatch, session):
+    monkeypatch.setattr(
+        stripe.checkout.Session, "retrieve", lambda session_id, **kw: session
+    )
+
+
+class TestSelfServeUpgrade:
+    def test_a_free_account_starts_a_self_serve_checkout(self, env, monkeypatch):
+        c, store = env
+        user, headers = _free_user(store)
+        calls = _create_recorded(monkeypatch)
+        r = c.post("/billing/upgrade", json={"plan": "team"}, headers=headers)
+        assert r.status_code == 200, r.text
+        assert r.json()["url"] == "https://pay.stripe.test/cs_1"
+        session = calls["session"]
+        assert session["mode"] == "subscription"
+        assert session["metadata"]["self_serve"] == "true"
+        assert session["metadata"]["user_id"] == user["id"]
+        assert session["metadata"]["organisation_id"] == "org-" + user["id"]
+        assert session["subscription_data"]["metadata"] == session["metadata"]
+        assert session["line_items"][0] == {"price": PRICE_TEAM_M, "quantity": 1}
+        assert "{CHECKOUT_SESSION_ID}" in session["success_url"]
+        # The account is not moved and no organisation is created until it pays.
+        assert store.get(user["id"])["organisation_id"] == "_sample"
+        assert store.get_organisation("org-" + user["id"]) is None
+
+    def test_a_paid_seat_cannot_self_serve_upgrade(self, env, monkeypatch):
+        c, store = env
+        headers = _checkout_ctx(store)  # owner of the customer org "acme"
+        _create_recorded(monkeypatch)
+        r = c.post("/billing/upgrade", json={"plan": "team"}, headers=headers)
+        assert r.status_code == 409
+        assert "portal" in r.json()["detail"].lower()
+
+    def test_requires_authentication(self, env, monkeypatch):
+        c, _ = env
+        _create_recorded(monkeypatch)
+        assert c.post("/billing/upgrade", json={"plan": "team"}).status_code == 401
+
+    def test_unconfigured_billing_returns_503(self, env, monkeypatch):
+        c, store = env
+        _user, headers = _free_user(store)
+        monkeypatch.delenv("STRIPE_SECRET_KEY")
+        r = c.post("/billing/upgrade", json={"plan": "team"}, headers=headers)
+        assert r.status_code == 503
+
+    def test_unknown_plan_is_refused(self, env, monkeypatch):
+        c, store = env
+        _user, headers = _free_user(store)
+        _create_recorded(monkeypatch)
+        assert c.post(
+            "/billing/upgrade", json={"plan": "mega"}, headers=headers
+        ).status_code == 409
+
+    def test_the_webhook_moves_the_payer_into_their_new_org(self, env):
+        c, store = env
+        user, _ = _free_user(store)
+        r = post_event(c, "checkout.session.completed", {
+            "customer": "cus_free", "subscription": "sub_free",
+            "metadata": {
+                "organisation_id": "org-" + user["id"],
+                "organisation_name": "Free Bird Ltd",
+                "user_id": user["id"],
+                "self_serve": "true",
+            },
+        }, "evt_upgrade_1")
+        assert r.status_code == 200
+        moved = store.get(user["id"])
+        assert moved["organisation_id"] == "org-" + user["id"]
+        # The workspace it already had is kept, and it owns the new organisation.
+        assert store.workspace_categories(user["id"]) == ["finance"]
+        assert store.org_role(user["id"]) == "owner"
+        org = store.get_organisation("org-" + user["id"])
+        assert org["name"] == "Free Bird Ltd"
+        assert org["stripe_customer_id"] == "cus_free"
+        assert org["stripe_subscription_id"] == "sub_free"
+        assert org["billing_status"] == "active"
+
+    def test_the_on_return_sync_moves_the_payer_without_a_webhook(self, env, monkeypatch):
+        c, store = env
+        user, headers = _free_user(store)
+        _stub_checkout_retrieve(monkeypatch, {
+            "id": "cs_paid", "status": "complete", "payment_status": "paid",
+            "customer": "cus_free", "subscription": "sub_free",
+            "metadata": {
+                "organisation_id": "org-" + user["id"],
+                "user_id": user["id"],
+                "self_serve": "true",
+            },
+        })
+        _stub_retrieve(monkeypatch, live_subscription(
+            customer="cus_free", org="org-" + user["id"], sub_id="sub_free"))
+        r = c.post("/billing/sync", json={"session_id": "cs_paid"}, headers=headers)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["synced"] is True
+        assert body["organisation_id"] == "org-" + user["id"]
+        assert body["plan"] == "team"
+        assert body["billing_status"] == "active"
+        assert store.get(user["id"])["organisation_id"] == "org-" + user["id"]
+        assert store.org_role(user["id"]) == "owner"
+
+    def test_the_sync_before_payment_changes_nothing(self, env, monkeypatch):
+        c, store = env
+        user, headers = _free_user(store)
+        _stub_checkout_retrieve(monkeypatch, {
+            "id": "cs_open", "status": "open", "payment_status": "unpaid",
+            "metadata": {},
+        })
+        r = c.post("/billing/sync", json={"session_id": "cs_open"}, headers=headers)
+        assert r.status_code == 200
+        assert r.json()["synced"] is False
+        assert store.get(user["id"])["organisation_id"] == "_sample"
+
+    def test_the_sync_refreshes_an_existing_subscription(self, env, monkeypatch):
+        c, store = env
+        headers = _checkout_ctx(store)
+        store.set_organisation_billing("acme", stripe_subscription_id="sub_live_1")
+        _stub_retrieve(monkeypatch, live_subscription())
+        r = c.post("/billing/sync", json={}, headers=headers)
+        assert r.status_code == 200
+        assert r.json()["synced"] is True
+        assert store.get_organisation("acme")["plan"] == "team"
+
+    def test_the_sync_needs_authentication(self, env):
+        c, _ = env
+        assert c.post("/billing/sync", json={}).status_code == 401
+
+    def test_provisioning_is_idempotent(self, env):
+        c, store = env
+        user, _ = _free_user(store)
+        payload = {
+            "customer": "cus_free", "subscription": "sub_free",
+            "metadata": {
+                "organisation_id": "org-" + user["id"],
+                "user_id": user["id"], "self_serve": "true",
+            },
+        }
+        assert post_event(c, "checkout.session.completed", payload, "evt_a").status_code == 200
+        # A redelivery under a new id must not create a second owner or org.
+        assert post_event(c, "checkout.session.completed", payload, "evt_b").status_code == 200
+        owners = [r for r in store.org_roles_for("org-" + user["id"])
+                  if r["role"] == "owner"]
+        assert len(owners) == 1
+
+
+class TestPortalPlanSwitching:
+    """The portal must let a subscriber move between plans, not just cancel.
+
+    Stripe's default portal can't, so a configuration with subscription_update
+    enabled is created (or pinned by env) and passed on the session.
+    """
+
+    def test_an_explicit_configuration_is_used(self, env, monkeypatch):
+        c, store = env
+        headers = _checkout_ctx(store)
+        store.set_organisation_billing("acme", stripe_customer_id="cus_1")
+        monkeypatch.setenv("STRIPE_PORTAL_CONFIGURATION_ID", "bpc_explicit")
+        calls = _portal_recorded(monkeypatch)
+        r = c.post("/billing/portal", json={}, headers=headers)
+        assert r.status_code == 200
+        assert calls["portal"]["configuration"] == "bpc_explicit"
+
+    def test_a_switcher_configuration_is_created_once_and_cached(self, env, monkeypatch):
+        c, store = env
+        billing._portal_configuration_cache.clear()
+        monkeypatch.delenv("STRIPE_PORTAL_CONFIGURATION_ID", raising=False)
+        headers = _checkout_ctx(store)
+        store.set_organisation_billing("acme", stripe_customer_id="cus_1")
+        created = {}
+        monkeypatch.setattr(
+            stripe.billing_portal.Configuration, "list", lambda **kw: {"data": []}
+        )
+        monkeypatch.setattr(
+            stripe.Price, "retrieve",
+            lambda pid, **kw: {"id": pid, "product": "prod_" + pid},
+        )
+
+        def make_config(**kw):
+            created.update(kw)
+            return {"id": "bpc_new"}
+
+        monkeypatch.setattr(stripe.billing_portal.Configuration, "create", make_config)
+        calls = _portal_recorded(monkeypatch)
+        r = c.post("/billing/portal", json={}, headers=headers)
+        assert r.status_code == 200
+        assert calls["portal"]["configuration"] == "bpc_new"
+        assert created["name"] == "esg-plan-switcher"
+        update = created["features"]["subscription_update"]
+        assert update["enabled"] is True
+        assert update["products"]  # the switchable prices, grouped by product
+        # A second portal call reuses the cached configuration.
+        created.clear()
+        r = c.post("/billing/portal", json={}, headers=headers)
+        assert r.status_code == 200
+        assert created == {}
+        assert calls["portal"]["configuration"] == "bpc_new"
+        billing._portal_configuration_cache.clear()
+
+    def test_a_failed_configuration_still_opens_the_default_portal(self, env, monkeypatch):
+        c, store = env
+        billing._portal_configuration_cache.clear()
+        monkeypatch.delenv("STRIPE_PORTAL_CONFIGURATION_ID", raising=False)
+        headers = _checkout_ctx(store)
+        store.set_organisation_billing("acme", stripe_customer_id="cus_1")
+        monkeypatch.setattr(
+            stripe.billing_portal.Configuration, "list", lambda **kw: {"data": []}
+        )
+        monkeypatch.setattr(
+            stripe.Price, "retrieve",
+            lambda pid, **kw: {"id": pid, "product": "prod"},
+        )
+
+        def boom(**kw):
+            raise stripe.APIConnectionError("stripe down")
+
+        monkeypatch.setattr(stripe.billing_portal.Configuration, "create", boom)
+        calls = _portal_recorded(monkeypatch)
+        r = c.post("/billing/portal", json={}, headers=headers)
+        assert r.status_code == 200
+        assert "configuration" not in calls["portal"]
+        billing._portal_configuration_cache.clear()
+
+    def test_a_dashboard_default_that_switches_is_not_overridden(self, env, monkeypatch):
+        # The operator enabled plan switching on the dashboard's default
+        # configuration; the app must use it, not silently substitute its own.
+        c, store = env
+        billing._portal_configuration_cache.clear()
+        monkeypatch.delenv("STRIPE_PORTAL_CONFIGURATION_ID", raising=False)
+        headers = _checkout_ctx(store)
+        store.set_organisation_billing("acme", stripe_customer_id="cus_1")
+        monkeypatch.setattr(
+            stripe.billing_portal.Configuration, "list",
+            lambda **kw: {"data": [{
+                "id": "bpc_default", "is_default": True, "active": True,
+                "features": {"subscription_update": {"enabled": True}},
+            }]},
+        )
+        created = {}
+        monkeypatch.setattr(
+            stripe.billing_portal.Configuration, "create",
+            lambda **kw: created.update(kw) or {"id": "bpc_mine"},
+        )
+        calls = _portal_recorded(monkeypatch)
+        r = c.post("/billing/portal", json={}, headers=headers)
+        assert r.status_code == 200
+        assert calls["portal"]["configuration"] == "bpc_default"
+        assert created == {}  # our own config was never created
+        billing._portal_configuration_cache.clear()
+
+    def test_a_default_without_switching_falls_back_to_creating_one(self, env, monkeypatch):
+        c, store = env
+        billing._portal_configuration_cache.clear()
+        monkeypatch.delenv("STRIPE_PORTAL_CONFIGURATION_ID", raising=False)
+        headers = _checkout_ctx(store)
+        store.set_organisation_billing("acme", stripe_customer_id="cus_1")
+        monkeypatch.setattr(
+            stripe.billing_portal.Configuration, "list",
+            lambda **kw: {"data": [{
+                "id": "bpc_plain", "is_default": True, "active": True,
+                "features": {"subscription_update": {"enabled": False}},
+            }]},
+        )
+        monkeypatch.setattr(
+            stripe.Price, "retrieve",
+            lambda pid, **kw: {"id": pid, "product": "prod_" + pid},
+        )
+        monkeypatch.setattr(
+            stripe.billing_portal.Configuration, "create",
+            lambda **kw: {"id": "bpc_mine"},
+        )
+        calls = _portal_recorded(monkeypatch)
+        r = c.post("/billing/portal", json={}, headers=headers)
+        assert r.status_code == 200
+        assert calls["portal"]["configuration"] == "bpc_mine"
+        billing._portal_configuration_cache.clear()
+
+
+class TestUpgradeDoorInTheUI:
+    """A cappable free account has to be able to reach the paid path."""
+
+    @staticmethod
+    def _ui():
+        return open("src/chatbot/static/ui.html").read()
+
+    def test_the_upgrade_card_exists_and_is_gated_on_free_tier(self):
+        html = self._ui()
+        assert "freeTierView" in html
+        assert "renderUpgradeCard" in html
+        # The free card and the owner card share the same section, chosen by
+        # which view applies, so neither can be shown to the wrong account.
+        assert "if (freeTierView()) { renderUpgradeCard(box); return; }" in html
+
+    def test_the_upgrade_button_calls_the_endpoint(self):
+        assert '"/billing/upgrade"' in self._ui()
+
+    def test_the_return_from_checkout_is_confirmed(self):
+        html = self._ui()
+        assert '"/billing/sync"' in html
+        assert "syncUpgrade" in html
+
+    def test_the_402_message_offers_an_upgrade(self):
+        assert "Upgrade now" in self._ui()

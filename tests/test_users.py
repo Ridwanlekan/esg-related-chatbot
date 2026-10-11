@@ -271,9 +271,10 @@ def test_cannot_remove_only_workspace(store):
     assert store.workspace_categories(user["id"]) == ["finance"]
 
 
-def test_set_primary_requires_membership(store):
+def test_set_primary_requires_reachability(store):
+    """A plain member may only switch to a workspace they actually hold."""
     user = store.create_user("a@b.com", "password123", "A", "finance")
-    with pytest.raises(ValueError, match="no membership"):
+    with pytest.raises(ValueError, match="may reach"):
         store.set_primary_workspace(user["id"], "hr")
     assert store.get(user["id"])["category"] == "finance"
 
