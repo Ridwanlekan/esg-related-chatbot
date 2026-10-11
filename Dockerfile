@@ -10,7 +10,7 @@ WORKDIR /app
 
 COPY requirements.txt pyproject.toml README.md ./
 COPY src ./src
-COPY data ./data
+COPY src ./src
 
 RUN pip install -r requirements.txt \
  && pip install . --no-deps
