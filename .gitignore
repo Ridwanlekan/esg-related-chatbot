@@ -73,6 +73,7 @@ ppt/
 /*.pages
 /*.numbers
 !/README.md
+!/SECURITY.md
 
 # Commercial and client material, and third-party briefs: never in this repo.
 # Holds real contact details, bank references and pricing, so whole directories
