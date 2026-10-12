@@ -67,6 +67,7 @@ from chatbot.download_links import (
     verify_download_token,
 )
 from chatbot.ingest import INGEST_PROGRESS
+from chatbot.languages import resolve_language
 from chatbot.security import RateLimiter, int_env, make_auth_check, make_rate_limit
 from chatbot.session_store import SessionStore
 from chatbot import users as users_mod
@@ -206,6 +207,7 @@ class ChatRequest(BaseModel):
     k: int = Field(default=3, ge=1, le=20)
     source: str | None = None
     history_limit: int = Field(default=10, ge=0, le=50)
+    language: str | None = Field(default=None, max_length=16)
 
 
 class ChatResponse(BaseModel):
@@ -218,6 +220,7 @@ class SearchRequest(BaseModel):
     question: str = Field(min_length=1, max_length=8000)
     k: int = Field(default=3, ge=1, le=50)
     source: str | None = None
+    language: str | None = Field(default=None, max_length=16)
 
 
 class SearchItem(BaseModel):
@@ -514,6 +517,7 @@ class CostRatesRequest(BaseModel):
 
 class TTSRequest(BaseModel):
     text: str = Field(min_length=1, max_length=100_000)
+    language: str | None = Field(default=None, max_length=16)
 
 
 class AdminLoginRequest(BaseModel):
@@ -4082,7 +4086,11 @@ def create_app(
         history = store.history(session_id, limit=req.history_limit)
         bot = get_bot(request, user["category"], user.get("organisation_id"))
         tz = tz_offset_minutes(request)
-        reply = smalltalk.handle(req.question, user["name"], user["category"], tz)
+        language = resolve_language(req.question, req.language)
+        reply = smalltalk.handle(
+            req.question, user["name"], user["category"], tz,
+            language=language,
+        )
         sources = []
         if reply is None:
             require_free_tier_quota(user)
@@ -4095,6 +4103,7 @@ def create_app(
                     source=req.source,
                     history=history,
                     usage_sink=usage_events,
+                    language=language,
                 )
             except RuntimeError as e:
                 raise HTTPException(status_code=503, detail=str(e))
@@ -4126,7 +4135,11 @@ def create_app(
         history = store.history(session_id, limit=req.history_limit)
         bot = get_bot(request, user["category"], user.get("organisation_id"))
         tz = tz_offset_minutes(request)
-        reply = smalltalk.handle(req.question, user["name"], user["category"], tz)
+        language = resolve_language(req.question, req.language)
+        reply = smalltalk.handle(
+            req.question, user["name"], user["category"], tz,
+            language=language,
+        )
 
         # Checked here rather than inside the generator so an exhausted free
         # account gets a plain 402 before the stream opens, which is what the
@@ -4149,6 +4162,7 @@ def create_app(
                         source=req.source,
                         history=history,
                         usage_sink=usage_events,
+                        language=language,
                     ):
                         chunks.append(piece)
                         yield f"data: {json.dumps({'delta': piece})}\n\n"
@@ -4268,7 +4282,10 @@ def create_app(
             )
         try:
             provider = voice.get_tts_provider()
-            audio = await run_in_threadpool(provider.synthesize, req.text)
+            tts_language = resolve_language(req.text, req.language)
+            audio = await run_in_threadpool(
+                provider.synthesize, req.text, language=tts_language
+            )
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))
         record_voice_usage(
@@ -4290,8 +4307,10 @@ def create_app(
         require_active_billing(user)
         bot = get_bot(request, user["category"], user.get("organisation_id"))
         try:
+            language = resolve_language(req.question, req.language)
             results = await run_in_threadpool(
-                bot.retrieve, question=req.question, k=req.k, source=req.source
+                bot.retrieve, question=req.question, k=req.k, source=req.source,
+                language=language,
             )
         except RuntimeError as e:
             raise HTTPException(status_code=503, detail=str(e))

@@ -30,10 +30,10 @@ class FakeBot:
     def retrieve(self, question, k=3, source=None, history=None, usage_sink=None):
         return []
 
-    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         return "answer"
 
-    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         yield "answer"
         yield "[DONE]"
 
@@ -55,7 +55,7 @@ class FakeTTS:
     def __init__(self):
         self.seen = []
 
-    def synthesize(self, text):
+    def synthesize(self, text, language=None):
         self.seen.append(text)
         return b"ID3-fake-mp3-bytes"
 
@@ -359,7 +359,7 @@ def test_openai_tts_wraps_sdk_errors_as_runtime_error():
 
 def test_failed_tts_is_not_metered(voice_env, monkeypatch):
     """A 503 costs nothing, so it must not appear in the usage ledger."""
-    def boom(_text):
+    def boom(_text, language=None):
         raise RuntimeError("Voice TTS is unavailable")
 
     monkeypatch.setattr(voice, "get_tts_provider",
@@ -455,7 +455,7 @@ def test_local_tts_endpoint_serves_a_playable_wav(voice_env, monkeypatch):
     monkeypatch.setenv("VOICE_TTS_PROVIDER", "kokoro")
     monkeypatch.setattr(
         voice, "get_tts_provider",
-        lambda: SimpleNamespace(synthesize=lambda _t: payload, media_type="audio/wav"),
+        lambda: SimpleNamespace(synthesize=lambda _t, language=None: payload, media_type="audio/wav"),
     )
     res = voice_env.post("/voice/tts", json={"text": "hello"}, headers=_auth(voice_env))
     assert res.status_code == 200, res.text
@@ -467,7 +467,7 @@ def test_tts_media_type_falls_back_to_mp3_when_a_provider_omits_it(voice_env, mo
     """A provider that forgets to declare one still gets a playable type."""
     monkeypatch.setattr(
         voice, "get_tts_provider",
-        lambda: SimpleNamespace(synthesize=lambda _t: b"ID3-fake-mp3-bytes"),
+        lambda: SimpleNamespace(synthesize=lambda _t, language=None: b"ID3-fake-mp3-bytes"),
     )
     res = voice_env.post("/voice/tts", json={"text": "hello"}, headers=_auth(voice_env))
     assert res.status_code == 200

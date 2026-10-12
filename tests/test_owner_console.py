@@ -31,10 +31,10 @@ class FakeBot:
     def __init__(self):
         self.store = type("S", (), {"count": staticmethod(lambda: 0)})()
 
-    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         return f"answer to: {question}"
 
-    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         yield "answer"
 
     def read_and_embed_data(self):

@@ -8,10 +8,10 @@ from chatbot.session_store import SessionStore
 
 
 class FakeBot:
-    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         return f"answer to: {question}"
 
-    def retrieve(self, question, k=3, source=None):
+    def retrieve(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         return []
 
     def read_and_embed_data(self):

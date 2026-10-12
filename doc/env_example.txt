@@ -101,3 +101,20 @@ TOKENIZERS_PARALLELISM = False
 # DOCLING_VET_DIR = .docling_vet  # cleaned Markdown saved before ingest (gitignored; 0/false disables)
 # PORT = 8000                     # uvicorn port (platforms like App Service inject this)
 # LOG_LEVEL = INFO
+
+# --- Multilingual answers (Mandarin + Hindi) ----------------------------------
+# Chat, voice and the UI can answer in English, Simplified Chinese (zh-Hans)
+# and Hindi (hi). No configuration is required to enable them: a question typed
+# in Chinese or Hindi is answered in that language, an English question follows
+# the language picked in the UI selector, and English remains the default.
+#
+# Retrieval stays English-only on purpose. The embedding index and reranker are
+# English-centric, so a Zh/Hi question is translated to English before it is
+# embedded (one extra LLM call, metered under the "rewrite" kind) while the
+# original question is kept for the answer, so the reply still comes back in
+# the user's language.
+#
+# Voice follows the same rule: STT auto-detects the spoken language, and Kokoro
+# TTS switches to a Mandarin or Hindi voice for those languages (ignoring an
+# English VOICE_TTS_VOICE when it would mispronounce the text).
+# SUPPORTED_LANGS = en,zh,hi      # informational; the set is fixed in code

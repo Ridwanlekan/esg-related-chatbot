@@ -988,10 +988,10 @@ class _MeteredBot:
             content="chunk body", distance=0.25,
         )]
 
-    def retrieve(self, question, k=3, source=None, history=None, usage_sink=None):
+    def retrieve(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         return self.last_results
 
-    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         if usage_sink is not None:
             usage_sink.append({
                 "kind": "answer", "model": "m",
@@ -999,7 +999,7 @@ class _MeteredBot:
             })
         return "answer"
 
-    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         if usage_sink is not None:
             usage_sink.append({
                 "kind": "answer", "model": "m",

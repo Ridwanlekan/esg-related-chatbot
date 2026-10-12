@@ -9,6 +9,7 @@ from transformers import AutoTokenizer
 
 from chatbot import model_utils, telemetry
 from chatbot.ingest import ingest_documents, recursive_split
+from chatbot.languages import language_directive, normalize_language
 from chatbot.model_utils import BASE_DIR, env_or_local_model
 from chatbot.reranker import CrossEncoderReranker, mmr_lambda_value, mmr_select, reranker_enabled
 from chatbot.rewrite import rewrite_question
@@ -27,6 +28,8 @@ SYSTEM_PROMPT = (
     "in square brackets when you use it. If you don't know, say "
     "'I don't know'. Do not try to make up an answer."
 )
+
+
 
 
 def _require_env(name):
@@ -223,7 +226,43 @@ class RAGBot:
         )
         return response.choices[0].message.content
 
-    def retrieve(self, question, k=3, source=None, history=None, usage_sink=None):
+    def _no_results_reply(self, language=None):
+        lang = normalize_language(language)
+        if lang == "zh":
+            return "我不知道。没有找到相关文档。"
+        if lang == "hi":
+            return "मुझे नहीं पता। कोई प्रासंगिक दस्तावेज़ नहीं मिला।"
+        return "I don't know. No relevant documents were found."
+
+    def translate_to_english(self, question, usage_sink=None):
+        """Translate a non-English query into English for retrieval.
+
+        The index and embedding model are English-centric, so a Zh/Hi query is
+        translated before it is embedded. The original question is kept for the
+        answer prompt, so the reply still comes back in the user's language.
+        Falls back to the original question on any failure.
+        """
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a translator. Translate the user's question into "
+                    "English. Return only the English translation, no preamble."
+                ),
+            },
+            {"role": "user", "content": question},
+        ]
+        try:
+            response = self._complete(
+                "rewrite", messages, max_tokens=200, temperature=0,
+                usage_sink=usage_sink,
+            )
+            translated = (response.choices[0].message.content or "").strip()
+            return translated or question
+        except Exception:
+            return question
+
+    def retrieve(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         if self.store.count() == 0:
             # A workspace nobody has indexed yet: index it now, and if that
             # finds nothing to index, say so in words a visitor can read
@@ -235,7 +274,10 @@ class RAGBot:
                     "has to assign some to it."
                 )
         started = time.monotonic()
-        rewritten = self.rewrite_question_for_retrieval(question, history, usage_sink)
+        retrieval_question = question
+        if normalize_language(language) != "en":
+            retrieval_question = self.translate_to_english(question, usage_sink)
+        rewritten = self.rewrite_question_for_retrieval(retrieval_question, history, usage_sink)
         query_embedding = self._embed([rewritten])[0]
         results = self.store.search_hybrid(
             query_text=rewritten,
@@ -258,12 +300,13 @@ class RAGBot:
         telemetry.record_retrieval(time.monotonic() - started)
         return results
 
-    def _build_messages(self, question, results, history=None):
+    def _build_messages(self, question, results, history=None, language=None):
         context = "\n--\n".join(f"[{r.source}] {r.content}" for r in results)
         if not context:
             context = "No relevant documents were found."
         context = context[:8000]
-        messages = [{"role": "system", "content": self.system_prompt}]
+        system_content = self.system_prompt + language_directive(language)
+        messages = [{"role": "system", "content": system_content}]
         if history:
             for turn in history:
                 turn = dict(turn)
@@ -274,28 +317,28 @@ class RAGBot:
         )
         return messages
 
-    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
-        results = self.retrieve(question, k=k, source=source, history=history, usage_sink=usage_sink)
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
+        results = self.retrieve(question, k=k, source=source, history=history, usage_sink=usage_sink, language=language)
         self.last_results = results
         if not results:
-            return "I don't know. No relevant documents were found."
+            return self._no_results_reply(language)
 
         response = self._complete(
-            "answer", self._build_messages(question, results, history),
+            "answer", self._build_messages(question, results, history, language),
             max_tokens=self.max_generation_tokens,
             usage_sink=usage_sink,
         )
         return response.choices[0].message.content
 
-    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
-        results = self.retrieve(question, k=k, source=source, history=history, usage_sink=usage_sink)
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
+        results = self.retrieve(question, k=k, source=source, history=history, usage_sink=usage_sink, language=language)
         self.last_results = results
         if not results:
-            yield "I don't know. No relevant documents were found."
+            yield self._no_results_reply(language)
             return
 
         stream = self._complete(
-            "stream", self._build_messages(question, results, history),
+            "stream", self._build_messages(question, results, history, language),
             max_tokens=self.max_generation_tokens,
             stream=True,
             usage_sink=usage_sink,

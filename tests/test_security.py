@@ -8,13 +8,13 @@ from chatbot.users import UserStore
 
 
 class FakeBot:
-    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         return f"answer to: {question}"
 
-    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         yield "chunk one "
 
-    def retrieve(self, question, k=3, source=None):
+    def retrieve(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         return []
 
     def read_and_embed_data(self):
@@ -138,14 +138,14 @@ def test_rate_limiter_sliding_window():
 
 
 class EmptyBot:
-    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         raise RuntimeError("call ingest() before retrieve()")
 
-    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         raise RuntimeError("call ingest() before retrieve()")
         yield
 
-    def retrieve(self, question, k=3, source=None):
+    def retrieve(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         raise RuntimeError("call ingest() before retrieve()")
 
 
