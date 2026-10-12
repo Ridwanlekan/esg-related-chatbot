@@ -1,16 +1,16 @@
 # Direct runtime dependencies of the project (exact versions used for the dev/CI venv).
 # Transitive dependencies are resolved by pip at install time.
 openai==1.97.0
-python-dotenv==1.1.1
-python-multipart==0.0.20
+python-dotenv==1.2.4
+python-multipart==0.0.32
 sentence-transformers==5.0.0
 transformers==4.53.2
-scikit-learn==1.7.1
+scikit-learn==1.7.2
 numpy==2.3.1
 sqlite-vec==0.1.9
 httpx==0.28.1
-fastapi==0.141.1
-uvicorn==0.53.0
+fastapi==0.143.0
+uvicorn==0.54.0
 prometheus-client==0.26.0
 stripe==16.0.0
-docling==2.129.0
+docling==2.137.0
