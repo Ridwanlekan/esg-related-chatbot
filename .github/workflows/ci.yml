@@ -44,14 +44,29 @@ jobs:
           key: hf-models-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
           restore-keys: |
             hf-models-${{ runner.os }}-
+      - name: Check for an indexable corpus
+        id: corpus
+        run: |
+          # data/ always contains junk (.index db, admin.db) so "any file"
+          # is not a corpus. Only real documents count - and the harness has
+          # the same guard, so this skip is just a noisier form of it.
+          if find data -type f \
+            ! -name '*.db' ! -name '*.sqlite3' \
+            ! -path 'data/.index/*' ! -path 'data/.docling_vet/*' \
+            -print -quit 2>/dev/null | grep -q .; then
+            echo "has_corpus=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_corpus=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Build index and run retrieval eval
+        if: steps.corpus.outputs.has_corpus == 'true'
         run: >-
           python -m chatbot.evaluate
           --set evals/eval_set.json
           --k 3
                                         --json eval-report.json
       - name: Upload eval report
-        if: always()
+        if: always() && steps.corpus.outputs.has_corpus == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: eval-report

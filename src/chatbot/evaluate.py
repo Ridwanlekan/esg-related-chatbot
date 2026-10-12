@@ -130,6 +130,9 @@ def main(argv=None):
     if bot.store.count() == 0:
         print("index empty - ingesting data/ ...")
         bot.ingest()
+        if bot.store.count() == 0:
+            print("no indexable documents in data/ - retrieval eval skipped")
+            return 0
 
     questions = load_eval_set(args.set)
     if args.limit:
