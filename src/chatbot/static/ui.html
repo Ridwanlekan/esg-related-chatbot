@@ -222,6 +222,11 @@
   <span id="user-badge" class="badge theme"></span>
   <span id="org-badge" class="badge hidden"></span>
   <span class="spacer"></span>
+  <select id="lang-select" title="Language" style="font-size:11px;padding:4px 6px;border-radius:8px;border:1px solid var(--border);background:var(--panel-2);color:var(--text)">
+    <option value="en">English</option>
+    <option value="zh-Hans">中文</option>
+    <option value="hi">हिन्दी</option>
+  </select>
   <a id="org-console-link" class="hidden" href="/owner" style="font-size:12px">Organisation console</a>
   <span id="session-label" class="badge">session: —</span>
   <button id="new-session">New session</button>
@@ -305,6 +310,38 @@ let inviteOrganisation = "";
 // because each notice renders on its own, and whichever ran last must not
 // unlock what the other still forbids.
 let composerBlocked = { verification: false, billing: false };
+let uiLanguage = localStorage.getItem("uiLanguage") || "en";
+
+// Minimal UI localisation: only the chat controls and the welcome line. The
+// server localises the answers themselves; this keeps the surrounding chrome
+// in step with the chosen language.
+const UI_STRINGS = {
+  en: { placeholder: "Ask about your workspace documents…", send: "Send",
+        newSession: "New session", logout: "Log out",
+        welcome: "New session. Ask me anything about your workspace documents." },
+  "zh-Hans": { placeholder: "询问您工作区的文档…", send: "发送",
+        newSession: "新会话", logout: "退出登录",
+        welcome: "新会话。关于您工作区的文档，欢迎随时提问。" },
+  hi: { placeholder: "अपने कार्यक्षेत्र दस्तावेज़ों के बारे में पूछें…", send: "भेजें",
+        newSession: "नया सत्र", logout: "लॉग आउट",
+        welcome: "नया सत्र। अपने कार्यक्षेत्र दस्तावेज़ों के बारे में कुछ भी पूछें।" },
+};
+
+function t(key) {
+  const pack = UI_STRINGS[uiLanguage] || UI_STRINGS.en;
+  return pack[key] != null ? pack[key] : UI_STRINGS.en[key];
+}
+
+function applyUiLanguage() {
+  const input = $("input");
+  if (input) input.placeholder = t("placeholder");
+  const send = $("send");
+  if (send && !send.disabled) send.textContent = t("send");
+  const ns = $("new-session");
+  if (ns) ns.textContent = t("newSession");
+  const lo = $("logout");
+  if (lo) lo.textContent = t("logout");
+}
 
 function tzOffset() { return -new Date().getTimezoneOffset(); }
 function authHeaders(json) {
@@ -909,7 +946,7 @@ async function loadMessages(id) {
   }
 }
 
-function renderWelcomeMsg() { addMsg("bot", "New session. Ask me anything about your workspace documents."); }
+function renderWelcomeMsg() { addMsg("bot", t("welcome")); }
 
 async function fetchSessions() {
   const res = await api("/sessions?limit=" + SESSION_PAGE + "&offset=" + sessionOffset, { headers: authHeaders(), auth: true });
@@ -982,7 +1019,7 @@ async function send() {
     const res = await api("/chat/stream", {
       method: "POST",
       headers: authHeaders(true),
-      body: JSON.stringify({ question: q, session_id: sessionId }),
+      body: JSON.stringify({ question: q, session_id: sessionId, language: uiLanguage }),
       auth: true,
     });
     if (!res.ok) {
@@ -1274,7 +1311,7 @@ async function speak(text, btn) {
     const res = await api("/voice/tts", {
       method: "POST",
       headers: authHeaders(true),
-      body: JSON.stringify({ text: clean }),
+      body: JSON.stringify({ text: clean, language: uiLanguage }),
       auth: true,
     });
     if (!res.ok) {
@@ -1352,7 +1389,7 @@ async function doSearch() {
   const q = $("search-q").value.trim();
   if (!q) return;
   const res = await api("/search", {
-    method: "POST", headers: authHeaders(true), body: JSON.stringify({ question: q, k: 5 }), auth: true,
+    method: "POST", headers: authHeaders(true), body: JSON.stringify({ question: q, k: 5, language: uiLanguage }), auth: true,
   });
   if (!res.ok) return;
   const data = await res.json();
@@ -1748,6 +1785,17 @@ $("verify-resend").addEventListener("click", async () => {
   }
   health();
   setInterval(health, 30000);
+  // init language selector
+  const langSel = $("lang-select");
+  if (langSel) {
+    langSel.value = uiLanguage;
+    langSel.addEventListener("change", () => {
+      uiLanguage = langSel.value || "en";
+      localStorage.setItem("uiLanguage", uiLanguage);
+      applyUiLanguage();
+    });
+  }
+  applyUiLanguage();
   if (token) {
     try {
       // Returning from an upgrade checkout: confirm it before /me so the

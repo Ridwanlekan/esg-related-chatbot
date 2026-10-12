@@ -21,15 +21,15 @@ class WorkspaceBot:
         ]
         self.store = SimpleNamespace(count=lambda: 100)
 
-    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         self.ask_calls.append(question)
         return f"{self.tag}: answer to '{question}'"
 
-    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         self.ask_calls.append(question)
         yield f"{self.tag}: "
 
-    def retrieve(self, question, k=3, source=None):
+    def retrieve(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         return self.last_results
 
     def read_and_embed_data(self):

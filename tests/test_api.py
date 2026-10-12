@@ -23,14 +23,14 @@ class FakeBot:
         self.store = SimpleNamespace(count=lambda: 350)
         self.ask_calls = []
 
-    def retrieve(self, question, k=3, source=None):
+    def retrieve(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         return self.last_results
 
-    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         self.ask_calls.append({"history": history})
         return f"answer to: {question}"
 
-    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         yield "chunk one "
         yield "chunk two"
 

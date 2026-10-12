@@ -29,7 +29,7 @@ class UsageBot:
         )]
         return self.last_results
 
-    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         if usage_sink is not None:
             usage_sink.append({
                 "kind": "answer", "model": "gpt-4.1-mini",
@@ -37,7 +37,7 @@ class UsageBot:
             })
         return "usage answer"
 
-    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         if usage_sink is not None:
             usage_sink.append({
                 "kind": "rewrite", "model": "gpt-4.1-mini",

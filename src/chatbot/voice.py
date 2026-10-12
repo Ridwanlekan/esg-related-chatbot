@@ -57,6 +57,50 @@ DEFAULT_KOKORO_MODEL = "models/tts/kokoro-v1.0.onnx"
 DEFAULT_KOKORO_VOICES = "models/tts/voices-v1.0.bin"
 DEFAULT_KOKORO_VOICE = "af_heart"
 
+# Kokoro's espeak G2P expects its own language codes. English keeps whatever
+# VOICE_TTS_LANG is configured to; the non-English languages map onto the
+# codes Kokoro's multilingual voice pack uses ("cmn" for Mandarin, "hi" for
+# Hindi). Unknown languages fall back to the configured default.
+KOKORO_LANG_BY_LANGUAGE = {"zh": "cmn", "hi": "hi"}
+# Voice families in the pack: zf_/zm_ read Mandarin, hf_/hm_ read Hindi. An
+# English voice phonemising Zh/Hi text is audibly wrong, so a language with a
+# dedicated voice family overrides an English-configured voice.
+KOKORO_VOICE_BY_LANGUAGE = {"zh": "zf_xiaoxiao", "hi": "hf_alpha"}
+KOKORO_VOICE_PREFIXES = {"zh": ("zf_", "zm_"), "hi": ("hf_", "hm_")}
+
+
+def _normalize_language_safe(language):
+    try:
+        from chatbot.languages import normalize_language
+
+        return normalize_language(language)
+    except Exception:
+        return "en"
+
+
+def kokoro_lang(language=None):
+    """Resolve a request language onto a Kokoro G2P language code."""
+    default = os.environ.get("VOICE_TTS_LANG", "en-gb")
+    normalized = _normalize_language_safe(language) if language else "en"
+    if normalized == "en":
+        return default
+    return KOKORO_LANG_BY_LANGUAGE.get(normalized, default)
+
+
+def kokoro_voice(language=None):
+    """Resolve a request language onto a Kokoro voice."""
+    default = os.environ.get("VOICE_TTS_VOICE", DEFAULT_KOKORO_VOICE)
+    if not language:
+        return default
+    normalized = _normalize_language_safe(language)
+    prefixes = KOKORO_VOICE_PREFIXES.get(normalized)
+    if not prefixes:
+        return default
+    # Honour an operator's explicit choice when it already speaks the language.
+    if default.startswith(prefixes):
+        return default
+    return KOKORO_VOICE_BY_LANGUAGE.get(normalized, default)
+
 _stt_provider = None
 _tts_provider = None
 
@@ -233,10 +277,12 @@ class OpenAITTS:
     def __init__(self, client):
         self._client = client
 
-    def synthesize(self, text):
+    def synthesize(self, text, language=None):
         # The deployment name this provider actually called, not the ledger
         # label: the two differ when the env selects a provider other than
         # this one, and the error message must name what was requested.
+        # `language` is accepted for signature parity with the local provider;
+        # the OpenAI speech models are multilingual and need no code.
         model = _openai_tts_deployment()
         try:
             response = self._client.audio.speech.create(
@@ -320,10 +366,10 @@ class LocalKokoroTTS:
     def voices(self):
         return list(self._ensure_model().get_voices())
 
-    def synthesize(self, text):
-        voice = os.environ.get("VOICE_TTS_VOICE", DEFAULT_KOKORO_VOICE)
+    def synthesize(self, text, language=None):
+        voice = kokoro_voice(language)
         speed = float(os.environ.get("VOICE_TTS_SPEED", "1.0"))
-        lang = os.environ.get("VOICE_TTS_LANG", "en-gb")
+        lang = kokoro_lang(language)
         with self._lock:
             model = self._ensure_model()
             try:

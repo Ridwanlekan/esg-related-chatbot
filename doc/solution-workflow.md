@@ -234,6 +234,14 @@ Plan tiers (from the pricing proposal's table):
 - Search (`POST /search`) is retrieval-only, no LLM.
 - Voice: browser recording → local faster-whisper STT → transcript review →
   send; TTS reads answers aloud. Speech is bundled, not separately metered.
+- Multilingual answers (English, Simplified Chinese `zh-Hans`, Hindi `hi`):
+  a question typed in Chinese or Hindi is answered in that language; an English
+  question follows the UI language selector, defaulting to English. Retrieval
+  stays English-only — a Zh/Hi question is translated to English before it is
+  embedded, while the original question is kept so the answer returns in the
+  user's language. `POST /chat`, `/chat/stream`, `/search` and `/voice/tts`
+  accept an optional `language` field; Kokoro TTS switches to Mandarin/Hindi
+  voices for those languages.
 
 ---
 

@@ -24,13 +24,13 @@ class FakeBot:
         self.last_results = []
         self.source = source
 
-    def ask(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         return "answer"
 
-    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None):
+    def ask_stream(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         yield "answer"
 
-    def retrieve(self, question, k=3, source=None):
+    def retrieve(self, question, k=3, source=None, history=None, usage_sink=None, language=None):
         return []
 
     def read_and_embed_data(self):
@@ -610,7 +610,7 @@ class TestPageCitations:
         client = self._client(data_dir, self._bot())
         token = _token(client, "page6@corp.com", "finance")
         bot = client.app.state.bot
-        bot.retrieve = lambda question, k=3, source=None: bot.last_results
+        bot.retrieve = lambda question, k=3, source=None, history=None, usage_sink=None, language=None: bot.last_results
         res = client.post("/search", json={"question": "q"}, headers=_auth(token))
         assert res.json()["results"][0]["page_start"] == 42
 
