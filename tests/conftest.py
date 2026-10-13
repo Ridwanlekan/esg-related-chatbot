@@ -47,6 +47,10 @@ _SCRUB = {
     "STRIPE_PRICE_QUESTION_OVERAGE",
     "STRIPE_METER_EXTRA_SEATS",
     "STRIPE_METER_QUESTIONS",
+    # Organisation scoping: scrub so a developer who ran the legacy migration and
+    # set ALLOW_LEGACY_CONTENT=0 in their .env does not break the suites that rely
+    # on the default-on fallback. Unset -> documents.py defaults it to "1".
+    "ALLOW_LEGACY_CONTENT",
 }
 
 
