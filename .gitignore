@@ -1,6 +1,7 @@
 # Secrets / local configuration
 .env
 *.env
+.env.*
 !**/env_example.txt
 
 # Local workflow notes (never commit)

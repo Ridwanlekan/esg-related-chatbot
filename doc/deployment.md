@@ -81,6 +81,45 @@ Scale **up** (bigger SKU), not **out**, until you move to Postgres.
 
 ---
 
+## 1c. Quick throwaway test (B2, delete the same day)
+
+For a smoke test you don't need the OIDC/GitHub wiring yet. Two helper scripts
+provision a **B2** Linux Web App running the published image, apply the app
+settings and wait for `/health`, then delete the whole resource group when you
+are done. B2 is billed per hour (~US$0.03/hr), so a same-day test is well under
+a dollar.
+
+```bash
+# One-time: sign in (skip if already signed in)
+az login
+
+# From the repo root, load the app credentials. Your .env may use "KEY = value"
+# (spaces around '='), which bash cannot source — normalise it once first:
+sed -i.bak -E 's/^([A-Za-z_][A-Za-z0-9_]*)[[:space:]]+=/\1=/' .env
+set -a; . ./.env; set +a
+
+scripts/azure-test-up.sh      # B2 by default; provisions + deploys + waits for /health
+# ... open the printed https://<app>.azurewebsites.net URL, seed data via /admin ...
+
+RG=esg-chatbot-test-rg scripts/azure-test-down.sh   # deletes the whole resource group
+```
+
+> `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `OPENAI_API_VERSION` and
+> `MODEL_NAME` all come from `.env`. The script defaults to **B2** and model
+> `gpt-4.1-mini` / API version `2025-04-14` if those are not set.
+
+Override any default with env vars: `RG`, `APP`, `LOC`, `PLAN`, `SKU`, `IMAGE`,
+`MODEL_NAME`, `OPENAI_API_VERSION`; set `GHCR_USER`/`GHCR_TOKEN` if the package
+is private. The scripts are the fast path — §2 onward is the production path
+(OIDC, least-privilege identity, persistent settings).
+
+> **Free (F1) is not enough for this image.** F1 gives 1 GB RAM / 60 CPU-min per
+> day; the container loads torch + docling + the embedding/reranker models (plus
+> ~840 MB of voice weights), so it OOMs. Use **B1** (1.75 GB, light corpora) or
+> **B2** (3.5 GB, safe default): `SKU=B1 scripts/azure-test-up.sh`.
+
+---
+
 ## 2. Provision Azure
 
 Run these in Cloud Shell. Replace `<...>` placeholders.
@@ -314,6 +353,7 @@ az webapp ssh      -g "$RG" -n "$APP"          # shell into the container
 | App shows "Application Error" / 503 on start | missing `AZURE_OPENAI_*` (fails fast) | set the app settings in §3 |
 | `/health` ok but `/chat` 503 | index empty | seed + re-index (§5) |
 | Container pull fails | private GHCR without creds | add registry credentials (§2.2a) |
+| `/admin` or `/ui` shows "not found" | `static/*.html` missing from the installed wheel | declare `package-data` in `pyproject.toml` (`chatbot = ["static/*.html"]`) and rebuild |
 | Admin cookie not set | HTTPS required | use the https URL; `ADMIN_SESSION_SECURE=1` |
 | Slow first response | cold start + model load | scale up the plan |
 | Data lost after redeploy | app-service storage disabled | ensure `WEBSITES_ENABLE_APP_SERVICE_STORAGE=true` |
