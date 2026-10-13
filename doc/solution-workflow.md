@@ -1,6 +1,8 @@
 # Solution workflow — ESG Workspace Chatbot
 
-Status: current as of 2026-10-10. Branch `feat/organisation-scoping`.
+Status: current as of 2026-10-13 (`main`). Incorporates the organisation,
+billing, free-tier, owner-console and multilingual work; the app hardening
+(security headers + admin CSRF) is documented in `README.md` §Security.
 
 This document is the end-to-end workflow of the shipped system: who the actors
 are, what each one does, and how the pieces fit together. It reflects the

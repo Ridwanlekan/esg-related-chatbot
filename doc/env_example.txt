@@ -120,3 +120,52 @@ TOKENIZERS_PARALLELISM = False
 # TTS switches to a Mandarin or Hindi voice for those languages (ignoring an
 # English VOICE_TTS_VOICE when it would mispronounce the text).
 # SUPPORTED_LANGS = en,zh,hi      # informational; the set is fixed in code
+
+# --- Organisations, billing & free tier ---------------------------------------
+# The product is sold per organisation through Stripe. An organisation buys a
+# plan that grants workspaces, seats and a monthly question pool; payment state
+# is written by the signed Stripe webhook. See doc/solution-workflow.md for the
+# end-to-end workflow.
+#
+# STRIPE_SECRET_KEY = ""          # Stripe API key (sk_...); required for checkout/portal/webhook
+# STRIPE_WEBHOOK_SECRET = ""      # whsec_... verifies POST /billing/webhook signatures
+# STRIPE_PORTAL_CONFIGURATION_ID = ""   # optional pinned portal config that enables plan
+#                                 # switching; if unset and the account default already switches,
+#                                 # that is used, otherwise one named "esg-plan-switcher" is created
+#
+# Base per-workspace prices — a tier is purchasable only when its price ids are set:
+# STRIPE_PRICE_TEAM_MONTHLY = ""
+# STRIPE_PRICE_TEAM_ANNUAL = ""
+# STRIPE_PRICE_BUSINESS_MONTHLY = ""
+# STRIPE_PRICE_BUSINESS_ANNUAL = ""
+# STRIPE_PRICE_ENTERPRISE_ANNUAL = ""
+#
+# Metered add-ons (extra seats past the per-workspace allowance, question overage):
+# STRIPE_PRICE_EXTRA_SEAT_TEAM = ""
+# STRIPE_PRICE_EXTRA_SEAT_TEAM_ANNUAL = ""
+# STRIPE_PRICE_EXTRA_SEAT_BUSINESS = ""
+# STRIPE_PRICE_EXTRA_SEAT_BUSINESS_ANNUAL = ""
+# STRIPE_PRICE_QUESTION_OVERAGE = ""
+# STRIPE_PRICE_QUESTION_OVERAGE_ANNUAL = ""
+#
+# Free tier: self-registration lands in the shared sample organisation (_sample).
+# MAX_FREE_ACCOUNTS = 500         # cap on free accounts; 0 closes self-signup (503 at the cap)
+# FREE_TIER_QUESTION_CAP = 50     # answered questions per account; 0/negative = unlimited
+# EMAIL_VERIFICATION_REQUIRED = 1 # 1 gates free accounts behind a confirmed email
+# VERIFICATION_TOKEN_TTL_HOURS = 48   # lifetime of a confirmation link
+#
+# Locally, Stripe webhooks do not arrive without a forwarder:
+#   stripe listen --forward-to localhost:8000/billing/webhook
+# Without it, reconcile with POST /admin/organisations/{id}/billing/refresh.
+
+# --- Email (verification + password reset) ------------------------------------
+# With SMTP_HOST set, mail goes through the relay; otherwise messages are written
+# to the admin outbox (viewed at /admin/emails) so onboarding still works with no
+# mail path. Set public_base_url in admin settings so emailed links match the
+# public hostname. For production, verify your sending domain (SPF/DKIM/DMARC).
+#
+# SMTP_HOST = ""                  # e.g. smtp.postmarkapp.com; empty = admin outbox fallback
+# SMTP_PORT = 587                 # STARTTLS only; implicit TLS (465) is not implemented
+# SMTP_USER = ""
+# SMTP_PASSWORD = ""
+# SMTP_FROM = "ESG Assistant <no-reply@yourdomain.com>"   # default: no-reply@localhost

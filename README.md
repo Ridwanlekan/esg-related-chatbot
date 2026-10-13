@@ -1,6 +1,6 @@
 # ESG Workspace Chatbot
 
-A retrieval-augmented generation (RAG) chatbot platform where each user signs up into a **workspace** (category) — Finance or HR — and chats with a specialized assistant that answers strictly from that workspace's documents. Documents are chunked, embedded, and stored in per-workspace persistent vector indexes; each query is routed deterministically to the user's workspace index.
+A retrieval-augmented generation (RAG) chatbot platform where each user signs up into a **workspace** (category) — Finance or HR — and chats with a specialized assistant that answers strictly from that workspace's documents. Documents are chunked, embedded, and stored in per-workspace persistent vector indexes; each query is routed deterministically to the user's workspace index. On the paid path an **organisation** owns many workspaces, seats and billing (see [Organisations, roles & billing](#organisations-roles--billing)); free accounts use a capped sample workspace. Full workflow: [`doc/solution-workflow.md`](doc/solution-workflow.md).
 
 > Note: `data/demo/` files are placeholders (Jupiter, Ada Lovelace, CRISPR). `data/finance/` and `data/hr/` hold the real ESG documents (IFRS S1/S2, ESG-for-HR); drop files into a workspace folder and re-index.
 
@@ -19,6 +19,9 @@ A retrieval-augmented generation (RAG) chatbot platform where each user signs up
 - **Conversational follow-ups**: follow-up questions are rewritten into standalone queries using chat history (`rewrite.py`) so turns like "which is the largest?" retrieve against the right context.
 - **HTTP API + UI**: FastAPI service with streaming (SSE), per-user session memory (SQLite), signup/login UI, and a self-contained browser UI (`/ui`, no CDN).
 - **Voice mode**: a mic button beside the chat input records a question, transcribes it into the composer for review, then reads the answer back aloud. Both halves default to local models with no per-request cost — faster-whisper for STT, Kokoro for TTS — and either can be switched to the Azure OpenAI endpoint with one env var.
+- **Organisations, roles & the owner console**: users belong to an **organisation** with a role (`owner`, `admin`, or a seat). Owners and admins manage members, seats, invites and workspace access from the organisation console at **`/owner`**, and can reach every workspace the organisation owns. The platform admin console (`/admin`) stays above it for cross-customer operations.
+- **Plans, billing & free tier**: organisations buy a plan (Team / Business / Enterprise) that grants workspaces, seats and a monthly question pool; billing runs through Stripe (Checkout, customer portal, metered extra seats and question overage). Free self-registration lands in a shared capped sample organisation with email confirmation.
+- **Multilingual answers**: chat, voice and UI answer in **English, Simplified Chinese (zh-Hans) and Hindi (hi)**. A question written in Chinese or Hindi is answered in that language; retrieval itself stays English-only, translating the query first.
 
 ## Project Structure
 
@@ -27,12 +30,24 @@ esg-chatbot/
 ├── src/chatbot/          # Python package
 │   ├── rag.py            # RAGBot: orchestration, embedding, LLM answering
 │   ├── workspaces.py     # workspace/category config, labels, per-workspace bots
-│   ├── users.py          # UserStore: accounts, passwords (scrypt), JWT tokens
+│   ├── users.py          # UserStore: accounts, passwords (scrypt), JWT tokens, org roles
+│   ├── admin_store.py    # platform-admin data: organisations, content, usage, audit
+│   ├── billing.py        # Stripe plans, checkout, portal, webhook, meters
+│   ├── content_library.py # shared content library assigned to organisations/workspaces
+│   ├── languages.py      # language detect/resolve (English / zh-Hans / Hindi)
+│   ├── email_sender.py   # verification/reset mail (SMTP, or admin outbox fallback)
+│   ├── documents.py      # citation resolution + signed download links
+│   ├── download_links.py # HMAC-signed, short-lived per-document download tokens
+│   ├── security.py       # rate limiting, security headers, proxy trust
+│   ├── admin_security.py # admin session cookie + CSRF (double-submit)
+│   ├── telemetry.py      # usage/cost ledger (questions, tokens, voice, cost)
 │   ├── smalltalk.py      # greeting detection + day/date-aware persona replies
 │   ├── ingest.py         # chunking + incremental ingestion pipeline
 │   ├── docling_loader.py # multi-format parsing via Docling (docs/images/ASR)
 │   ├── vector_store.py   # persistent vector store (SQLite + sqlite-vec)
+│   ├── reranker.py       # local cross-encoder rerank
 │   ├── rewrite.py        # query rewriting from chat history (python module)
+│   ├── voice.py          # STT/TTS providers (faster-whisper/Kokoro or Azure)
 │   ├── api.py            # FastAPI HTTP service (esg-api command)
 │   ├── session_store.py  # per-user session chat memory (SQLite)
 │   ├── view_index.py     # index inspector (view-index command)
@@ -129,6 +144,11 @@ POST /chat (Authorization: Bearer <jwt>, X-Timezone-Offset: <minutes>) →
 | `POST /auth/verify-email` | confirm an address from the link (`token`) |
 | `POST /auth/resend-verification` | send the confirmation again (auth required, rate-limited) |
 | `GET /verify-email` | the landing page the emailed link opens |
+| `POST /auth/forgot-password` | email a password-reset link (generic reply; never reveals whether an account exists) |
+| `POST /auth/reset-password` | resolve a reset link → fresh session (single-use, 2-hour expiry) |
+| `GET /reset-password` | the reset page the emailed link opens |
+| `POST /me/password` | change own password (rotates the session token) |
+| `POST /me/workspace` | switch the account's active workspace (within its reachable set) |
 
 User chat endpoints require `Authorization: Bearer <jwt>`. `AUTH_SECRET` signs the tokens — set it in production (tokens are invalidated on restart if it's missing, since an ephemeral secret is used).
 
@@ -157,6 +177,51 @@ An unconfirmed free account is refused at `/chat`, `/chat/stream`, `/search`,
 `/auth/resend-verification` stay reachable so the user can recover. Operators
 can confirm or revoke from `/admin/verifications` and
 `POST /admin/users/{id}/verify`.
+
+## Organisations, roles & billing
+
+The product is sold **per organisation**, not per individual. An organisation
+buys a plan granting a number of workspaces, seats and a monthly question pool,
+and its members consume it. `GET /me` reports the caller's `organisation` and
+(if a free account) `free_tier`. See [`doc/solution-workflow.md`](doc/solution-workflow.md)
+for the full end-to-end workflow.
+
+**Roles** live in `org_roles` — `owner` (exactly one), `admin`, or a seat
+(member). Owners and admins can reach and chat in every workspace the
+organisation owns; a seat reaches only the workspaces explicitly granted to it
+(and may hold several, switching with `POST /me/workspace`). System
+organisations (`_sample`, `_default`) have no owner and are never billed.
+
+**Organisation console** at **`/owner`** (manager-gated, always scoped to the
+caller's own organisation — no route accepts an `organisation_id`):
+
+| Tab | Endpoints | Shows / does |
+| --- | --------- | ------------ |
+| Overview | `GET /org/overview` | Totals (workspaces, members, chunks, questions vs pool), per-workspace status, subscription meter. |
+| Analytics | `GET /org/usage?range=` | Tokens/cost for the organisation, per period, workspace and call type. |
+| People | `GET/POST /org/members`, `/org/invites` | Members with roles/access; add seat, change role, remove, reset password, adjust workspace access, mint invites, transfer ownership. |
+| Billing | `/billing/usage`, `GET /org/plans` | Current plan/status/period, pool meter, seats per workspace, plan catalog. |
+
+**Billing** runs through Stripe. `POST /billing/checkout` (owner) creates a
+Checkout Session — one base line at quantity = workspace count plus metered
+extra-seat and question-overage lines — and `POST /billing/portal` opens the
+customer portal to change/cancel. Subscriptions are written by the signed
+`POST /billing/webhook`; a free account can self-serve with
+`POST /billing/upgrade`, and `POST /billing/sync` re-confirms a checkout on
+return. Related variables: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
+`STRIPE_PRICE_*` (a tier is purchasable only when its price ids are set),
+`FREE_TIER_QUESTION_CAP`, `MAX_FREE_ACCOUNTS`.
+
+Locally, Stripe webhooks do not arrive without a forwarder:
+
+```bash
+stripe listen --forward-to localhost:8000/billing/webhook
+# without it: reconcile via POST /admin/organisations/{id}/billing/refresh
+```
+
+The **platform admin console** at `/admin` sits above the org console for
+cross-customer work (create/delete organisations, move users, assign content
+from the library, run legacy migrations, and cross-customer Usage & Cost).
 
 ## Retrieval pipeline
 
@@ -231,6 +296,10 @@ esg-chatbot
 ```
 
 The first run builds the index (embeds the documents). Subsequent runs reuse it and only re-index what changed. Type `exit` to quit. Note: the CLI indexes every workspace folder into one combined index for local inspection — the HTTP service keeps workspaces isolated.
+
+### Multilingual answers
+
+Chat, search and voice answer in **English, Simplified Chinese (`zh`/`zh-Hans`) and Hindi (`hi`)** — no configuration needed. `/chat`, `/chat/stream`, `/search` and `/voice/tts` accept an optional `language` tag; a question written in Chinese or Hindi is answered in that language regardless, while an English question follows the UI selection (default English). Retrieval stays English-only, so a non-English query is translated to English before embedding (one extra LLM call, metered under the `rewrite` kind) and the original wording is kept for the answer. Voice STT auto-detects the spoken language, and Kokoro TTS switches to a Mandarin or Hindi voice. `SUPPORTED_LANGS = en,zh,hi` is informational; the set is fixed in code (`src/chatbot/languages.py`).
 
 ### Inspect the index
 
@@ -561,3 +630,14 @@ Metrics: **hit_rate@k** (≥1 expected source retrieved), **recall@k** (coverage
 
 - **Unit tests** — installs from `requirements.txt` and runs `pytest`.
 - **Retrieval eval** — builds the index from `data/` (downloads the local embedding model) and gates on `hit_rate ≥ 0.8`, `recall ≥ 0.8`, `mrr ≥ 0.7`; uploads `eval-report.json` as an artifact. No LLM is used, so the gate has no network/secret dependency on Azure.
+- **Lint workflows** — `actionlint` validates every workflow file.
+
+Alongside CI, `main` is protected by these workflows:
+
+- **Container** (`container.yml`) — builds the Docker image on every PR (validation) and pushes to GHCR on `main`/tags (see [Deployment](#deployment-cicd)).
+- **CodeQL** — static analysis on push/PR plus a weekly schedule.
+- **Secret scan** — scans for committed secrets on push/PR.
+- **Dependency review** — blocks PRs that introduce vulnerable/licence-problematic dependencies.
+- **Deploy** — deploys the published image to Azure after Container succeeds on `main` (inert until configured).
+
+Dependency updates are automated via `.github/dependabot.yml` (pip, GitHub Actions and Docker, weekly, grouped). `SECURITY.md` documents how to report a vulnerability privately.
