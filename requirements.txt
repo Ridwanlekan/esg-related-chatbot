@@ -1,6 +1,6 @@
 # Direct runtime dependencies of the project (exact versions used for the dev/CI venv).
 # Transitive dependencies are resolved by pip at install time.
-openai==1.97.0
+openai==3.28.0
 python-dotenv==1.2.4
 python-multipart==0.0.32
 sentence-transformers==6.1.0
