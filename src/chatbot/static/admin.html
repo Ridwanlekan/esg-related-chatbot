@@ -523,6 +523,17 @@ let refreshTimer = null;
 let tokens = {};
 let docOffsets = {};
 let sharedState = { documents: [], workspaces: [] };
+const CSRF_COOKIE = "esg_admin_csrf";
+let csrfFromLogin = "";
+
+// CSRF double-submit: echo the readable cookie (or the value returned by
+// /admin/login) in the X-CSRF-Token header on every admin request. A cross-site
+// page can make the browser send the cookie but cannot read it to set the header.
+function csrfToken() {
+  if (csrfFromLogin) return csrfFromLogin;
+  const m = document.cookie.match(new RegExp("(?:^|;\\s*)" + CSRF_COOKIE + "=([^;]+)"));
+  return m ? decodeURIComponent(m[1]) : "";
+}
 
 const tabs = [
   ["tab-overview", "view-overview"],
@@ -563,6 +574,8 @@ function authHeaders(json = true) {
   if (adminKey) h["authorization"] = "Bearer " + adminKey;
   else if (basicUser && basicPass) h["authorization"] = "Basic " + btoa(basicUser + ":" + basicPass);
   if (totpCode) h["x-admin-totp"] = totpCode;
+  const csrf = csrfToken();
+  if (csrf) h["x-csrf-token"] = csrf;
   return h;
 }
 
@@ -739,6 +752,7 @@ async function loginAdmin() {
     const d = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(d.detail || res.status + " " + res.statusText);
     clearStoredCreds();
+    csrfFromLogin = d.csrf || "";
     sessionActive = true;
     sessionActor = d.actor || "";
     delete $("key-editor").dataset.open;
@@ -758,6 +772,7 @@ async function logoutAdmin() {
     await fetch("/admin/logout", { method: "POST" });
   } catch (e) { /* best-effort */ }
   clearStoredCreds();
+  csrfFromLogin = "";
   sessionActive = false;
   sessionActor = "";
   delete $("key-editor").dataset.open;
