@@ -64,7 +64,7 @@ jobs:
           python -m chatbot.evaluate
           --set evals/eval_set.json
           --k 3
-                                        --json eval-report.json
+          --json eval-report.json
       - name: Upload eval report
         if: always() && steps.corpus.outputs.has_corpus == 'true'
         uses: actions/upload-artifact@v4
