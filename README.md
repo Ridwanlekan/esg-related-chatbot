@@ -242,6 +242,8 @@ docker compose up --build     # bake models, then serve on :8000
 
 ## Deployment (CI/CD)
 
+> Step-by-step Azure runbook (provisioning, OIDC, app settings, first boot, go-live): [`doc/deployment.md`](doc/deployment.md).
+
 **Container publishing** — `.github/workflows/container.yml` builds the image on every PR (validation only) and, on `main`/version tags, pushes to GitHub Container Registry:
 
 ```

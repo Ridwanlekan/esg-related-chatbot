@@ -31,20 +31,39 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Set container settings
+      - name: Configure app settings and platform
+        # Only runs once the repo is configured with a target. Secrets are NOT
+        # set here on purpose - keep them in Azure app settings or Key Vault.
+        # See doc/deployment.md.
         if: vars.AZURE_RESOURCE_GROUP != ''
         uses: azure/cli@v3
         with:
           inlineScript: |
-            az webapp config appsettings set \
-              --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
-              --name "${{ vars.AZURE_WEBAPP_NAME }}" \
-              --settings WEBSITES_PORT=8000 WEBSITES_ENABLE_APP_SERVICE_STORAGE=true \
-                INDEX_DIR=/home/esg-index \
-                DATA_DIR=/home/esg-data \
-                DOCLING_VET_DIR=/home/esg-docling-vet \
-                'FORWARDED_ALLOW_IPS=*' \
-                'TRUSTED_PROXY_IPS=*'
+            set -eu
+            set -f  # no globbing, so FORWARDED_ALLOW_IPS=* survives unquoted
+            RG="${{ vars.AZURE_RESOURCE_GROUP }}"
+            APP="${{ vars.AZURE_WEBAPP_NAME }}"
+
+            settings="WEBSITES_PORT=8000 WEBSITES_ENABLE_APP_SERVICE_STORAGE=true"
+            settings="$settings INDEX_DIR=/home/esg-index DATA_DIR=/home/esg-data"
+            settings="$settings DOCLING_VET_DIR=/home/esg-docling-vet"
+            settings="$settings FORWARDED_ALLOW_IPS=* TRUSTED_PROXY_IPS=*"
+
+            # Optional non-secret overrides from repo variables. Sent only when
+            # set, so a value configured in Azure is never clobbered by a blank.
+            if [ -n "${{ vars.MODEL_NAME }}" ]; then settings="$settings MODEL_NAME=${{ vars.MODEL_NAME }}"; fi
+            if [ -n "${{ vars.OPENAI_API_VERSION }}" ]; then settings="$settings OPENAI_API_VERSION=${{ vars.OPENAI_API_VERSION }}"; fi
+            if [ -n "${{ vars.LOG_LEVEL }}" ]; then settings="$settings LOG_LEVEL=${{ vars.LOG_LEVEL }}"; fi
+            if [ -n "${{ vars.VOICE_TTS_VOICE }}" ]; then settings="$settings VOICE_TTS_VOICE=${{ vars.VOICE_TTS_VOICE }}"; fi
+            if [ -n "${{ vars.CORS_ORIGINS }}" ]; then settings="$settings CORS_ORIGINS=${{ vars.CORS_ORIGINS }}"; fi
+
+            az webapp config appsettings set -g "$RG" -n "$APP" --settings $settings
+
+            # HTTPS-only, minimum TLS, and container health check (idempotent).
+            az webapp update -g "$RG" -n "$APP" --set httpsOnly=true
+            az webapp config set -g "$RG" -n "$APP" \
+              --min-tls-version 1.2 \
+              --generic-configurations '{"healthCheckPath":"/health"}'
 
       - name: Deploy container
         uses: azure/webapps-deploy@v3

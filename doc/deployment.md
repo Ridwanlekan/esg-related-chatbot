@@ -1,0 +1,327 @@
+# Deployment runbook — Azure (App Service, container)
+
+This is the operator's guide to running the ESG Workspace Chatbot in Azure.
+It is written for a first Azure deployment and assumes you can copy/paste into
+**Azure Cloud Shell** (`https://shell.azure.com`) or a terminal with the Azure
+CLI (`az`) installed. Nothing here contains secrets — every secret is a
+placeholder you replace.
+
+> Companion docs: `README.md` (features, API), `doc/solution-workflow.md`
+> (product workflow), `doc/env_example.txt` (every environment variable).
+
+---
+
+## 0. How the pieces fit
+
+```
+GitHub main push
+  └─ CI (tests + eval)            .github/workflows/ci.yml
+  └─ Container                    .github/workflows/container.yml
+        builds the image, pushes ghcr.io/ridwanlekan/esg-related-chatbot:latest
+          └─ Deploy               .github/workflows/deploy.yml
+                OIDC login → sets app settings → pulls :latest into Azure Web App
+                                                              │
+                                    Azure App Service (Linux container)
+                                      /home/esg-index   (vector + sessions + admin DB)
+                                      /home/esg-data    (documents)
+                                      /home/esg-docling-vet
+```
+
+- The image already contains the models (embeddings, reranker, whisper, Kokoro),
+  so the container needs no runtime downloads.
+- **Data is not in the image** — `/home/esg-data` and `/home/esg-index` are
+  created empty on first boot. You seed them (see §5).
+- `Deploy` is inert until the repo variables in §1 are set.
+
+---
+
+## 1. GitHub setup (do this first)
+
+### 1.1 Create the `production` environment
+Repo → **Settings → Environments → New environment** → name it **`production`**.
+(Optional: add required reviewers so a deploy waits for approval.)
+
+- Add **Secrets** (Environment secrets on `production`):
+  - `AZURE_CLIENT_ID`
+  - `AZURE_TENANT_ID`
+  - `AZURE_SUBSCRIPTION_ID`
+- Add **Variables** (repository → Settings → Variables → Actions):
+  | Variable | Required | Example |
+  | --- | --- | --- |
+  | `AZURE_WEBAPP_NAME` | yes | `esg-chatbot-demo` |
+  - `AZURE_RESOURCE_GROUP` (optional but recommended; when set, the workflow
+    also writes the storage/proxy settings) → e.g. `esg-rg`
+  - Optional non-secret app settings the workflow will sync when set:
+    `MODEL_NAME`, `OPENAI_API_VERSION`, `LOG_LEVEL`, `VOICE_TTS_VOICE`,
+    `CORS_ORIGINS`.
+
+> `deploy.yml` uses `environment: production`, so the OIDC token's subject is
+> `repo:Ridwanlekan/esg-related-chatbot:environment:production`. The federated
+> credential you create in §2.2 must match that subject (or use a branch
+> subject such as `repo:Ridwanlekan/esg-related-chatbot:ref:refs/heads/main`).
+
+---
+
+## 1b. Choose the host
+
+| | Azure App Service (this runbook) | Azure Container Apps |
+| --- | --- | --- |
+| Repo support | `deploy.yml` already wired | new workflow needed |
+| Scale-to-zero | no | yes |
+| Secrets | app settings / Key Vault | native secrets / Key Vault |
+| Revisions/rollback | slot swap (needs extra setup) | built-in revisions |
+| Best for | first deployment, simplest | scale + cheaper idle |
+
+The rest of this runbook is the **App Service** path. Container Apps is a good
+follow-up once you are comfortable; the app itself is unchanged.
+
+**Keep it to ONE instance.** Sessions, the vector index and the admin/usage
+store are SQLite files on `/home`. Two instances sharing them will corrupt them.
+Scale **up** (bigger SKU), not **out**, until you move to Postgres.
+
+---
+
+## 2. Provision Azure
+
+Run these in Cloud Shell. Replace `<...>` placeholders.
+
+### 2.1 Resource group, plan, web app
+
+```bash
+RG=esg-rg
+APP=<globally-unique-app-name>        # e.g. esg-workspace-chatbot
+LOC=southeastasia                    # pick a region near your users
+IMAGE=ghcr.io/ridwanlekan/esg-related-chatbot:latest
+
+az group create -n "$RG" -l "$LOC"
+
+# Linux plan. B2 is a fine start; move up if you see slow cold starts.
+az appservice plan create -g "$RG" -n esg-plan --is-linux --sku B2
+
+# Web App for Containers, from the public GHCR image
+az webapp create -g "$RG" -p esg-plan -n "$APP" \
+  --deployment-container-image-name "$IMAGE"
+```
+
+**If the GHCR package is private**, either make it public (GitHub → Packages →
+the package → Package settings → Change visibility) or give the Web App
+credentials:
+
+```bash
+az webapp config container set -g "$RG" -n "$APP" \
+  --docker-custom-image-name "$IMAGE" \
+  --docker-registry-server-url https://ghcr.io \
+  --docker-registry-server-user <github-username> \
+  --docker-registry-server-password <PAT-with-read:packages>
+```
+
+### 2.2 GitHub Actions OIDC identity (no stored cloud passwords)
+
+```bash
+SUB=$(az account show --query id -o tsv)
+
+# App registration + service principal
+az ad app create --display-name "esg-github-deploy"
+CLIENT_ID=$(az ad app list --display-name esg-github-deploy --query "[0].appId" -o tsv)
+az ad sp create --id "$SUB" 2>/dev/null || true
+
+# Role: Contributor on just this resource group (least privilege)
+az role assignment create --assignee "$CLIENT_ID" \
+  --role Contributor \
+  --scope "/subscriptions/$SUB/resourceGroups/$RG"
+
+echo "AZURE_CLIENT_ID=$CLIENT_ID"
+az account show --query tenantId -o tsv   # AZURE_TENANT_ID
+```
+
+Add the **federated credential** (this is what lets GitHub log in without a
+password — update the repo/owner if you forked):
+
+```bash
+az ad app federated-credential create --id "$(az ad app list --display-name esg-deploy-identity --query '[0].appId' -o tsv 2>/dev/null || echo $CLIENT_ID)" \
+  --parameters '{
+    "name": "github-production",
+    "issuer": "https://token.actions.githubusercontent.com",
+    "subject": "repo:Ridwanlekan/esg-related-chatbot:environment:production",
+    "audiences": ["api://AzureADTokenExchange"]
+  }'
+```
+
+Put `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` into the
+**production** environment secrets from §0.
+
+### 2.2a Allow the web app to pull the image (private package only)
+
+Deployment Center → Registry settings → `https://ghcr.io`, user = GitHub
+username, password = PAT with `read:packages`. (Skip if the package is public.)
+
+---
+
+## 3. Application settings and secrets
+
+`deploy.yml` sets the **platform** settings and any non-secret values you put in
+repo variables. **Secrets are deliberately not in the repo** — set them once as
+App Service app settings (or, better, Key Vault references; see §8).
+
+```bash
+az webapp config appsettings set -g "$RG" -n "$APP" --settings \
+  AZURE_OPENAI_API_KEY='<key>' \
+  AZURE_OPENAI_ENDPOINT='<https://<resource>.openai.azure.com>' \
+  OPENAI_API_VERSION='<version>' \
+  MODEL_NAME='<deployment name, e.g. gpt-4.1-mini>' \
+  TOKENIZERS_PARALLELISM=False \
+  AUTH_SECRET='<random 32+ chars>' \
+  API_KEY='<random admin key>' \
+  ADMIN_BASIC_USER='admin' \
+  ADMIN_BASIC_PASS='<strong password>' \
+  ADMIN_TOTP_SECRET='<base32 TOTP secret>' \
+  ADMIN_SESSION_SECURE=1
+
+# Only for the tiers you actually sell (Stripe):
+az webapp config appsettings set -g "$RG" -n "$APP" --settings \
+  STRIPE_SECRET_KEY='sk_...' \
+  STRIPE_WEBHOOK_SECRET='whsec_...' \
+  STRIPE_PRICE_TEAM_MONTHLY='price_...' \
+  STRIPE_PRICE_TEAM_ANNUAL='price_...' \
+  STRIPE_PRICE_BUSINESS_MONTHLY='price_...' \
+  STRIPE_PRICE_BUSINESS_ANNUAL='price_...' \
+  STRIPE_PRICE_ENTERPRISE_ANNUAL='price_...'
+
+# Optional email (otherwise verification/reset mail lands in the admin outbox):
+az webapp config appsettings set -g "$RG" -n "$APP" --settings \
+  SMTP_HOST='smtp.yourprovider.com' SMTP_PORT=587 \
+  SMTP_USER='<user>' SMTP_PASSWORD='<pass>' \
+  SMTP_FROM='ESG Assistant <no-reply@yourdomain.com>'
+```
+
+Generate secrets with `openssl rand -base64 32`. **`AUTH_SECRET` must stay
+stable**: changing it invalidates every session and every open citation link.
+
+> `OPENAI_API_VERSION` in the local `.env` is `2025-04-14` — re-verify against
+> what your Azure OpenAI / Foundry resource actually accepts before go-live.
+
+---
+
+## 4. First deployment
+
+1. Ensure `main` is green (CI + Container).
+2. GitHub → **Actions → Deploy → Run workflow** (or wait for the Container
+   workflow on `main` to succeed; Deploy fires automatically after it).
+3. Watch the run. On success, open:
+   - `https://<app>.azurewebsites.net/health` → expect `{"status":"ok", ...}`
+   - `https://<app>.azurewebsites.net/admin` → sign in with `API_KEY` (+ TOTP)
+
+If the container is still starting, App Service shows a "warming up" page for a
+minute or two while the models load.
+
+---
+
+## 5. First-boot: seed data
+
+The index starts empty, so `/chat` returns **503** until documents are indexed.
+Two ways to seed `/home/esg-data`:
+
+**A. Through the admin console (small corpora)**
+1. `/admin` → **Workspaces** → create/confirm your workspaces (finance, hr, …).
+2. **Documents** → drag-and-drop the real files into each workspace.
+3. **Re-index** (or `POST /ingest`), watch the progress bar, confirm chunks > 0.
+
+**B. Copy files in, then index (larger corpora)**
+```bash
+# list files and open a shell in the running container
+az webapp ssh -g "$RG" -n "$APP"
+# inside: copy into /home/esg-data/<workspace>/ then re-index from /admin
+```
+
+Recommended first-boot checks:
+1. Create an organisation + owner (`/admin` → Organisations), add a member.
+2. Sign in at `/ui`, ask a workspace question, click a citation, open the source.
+3. `GET /admin/status` confirms per-workspace chunk counts.
+
+---
+
+## 6. Go-live checklist
+
+- [ ] **HTTPS only + TLS 1.2** — set by `deploy.yml`; verify
+      `az webapp show -g "$RG" -n "$APP" --query httpsOnly`.
+- [ ] **Custom domain + managed certificate** (voice and citation links need HTTPS):
+      `az webapp config hostname add` → `az webapp config ssl create`.
+- [ ] **Health check** path `/health` configured (set by `deploy.yml`).
+- [ ] **Restrict `/admin`.** It is protected only by `API_KEY` (+ Basic/TOTP).
+      Options: App Service Access Restrictions (IP allow-list for the whole app),
+      Entra ID Easy Auth in front of `/admin`, or Azure Front Door/WAF with a
+      path rule. (Tracked as backlog item 11.)
+- [ ] **Stripe webhook** → `https://<domain>/billing/webhook` with the matching
+      `STRIPE_WEBHOOK_SECRET`; then confirm a checkout flips the org to paid.
+- [ ] **SMTP** configured (else verification/reset mail sits in `/admin/emails`;
+      see backlog item 15 for the outbox-drain worker). Verify SPF/DKIM/DMARC.
+- [ ] **Backups** of `/home/esg-index` and `/home/esg-data` (App Service backup).
+- [ ] **Logs** → Log Analytics / App Insights; keep `/metrics` for Prometheus.
+- [ ] One instance only (SQLite). Scale up, not out.
+- [ ] `ADMIN_SESSION_SECURE=1` (already required for the admin cookie over HTTPS).
+
+---
+
+## 7. Day-2 operations
+
+**Redeploy** — push to `main`; Container rebuilds `:latest`, Deploy pulls it.
+App settings and `/home` persist across restarts.
+
+**Rollback** — the image is tagged `sha-<sha>` and by version (`v*`). Pin the
+Web App to a known-good tag:
+```bash
+az webapp config container set -g "$RG" -n "$APP" \
+  --docker-custom-image-name ghcr.io/ridwanlekan/esg-related-chatbot:sha-<sha> \
+  --docker-custom-image-url "" 2>/dev/null || true
+az webapp restart -g "$RG" -n "$APP"
+```
+(For repeatable rollbacks, adopt deployment slots or Container Apps revisions.)
+
+**Scale up** — `az appservice plan update -g "$RG" -n esg-plan --sku P0v3`.
+
+**Inspect the running box**
+```bash
+az webapp log tail -g "$RG" -n "$APP"          # live logs
+az webapp ssh      -g "$RG" -n "$APP"          # shell into the container
+```
+
+**Reset local state** (destructive): inside the box,
+`rm -f /home/esg-index/vectors_*.sqlite3` then re-index.
+
+---
+
+## 8. Security (production standard)
+
+- **Secrets**: move from app settings to **Azure Key Vault** and reference them
+  with `@Microsoft.KeyVault(SecretUri=...)`, using the Web App's **managed
+  identity**. App settings are visible to anyone with Reader on the resource.
+- **Admin**: Entra ID in front of `/admin`; keep TOTP on.
+- **Network**: Access Restrictions or Front Door/WAF; do not leave the app open
+  to the whole Internet if it is a pilot.
+- **Least privilege**: the GitHub OIDC identity only gets Contributor on the
+  resource group, nothing subscription-wide.
+- **Scanning**: Dependabot, CodeQL, secret scanning and dependency review are
+  already enabled on the repo.
+- **`.dockerignore`/`.gitignore`** keep `.env`, `data/`, `models/`, proposals
+  and the local workflow log out of the image and the repo. Never commit secrets.
+
+## 9. Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Deploy job skipped | `vars.AZURE_WEBAPP_NAME` empty | set the repo variable |
+| `azure/login` fails | OIDC subject mismatch | federated credential must match the environment subject |
+| App shows "Application Error" / 503 on start | missing `AZURE_OPENAI_*` (fails fast) | set the app settings in §3 |
+| `/health` ok but `/chat` 503 | index empty | seed + re-index (§5) |
+| Container pull fails | private GHCR without creds | add registry credentials (§2.2a) |
+| Admin cookie not set | HTTPS required | use the https URL; `ADMIN_SESSION_SECURE=1` |
+| Slow first response | cold start + model load | scale up the plan |
+| Data lost after redeploy | app-service storage disabled | ensure `WEBSITES_ENABLE_APP_SERVICE_STORAGE=true` |
+
+## 10. Cost notes (rough)
+
+- App Service B2 ≈ US$70/mo; P0v3 ≈ US$80/mo (region-dependent).
+- Azure OpenAI is usage-based (the app calls it for answers/rewrites only;
+  retrieval and voice run locally, so cost tracks questions).
+- Voice weights (~840 MB) and the models are baked into the image — no extra
+  storage cost, but allow time on the first pull.
