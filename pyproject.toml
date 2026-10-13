@@ -53,6 +53,9 @@ esg-eval = "chatbot.evaluate:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+chatbot = ["static/*.html"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
