@@ -7,6 +7,8 @@ import threading
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
+from chatbot.sqlite_support import SqliteDatabase
+
 CATEGORY_RE = re.compile(r"^[a-z][a-z0-9_-]{1,29}$")
 
 DEFAULT_PRICE_INPUT_PER_M = 0.40
@@ -46,11 +48,8 @@ class AdminStore:
 
     def __init__(self, db_path):
         self.db_path = db_path
-        if db_path != ":memory:":
-            os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self._lock = threading.Lock()
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self._db = SqliteDatabase(db_path, row_factory=sqlite3.Row)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS workspaces ("
             "category TEXT PRIMARY KEY, "
@@ -180,6 +179,10 @@ class AdminStore:
         self._migrate_usage_units()
         self._migrate_usage_organisation()
         self._migrate_invites_organisation()
+
+    @property
+    def conn(self):
+        return self._db.connection
 
     # ---- outbox (D18) ------------------------------------------------------
 
@@ -1030,4 +1033,4 @@ class AdminStore:
             return cur.rowcount > 0
 
     def close(self):
-        self.conn.close()
+        self._db.close()
