@@ -24,6 +24,8 @@ TOKENIZERS_PARALLELISM = False
 # ADMIN_TOTP_SECRET = ""          # when set, a current TOTP code is required at sign-in and on the legacy gate
 # ADMIN_SESSION_TTL_HOURS = 12    # admin sign-in session lifetime (server-side, hash-at-rest)
 # ADMIN_SESSION_COOKIE = esg_admin_session
+# ADMIN_CSRF_COOKIE = esg_admin_csrf   # readable companion cookie for CSRF double-submit on
+#                                      # cookie-authenticated admin writes (sent in X-CSRF-Token)
 # ADMIN_SESSION_SECURE = 1        # set 1 in prod so the admin cookie is only ever sent over HTTPS
 # CORS_ORIGINS = ""               # comma-separated allowed browser origins (empty = no cross-origin access)
 # RATE_LIMIT_REQUESTS = 60        # max requests per window per IP

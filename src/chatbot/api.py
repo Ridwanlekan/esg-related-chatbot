@@ -98,6 +98,45 @@ from chatbot.workspaces import (
 
 logger = logging.getLogger("esg.api")
 
+# Sent on every response. CSP keeps 'unsafe-inline' for script/style because the
+# single-page consoles use one inline <script> and inline <style>/style="" — a
+# nonce/hash migration is the follow-up that would let us drop it. Everything
+# else is locked to the app's own origin; blob:/data: are needed for recorded
+# audio and inline images. Strict-Transport-Security is added only over TLS.
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=(), camera=(), microphone=(self)",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "X-Permitted-Cross-Domain-Policies": "none",
+    "Content-Security-Policy": (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; "
+        "media-src 'self' blob:; "
+        "font-src 'self' data:; "
+        "connect-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "form-action 'self'; "
+        "frame-ancestors 'none'"
+    ),
+}
+
+# Methods that change state and therefore need a CSRF token when the admin
+# console is authenticated by its cookie (rather than an API key / Basic).
+_UNSAFE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _request_is_https(request: Request) -> bool:
+    if request.url.scheme == "https":
+        return True
+    proto = request.headers.get("x-forwarded-proto", "")
+    return proto.split(",")[0].strip().lower() == "https"
+
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 INDEX_DIR = os.environ.get("INDEX_DIR", os.path.join(PROJECT_ROOT, ".index"))
 DEFAULT_SESSIONS_PATH = os.path.join(INDEX_DIR, "sessions.sqlite3")
@@ -651,6 +690,10 @@ def create_app(
     admin_session_cookie = os.environ.get("ADMIN_SESSION_COOKIE", "esg_admin_session")
     admin_session_ttl_seconds = int_env("ADMIN_SESSION_TTL_HOURS", 12) * 3600
     admin_session_secure = os.environ.get("ADMIN_SESSION_SECURE", "") == "1"
+    # Readable companion cookie for CSRF double-submit. HttpOnly would defeat the
+    # purpose: the browser-side script must echo this value in the request
+    # header, which a cross-site attacker cannot read.
+    admin_csrf_cookie = os.environ.get("ADMIN_CSRF_COOKIE", "esg_admin_csrf")
 
     def require_admin(
         request: Request,
@@ -667,6 +710,16 @@ def create_app(
         header is also mandatory on the legacy path.
         """
         if session and admin_store is not None and admin_store.get_admin_session(session):
+            # Cookie-authenticated write: enforce the CSRF double-submit. SameSite
+            # already blocks most cross-site sends; this is the second layer for
+            # same-site (subdomain) and legacy-browser cases.
+            if request.method in _UNSAFE_METHODS:
+                sent = request.headers.get("X-CSRF-Token", "")
+                cookie = request.cookies.get(admin_csrf_cookie, "")
+                if not (cookie and sent and secrets.compare_digest(cookie, sent)):
+                    raise HTTPException(
+                        status_code=403, detail="CSRF token missing or invalid"
+                    )
             return
         if basic_check is not None:
             basic_check(request)
@@ -753,9 +806,24 @@ def create_app(
             secure=admin_session_secure,
             path="/",
         )
+        csrf_token = secrets.token_urlsafe(32)
+        response.set_cookie(
+            admin_csrf_cookie,
+            csrf_token,
+            max_age=admin_session_ttl_seconds,
+            httponly=False,
+            samesite="strict",
+            secure=admin_session_secure,
+            path="/",
+        )
         log_audit(request, "admin.login", "user", config_admin_basic_user,
                   f"expires_at={created['expires_at']}")
-        return {"ok": True, "actor": config_admin_basic_user, "expires_at": created["expires_at"]}
+        return {
+            "ok": True,
+            "actor": config_admin_basic_user,
+            "expires_at": created["expires_at"],
+            "csrf": csrf_token,
+        }
 
     @app.post("/admin/logout", dependencies=rate_deps)
     def admin_logout(
@@ -770,6 +838,7 @@ def create_app(
             if existing:
                 log_audit(request, "admin.logout", "user", existing["actor"])
         response.delete_cookie(admin_session_cookie, path="/")
+        response.delete_cookie(admin_csrf_cookie, path="/")
         return {"ok": True}
 
     @app.get("/admin/session")
@@ -882,6 +951,14 @@ def create_app(
         duration = (time.monotonic() - started) * 1000
         telemetry.observe_http(request.method, route, response.status_code, duration)
         response.headers["X-Request-ID"] = rid
+        for name, value in _SECURITY_HEADERS.items():
+            # setdefault so a route can tighten a header (the download endpoint
+            # already pins its own Referrer-Policy) without being overwritten.
+            response.headers.setdefault(name, value)
+        if _request_is_https(request):
+            response.headers.setdefault(
+                "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+            )
         logger.info(
             "%s %s -> %s (%.1f ms, rid=%s)",
             request.method,

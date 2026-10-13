@@ -1,0 +1,254 @@
+CRISPR
+From Wikipedia, the free encyclopedia
+This article is about the prokaryotic antiviral system. For the use in editing genes, see CRISPR gene editing. For the biotechnology company, see CRISPR Therapeutics.
+CRISPR (/ˈkrɪspər/; acronym of clustered regularly interspaced short palindromic repeats) is a family of DNA sequences found in the genomes of prokaryotic organisms such as bacteria and archaea.[3] Each sequence within an individual prokaryotic CRISPR is derived from a DNA fragment of a bacteriophage that had previously infected the prokaryote or one of its ancestors.[4][5] These sequences are used to detect and destroy DNA from similar bacteriophages during subsequent infections. Hence these sequences play a key role in the antiviral (i.e. anti-phage) defense system of prokaryotes and provide a form of heritable,[4] acquired immunity.[3][6][7][8] CRISPR is found in approximately 50% of sequenced bacterial genomes and nearly 90% of sequenced archaea.[4]
+
+Cas9 (or "CRISPR-associated protein 9") is an enzyme that uses CRISPR sequences as a guide to recognize and open up specific strands of DNA that are complementary to the CRISPR sequence. Cas9 enzymes together with CRISPR sequences form the basis of a technology known as CRISPR-Cas9 that can be used to edit genes within living organisms.[9][10] This editing process has a wide variety of applications including basic biological research, development of biotechnological products, and treatment of diseases.[11][12] The development of the CRISPR-Cas9 genome editing technique was recognized by the Nobel Prize in Chemistry in 2020 awarded to Emmanuelle Charpentier and Jennifer Doudna.[13][14]
+
+History
+Repeated sequences
+The discovery of clustered DNA repeats took place independently in three parts of the world. The first description of what would later be called CRISPR is from Osaka University researcher Yoshizumi Ishino and his colleagues in 1987. They accidentally cloned part of a CRISPR sequence together with the "iap" gene (isozyme conversion of alkaline phosphatase) from their target genome, that of Escherichia coli.[15][16] The organization of the repeats was unusual. Repeated sequences are typically arranged consecutively, without interspersing different sequences.[12][16] They did not know the function of the interrupted clustered repeats.
+
+In 1993, researchers of Mycobacterium tuberculosis in the Netherlands published two articles about a cluster of interrupted direct repeats (DR) in that bacterium. They recognized the diversity of the sequences that intervened in the direct repeats among different strains of M. tuberculosis[17] and used this property to design a typing method called spoligotyping, still in use today.[18][19]
+
+Francisco Mojica at the University of Alicante in Spain studied the function of repeats in the archaeal species Haloferax and Haloarcula. Mojica's supervisor surmised that the clustered repeats had a role in correctly segregating replicated DNA into daughter cells during cell division, because plasmids and chromosomes with identical repeat arrays could not coexist in Haloferax volcanii. Transcription of the interrupted repeats was also noted for the first time; this was the first full characterization of CRISPR.[19][20] By 2000, Mojica and his students, after an automated search of published genomes, identified interrupted repeats in 20 species of microbes as belonging to the same family.[21] Because those sequences were interspaced, Mojica initially called these sequences "short regularly spaced repeats" (SRSR).[22] In 2001, Mojica and Ruud Jansen, who were searching for additional interrupted repeats, proposed the acronym CRISPR (Clustered Regularly Interspaced Short Palindromic Repeats) to unify the numerous acronyms used to describe these sequences.[20][23] In 2002, Tang, et al. showed evidence that CRISPR repeat regions from the genome of Archaeoglobus fulgidus were transcribed into long RNA molecules subsequently processed into unit-length small RNAs, plus some longer forms of 2, 3, or more spacer-repeat units.[24][25]
+
+In 2005, yogurt researcher Rodolphe Barrangou discovered that Streptococcus thermophilus, after iterative phage infection challenges, develops increased phage resistance due to the incorporation of additional CRISPR spacer sequences.[26] Barrangou's employer, the Danish food company Danisco, then developed phage-resistant S. thermophilus strains for yogurt production. Danisco was later bought by DuPont, which owns about 50 percent of the global dairy culture market, and the technology spread widely.[27]
+
+CRISPR-associated systems
+A major advance in understanding CRISPR came with Jansen's observation that the prokaryote repeat cluster was accompanied by four homologous genes that make up CRISPR-associated systems, cas 1–4. The Cas proteins showed helicase and nuclease motifs, suggesting a role in the dynamic structure of the CRISPR loci.[28] In this publication, the acronym CRISPR was used as the universal name of this pattern, but its function remained enigmatic.
+
+
+Simplified diagram of a CRISPR locus. The three major components of a CRISPR locus are shown: cas genes, a leader sequence, and a repeat-spacer array. Repeats are shown as gray boxes and spacers are colored bars. The arrangement of the three components is not always as shown.[29][30] In addition, several CRISPRs with similar sequences can be present in a single genome, only one of which is associated with cas genes.[31]
+In 2005, three independent research groups showed that some CRISPR spacers are derived from phage DNA and extrachromosomal DNA such as plasmids.[32][33][34] In effect, the spacers are fragments of DNA gathered from viruses that previously attacked the cell. The source of the spacers was a sign that the CRISPR-cas system could have a role in adaptive immunity in bacteria.[29][35] All three studies proposing this idea were initially rejected by high-profile journals, but eventually appeared in other journals.[36]
+
+The first publication[33] proposing a role of CRISPR-Cas in microbial immunity, by Mojica and collaborators at the University of Alicante, predicted a role for the RNA transcript of spacers on target recognition in a mechanism that could be analogous to the RNA interference system used by eukaryotic cells. Koonin and colleagues extended this RNA interference hypothesis by proposing mechanisms of action for the different CRISPR-Cas subtypes according to the predicted function of their proteins.[37]
+
+Experimental work by several groups revealed the basic mechanisms of CRISPR-Cas immunity. In 2007, the first experimental evidence that CRISPR was an adaptive immune system was published.[7][12] A CRISPR region in Streptococcus thermophilus acquired spacers from the DNA of an infecting bacteriophage. The researchers manipulated the resistance of S. thermophilus to different types of phages by adding and deleting spacers whose sequence matched those found in the tested phages.[38][39] In 2008, Brouns and Van der Oost identified a complex of Cas proteins called Cascade, that in E. coli cut the CRISPR RNA precursor within the repeats into mature spacer-containing RNA molecules called CRISPR RNA (crRNA), which remained bound to the protein complex.[40] Moreover, it was found that Cascade, crRNA and a helicase/nuclease (Cas3) were required to provide a bacterial host with immunity against infection by a DNA virus. By designing an anti-virus CRISPR, they demonstrated that two orientations of the crRNA (sense/antisense) provided immunity, indicating that the crRNA guides were targeting dsDNA. That year Marraffini and Sontheimer confirmed that a CRISPR sequence of S. epidermidis targeted DNA and not RNA to prevent conjugation. This finding was at odds with the proposed RNA-interference-like mechanism of CRISPR-Cas immunity, although a CRISPR-Cas system that targets foreign RNA was later found in Pyrococcus furiosus.[12][39] A 2010 study showed that CRISPR-Cas cuts strands of both phage and plasmid DNA in S. thermophilus.[41]
+
+Cas9
+Main article: Cas9
+
+A diagram of the CRISPR nucleases Cas12a and Cas9 with the position of DNA cleavage shown relative to their PAM sequences in a zoom-in
+A simpler CRISPR system from Streptococcus pyogenes uses the protein Cas9, an endonuclease functioning with two small RNAs—crRNA and tracrRNA—to form a four-component complex.[42][43] In 2012, Jennifer Doudna and Emmanuelle Charpentier simplified this into a two-component system by fusing the RNAs into a "single-guide RNA", enabling Cas9 to target and cut specific DNA sequences—a breakthrough that earned them the Nobel Prize in Chemistry in 2020.[44] Parallel work showed the S. thermophilus Cas9 could be similarly reprogrammed by altering the crRNA sequence.[19] These developments spurred genome editing efforts, including demonstrations by groups led by Feng Zhang and George Church showing genome editing in human cells using CRISPR-Cas9.[12][45][46]
+
+Cas12a
+Main article: Cas12a
+Cas12a, a Class II Type V CRISPR-associated nuclease, was characterized in 2015 and was formerly known as Cpf1.[5] This nuclease is found in the CRISPR-Cpf1 system of bacteria such as Francisella novicida.[6][2] The initial designation, derived from a TIGRFAMs protein family definition established in 2012, reflected the prevalence of this CRISPR-Cas subtype in the Prevotella and Francisella lineages. Cas12a exhibits several key distinctions from Cas9: it generates staggered cuts in double-stranded DNA, in contrast to the blunt ends produced by Cas9;[11] it relies on a 'T-rich' protospacer adjacent motif (PAM) (typically 5'-TTTV-3', where V is A, C, or G), offering alternative targeting sites compared to the 'G-rich' PAMs (typically 5'-NGG-3') favored by Cas9;[13] and it requires only a CRISPR RNA (crRNA) for effective targeting, whereas Cas9 necessitates both a crRNA and a trans-activating crRNA (tracrRNA).[5]
+
+Cas13a
+Main article: Cas13a
+In 2016, the nuclease (formerly known as C2c2) from the bacterium Leptotrichia shahii was characterized by researchers in Feng Zhang's group at MIT and the Broad Institute. Cas13 is an RNA-guided RNA endonuclease, which means that it does not cleave DNA, but only single-stranded RNA. Cas13 is guided by its crRNA to a ssRNA target and binds and cleaves the target. Similar to Cas12a, the Cas13 remains bound to the target and then cleaves other ssRNA molecules non-discriminately.[47] This collateral cleavage property has been exploited for the development of various diagnostic technologies.[48][49][50]
+
+Locus structure
+Repeats and spacers
+The CRISPR array is made up of an AT-rich leader sequence followed by short repeats that are separated by unique spacers.[51] CRISPR repeats typically range in size from 28 to 37 base pairs (bps), though there can be as few as 23 bp and as many as 55 bp.[52] Some show dyad symmetry, implying the formation of a secondary structure such as a stem-loop ('hairpin') in the RNA, while others are designed to be unstructured. The size of spacers in different CRISPR arrays is typically 32 to 38 bp (range 21 to 72 bp).[52] New spacers can appear rapidly as part of the immune response to phage infection.[53] There are usually fewer than 50 units of the repeat-spacer sequence in a CRISPR array.[52]
+
+CRISPR RNA structures
+CRISPR-DR2: Secondary structure taken from the Rfam database. Family RF01315.
+CRISPR-DR2: Secondary structure taken from the Rfam database. Family RF01315.
+ 
+CRISPR-DR5: Secondary structure taken from the Rfam database. Family RF011318.
+CRISPR-DR5: Secondary structure taken from the Rfam database. Family RF011318.
+ 
+CRISPR-DR6: Secondary structure taken from the Rfam database. Family RF01319.
+CRISPR-DR6: Secondary structure taken from the Rfam database. Family RF01319.
+ 
+CRISPR-DR8: Secondary structure taken from the Rfam database. Family RF01321.
+CRISPR-DR8: Secondary structure taken from the Rfam database. Family RF01321.
+ 
+CRISPR-DR9: Secondary structure taken from the Rfam database. Family RF01322.
+CRISPR-DR9: Secondary structure taken from the Rfam database. Family RF01322.
+ 
+CRISPR-DR19: Secondary structure taken from the Rfam database. Family RF01332.
+CRISPR-DR19: Secondary structure taken from the Rfam database. Family RF01332.
+ 
+CRISPR-DR41: Secondary structure taken from the Rfam database. Family RF01350.
+CRISPR-DR41: Secondary structure taken from the Rfam database. Family RF01350.
+ 
+CRISPR-DR52: Secondary structure taken from the Rfam database. Family RF01365.
+CRISPR-DR52: Secondary structure taken from the Rfam database. Family RF01365.
+ 
+CRISPR-DR57: Secondary structure taken from the Rfam database. Family RF01370.
+CRISPR-DR57: Secondary structure taken from the Rfam database. Family RF01370.
+ 
+CRISPR-DR65: Secondary structure taken from the Rfam database. Family RF01378.
+CRISPR-DR65: Secondary structure taken from the Rfam database. Family RF01378.
+Cas genes and CRISPR subtypes
+Small clusters of cas genes are often located next to CRISPR repeat-spacer arrays. Collectively the 93 cas genes are grouped into 35 families based on sequence similarity of the encoded proteins. 11 of the 35 families form the cas core, which includes the protein families Cas1 through Cas9. A complete CRISPR-Cas locus has at least one gene belonging to the cas core.[54]
+
+CRISPR-Cas systems fall into two classes. Class 1 systems use a complex of multiple Cas proteins to degrade foreign nucleic acids. Class 2 systems use a single large Cas protein for the same purpose. Class 1 is divided into types I, III, and IV; class 2 is divided into types II, V, and VI.[55] The 6 system types are divided into 33 subtypes.[56] Each type and most subtypes are characterized by a "signature gene" found almost exclusively in the category. Classification is also based on the complement of cas genes that are present. Most CRISPR-Cas systems have a Cas1 protein. The phylogeny of Cas1 proteins generally agrees with the classification system,[57] but exceptions exist due to module shuffling.[54] Many organisms contain multiple CRISPR-Cas systems suggesting that they are compatible and may share components.[58][59] The sporadic distribution of the CRISPR-Cas subtypes suggests that the CRISPR-Cas system is subject to horizontal gene transfer during microbial evolution.
+
+
+This table is missing information about UniProt and InterPro cross-reference. Please expand the table to include this information. Further details may exist on the talk page. (October 2020)
+Signature genes and their putative functions for the major and minor CRISPR-cas types
+Class	Cas type	Cas subtype	Signature protein	Function	Ref.
+1	I	—	Cas3	Single-stranded DNA nuclease (HD domain) and ATP-dependent helicase	[60][61]
+I-A	Cas8a, Cas5	Cas8 is a Subunit of the interference module that is important in targeting of invading DNA by recognizing the PAM sequence. Cas5 is required for processing and stability of crRNAs.	[57][62]
+I-B	Cas8b
+I-C	Cas8c
+I-D	Cas10d	contains a domain homologous to the palm domain of nucleic acid polymerases and nucleotide cyclases	[63][64]
+I-E	Cse1, Cse2
+I-F	Csy1, Csy2, Csy3	Type IF-3 have been implicated in CRISPR-associated transposons	[57]
+I-G[Note 1]	GSU0054		[65]
+III	—	Cas10	Homolog of Cas10d and Cse1. Binds CRISPR target RNA and promotes stability of the interference complex	[64][66]
+III-A	Csm2	Not determined	[57]
+III-B	Cmr5	Not determined	[57]
+III-C	Cas10 or Csx11		[57][66]
+III-D	Csx10		[57]
+III-E			[65]
+III-F			[65]
+IV	—	Csf1		[65]
+IV-A			[65]
+IV-B			[65]
+IV-C			[65]
+2	II	—	Cas9	Nucleases RuvC and HNH together produce DSBs, and separately can produce single-strand breaks. Ensures the acquisition of functional spacers during adaptation.	[67][68]
+II-A	Csn2	Ring-shaped DNA-binding protein. Involved in primed adaptation in Type II CRISPR system.	[69]
+II-B	Cas4	Endonuclease that works with cas1 and cas2 to generate spacer sequences	[70]
+II-C		Characterized by the absence of either Csn2 or Cas4	[71]
+V	—	Cas12	Nuclease RuvC. Lacks HNH.	[55][72]
+V-A	Cas12a (Cpf1)	Auto-processing pre-crRNA activity for multiplex gene regulation	[65][73]
+V-B	Cas12b (C2c1)		[65]
+V-C	Cas12c (C2c3)		[65]
+V-D	Cas12d (CasY)		[65]
+V-E	Cas12e (CasX)		[65]
+V-F	Cas12f (Cas14, C2c10)		[65]
+V-G	Cas12g		[65]
+V-H	Cas12h		[65]
+V-I	Cas12i		[65]
+V-K[Note 2]	Cas12k (C2c5)	Type V-K have been implicated in CRISPR-associated transposons.	[65]
+V-U	C2c4, C2c8, C2c9		[65]
+VI	—	Cas13	RNA-guided RNase	[55][74]
+VI-A	Cas13a (C2c2)		[65]
+VI-B	Cas13b		[65]
+VI-C	Cas13c		[65]
+VI-D	Cas13d		[65]
+VI-X	Cas13x.1	RNA dependent RNA polymerase, Prophylactic RNA-virus inhibition	[75]
+VI-Y			[75]
+Mechanism
+
+The stages of CRISPR immunity for each of the 3 major types of adaptive immunity.
+(1) Acquisition begins by recognition of invading DNA by Cas1 and Cas2 and cleavage of a protospacer.
+(2) The protospacer is ligated to the direct repeat adjacent to the leader sequence and
+(3) single strand extension repairs the CRISPR and duplicates the direct repeat. The crRNA processing and interference stages occur differently in each of the three major CRISPR systems.
+(4) The primary CRISPR transcript is cleaved by cas genes to produce crRNAs.
+(5) In type I systems Cas6e/Cas6f cleave at the junction of ssRNA and dsRNA formed by hairpin loops in the direct repeat. Type II systems use a trans-activating (tracr) RNA to form dsRNA, which is cleaved by Cas9 and RNaseIII. Type III systems use a Cas6 homolog that does not require hairpin loops in the direct repeat for cleavage.
+(6) In type II and type III systems secondary trimming is performed at either the 5' or 3' end to produce mature crRNAs.
+(7) Mature crRNAs associate with Cas proteins to form interference complexes.
+(8) In type I and type II systems, interactions between the protein and PAM sequence are required for degradation of invading DNA. Type III systems do not require a PAM for successful degradation and in type III-A systems basepairing occurs between the crRNA and mRNA rather than the DNA, targeted by type III-B systems.
+
+The CRISPR genetic locus provides bacteria with a defense mechanism to protect them from repeated phage infections.
+
+Transcripts of the CRISPR Genetic Locus and Maturation of pre-crRNA
+
+3D structure of the CRISPR-Cas9 interference complex
+
+CRISPR-Cas9 as a molecular tool introduces targeted double strand DNA breaks.
+
+Double-strand DNA breaks introduced by CRISPR-Cas9 allows further genetic manipulation by exploiting endogenous DNA repair mechanisms.
+CRISPR-Cas immunity is a natural process of bacteria and archaea.[76] CRISPR-Cas prevents bacteriophage infection, conjugation and natural transformation by degrading foreign nucleic acids that enter the cell.[39]
+
+Spacer acquisition
+When a microbe is invaded by a bacteriophage, the first stage of the immune response is to capture phage DNA and insert it into a CRISPR locus in the form of a spacer. Cas1 and Cas2 are found in both types of CRISPR-Cas immune systems, which indicates that they are involved in spacer acquisition. Mutation studies confirmed this hypothesis, showing that removal of Cas1 or Cas2 stopped spacer acquisition, without affecting CRISPR immune response.[77][78][79][80][81]
+
+Multiple Cas1 proteins have been characterised and their structures resolved.[82][83][84] Cas1 proteins have diverse amino acid sequences. However, their crystal structures are similar and all purified Cas1 proteins are metal-dependent nucleases/integrases that bind to DNA in a sequence-independent manner.[58] Representative Cas2 proteins have been characterised and possess either (single strand) ssRNA-[85] or (double strand) dsDNA-[86][87] specific endoribonuclease activity.
+
+In the I-E system of E. coli, Cas1 and Cas2 form a complex where a Cas2 dimer bridges two Cas1 dimers.[88] In this complex, Cas2 performs a non-enzymatic scaffolding role,[88] binding double-stranded fragments of invading DNA, while Cas1 binds the single-stranded flanks of the DNA and catalyses their integration into CRISPR arrays.[89][90][91] New spacers are usually added at the beginning of the CRISPR next to the leader sequence creating a chronological record of viral infections.[92] In E. coli a histone like protein called integration host factor (IHF), which binds to the leader sequence, is responsible for the accuracy of this integration.[93] IHF also enhances integration efficiency in the type I-F system of Pectobacterium atrosepticum,[94] but in other systems, different host factors may be required[95]
+
+Protospacer adjacent motifs (PAM)
+Main article: Protospacer adjacent motif
+Bioinformatic analysis of regions of phage genomes that were excised as spacers (termed protospacers) revealed that they were not randomly selected but instead were found adjacent to short (3–5 bp) DNA sequences termed protospacer adjacent motifs (PAM). Analysis of CRISPR-Cas systems showed PAMs to be important for type I and type II, but not type III systems during acquisition.[34][96][97][98][99][100] In type I and type II systems, protospacers are excised at positions adjacent to a PAM sequence, with the other end of the spacer cut using a ruler mechanism, thus maintaining the regularity of the spacer size in the CRISPR array.[101][102] The conservation of the PAM sequence differs between CRISPR-Cas systems and appears to be evolutionarily linked to Cas1 and the leader sequence.[100][103]
+
+New spacers are added to a CRISPR array in a directional manner,[32] occurring preferentially,[53][96][97][104][105] but not exclusively, adjacent[99][102] to the leader sequence. Analysis of the type I-E system from E. coli demonstrated that the first direct repeat adjacent to the leader sequence is copied, with the newly acquired spacer inserted between the first and second direct repeats.[80][101]
+
+The PAM sequence appears to be important during spacer insertion in type I-E systems. That sequence contains a strongly conserved final nucleotide (nt) adjacent to the first nt of the protospacer. This nt becomes the final base in the first direct repeat.[81][106][107] This suggests that the spacer acquisition machinery generates single-stranded overhangs in the second-to-last position of the direct repeat and in the PAM during spacer insertion. However, not all CRISPR-Cas systems appear to share this mechanism as PAMs in other organisms do not show the same level of conservation in the final position.[103] It is likely that in those systems, a blunt end is generated at the very end of the direct repeat and the protospacer during acquisition.
+
+Insertion variants
+Analysis of Sulfolobus solfataricus CRISPRs revealed further complexities to the canonical model of spacer insertion, as one of its six CRISPR loci inserted new spacers randomly throughout its CRISPR array, as opposed to inserting closest to the leader sequence.[102]
+
+Multiple CRISPRs contain many spacers to the same phage. The mechanism that causes this phenomenon was discovered in the type I-E system of E. coli. A significant enhancement in spacer acquisition was detected where spacers already target the phage, even mismatches to the protospacer. This 'priming' requires the Cas proteins involved in both acquisition and interference to interact with each other. Newly acquired spacers that result from the priming mechanism are always found on the same strand as the priming spacer.[81][106][107] This observation led to the hypothesis that the acquisition machinery slides along the foreign DNA after priming to find a new protospacer.[107]
+
+Biogenesis
+CRISPR-RNA (crRNA), which later guides the Cas nuclease to the target during the interference step, must be generated from the CRISPR sequence. The crRNA is initially transcribed as part of a single long transcript encompassing much of the CRISPR array.[30] This transcript is then cleaved by Cas proteins to form crRNAs. The mechanism to produce crRNAs differs among CRISPR-Cas systems. In type I-E and type I-F systems, the proteins Cas6e and Cas6f respectively, recognise stem-loops[108][109][110] created by the pairing of identical repeats that flank the crRNA.[111] These Cas proteins cleave the longer transcript at the edge of the paired region, leaving a single crRNA along with a small remnant of the paired repeat region.
+
+Type III systems also use Cas6, however, their repeats do not produce stem-loops. Cleavage instead occurs by the longer transcript wrapping around the Cas6 to allow cleavage just upstream of the repeat sequence.[112][113][114]
+
+Type II systems lack the Cas6 gene and instead utilize RNaseIII for cleavage. Functional type II systems encode an extra small RNA that is complementary to the repeat sequence, known as a trans-activating crRNA (tracrRNA).[42] Transcription of the tracrRNA and the primary CRISPR transcript results in base pairing and the formation of dsRNA at the repeat sequence, which is subsequently targeted by RNaseIII to produce crRNAs. Unlike the other two systems, the crRNA does not contain the full spacer, which is instead truncated at one end.[67]
+
+CrRNAs associate with Cas proteins to form ribonucleotide complexes that recognize foreign nucleic acids. CrRNAs show no preference between the coding and non-coding strands, which is indicative of an RNA-guided DNA-targeting system.[8][41][77][81][115][116][117] The type I-E complex (commonly referred to as Cascade) requires five Cas proteins bound to a single crRNA.[118][119]
+
+Interference
+During the interference stage in type I systems, the PAM sequence is recognized on the crRNA-complementary strand and is required along with crRNA annealing. In type I systems correct base pairing between the crRNA and the protospacer signals a conformational change in Cascade that recruits Cas3 for DNA degradation.
+
+Type II systems rely on a single multifunctional protein, Cas9, for the interference step.[67] Cas9 requires both the crRNA and the tracrRNA to function and cleave DNA using its dual HNH and RuvC/RNaseH-like endonuclease domains. Basepairing between the PAM and the phage genome is required in type II systems. However, the PAM is recognized on the same strand as the crRNA (the opposite strand to type I systems).
+
+Type III systems, like type I require six or seven Cas proteins binding to crRNAs.[120][121] The type III systems analysed from S. solfataricus and P. furiosus both target the mRNA of phages rather than phage DNA genome,[59][121] which may make these systems uniquely capable of targeting RNA-based phage genomes.[58] Type III systems were also found to target DNA in addition to RNA using a different Cas protein in the complex, Cas10.[122] The DNA cleavage was shown to be transcription dependent.[123]
+
+The mechanism for distinguishing self from foreign DNA during interference is built into the crRNAs and is therefore likely common to all three systems. Throughout the distinctive maturation process of each major type, all crRNAs contain a spacer sequence and some portion of the repeat at one or both ends. It is the partial repeat sequence that prevents the CRISPR-Cas system from targeting the chromosome as base pairing beyond the spacer sequence signals self and prevents DNA cleavage.[124] RNA-guided CRISPR enzymes are classified as type V restriction enzymes.
+
+Evolution
+CRISPR associated protein Cas2 (adaptation RNase)
+
+Crystal structure of a hypothetical protein tt1823 from Thermus thermophilus
+Identifiers
+Symbol	CRISPR_Cas2
+Pfam	PF09827
+InterPro	IPR019199
+CDD	cd09638
+Available protein structures:
+CRISPR-associated protein CasA/Cse1 (Type I effector DNase)
+Identifiers
+Symbol	CRISPR_Cse1
+Pfam	PF09481
+InterPro	IPR013381
+CDD	cd09729
+Available protein structures:
+CRISPR associated protein CasC/Cse3/Cas6 (Type I effector RNase)
+
+Crystal structure of a crispr-associated protein from Thermus thermophilus
+Identifiers
+Symbol	CRISPR_assoc
+Pfam	PF08798
+Pfam clan	CL0362
+InterPro	IPR010179
+CDD	cd09727
+Available protein structures:
+The cas genes in the adaptor and effector modules of the CRISPR-Cas system are believed to have evolved from two different ancestral modules. A transposon-like element called casposon encoding the Cas1-like integrase and potentially other components of the adaptation module was inserted next to the ancestral effector module, which likely functioned as an independent innate immune system.[125] The highly conserved cas1 and cas2 genes of the adaptor module evolved from the ancestral module while a variety of class 1 effector cas genes evolved from the ancestral effector module.[126] The evolution of these various class 1 effector module cas genes was guided by various mechanisms, such as duplication events.[127] On the other hand, each type of class 2 effector module arose from subsequent independent insertions of mobile genetic elements.[128] These mobile genetic elements took the place of the multiple gene effector modules to create single gene effector modules that produce large proteins which perform all the necessary tasks of the effector module.[128] The spacer regions of CRISPR-Cas systems are taken directly from foreign mobile genetic elements and thus their long-term evolution is hard to trace.[129] The non-random evolution of these spacer regions has been found to be highly dependent on the environment and the particular foreign mobile genetic elements it contains.[130]
+
+CRISPR-Cas can immunize bacteria against certain phages and thus halt transmission. For this reason, Koonin described CRISPR-Cas as a Lamarckian inheritance mechanism.[131] However, this was disputed by a critic who noted, "We should remember [Lamarck] for the good he contributed to science, not for things that resemble his theory only superficially. Indeed, thinking of CRISPR and other phenomena as Lamarckian only obscures the simple and elegant way evolution really works".[132] But as more recent studies have been conducted, it has become apparent that the acquired spacer regions of CRISPR-Cas systems are indeed a form of Lamarckian evolution because they are genetic mutations that are acquired and then passed on.[133] On the other hand, the evolution of the Cas gene machinery that facilitates the system evolves through classic Darwinian evolution.[133]
+
+Coevolution
+Analysis of CRISPR sequences revealed coevolution of host and viral genomes.[134]
+
+The basic model of CRISPR evolution is newly incorporated spacers driving phages to mutate their genomes to avoid the bacterial immune response, creating diversity in both the phage and host populations. To resist a phage infection, the sequence of the CRISPR spacer must correspond perfectly to the sequence of the target phage gene. Phages can continue to infect their hosts' given point mutations in the spacer.[124] Similar stringency is required in PAM or the bacterial strain remains phage sensitive.[97][124]
+
+Rates
+A study of 124 S. thermophilus strains showed that 26% of all spacers were unique and that different CRISPR loci showed different rates of spacer acquisition.[96] Some CRISPR loci evolve more rapidly than others, which allowed the strains' phylogenetic relationships to be determined. A comparative genomic analysis showed that E. coli and S. enterica evolve much more slowly than S. thermophilus. The latter's strains that diverged 250,000 years ago still contained the same spacer complement.[135]
+
+Metagenomic analysis of two acid-mine-drainage biofilms showed that one of the analyzed CRISPRs contained extensive deletions and spacer additions versus the other biofilm, suggesting a higher phage activity/prevalence in one community than the other.[53] In the oral cavity, a temporal study determined that 7–22% of spacers were shared over 17 months within an individual while less than 2% were shared across individuals.[105]
+
+From the same environment, a single strain was tracked using PCR primers specific to its CRISPR system. Broad-level results of spacer presence/absence showed significant diversity. However, this CRISPR added three spacers over 17 months,[105] suggesting that even in an environment with significant CRISPR diversity some loci evolve slowly.
+
+CRISPRs were analysed from the metagenomes produced for the Human Microbiome Project.[136] Although most were body-site specific, some within a body site are widely shared among individuals. One of these loci originated from streptococcal species and contained ≈15,000 spacers, 50% of which were unique. Similar to the targeted studies of the oral cavity, some showed little evolution over time.[136]
+
+CRISPR evolution was studied in chemostats using S. thermophilus to directly examine spacer acquisition rates. In one week, S. thermophilus strains acquired up to three spacers when challenged with a single phage.[137] During the same interval, the phage developed single-nucleotide polymorphisms that became fixed in the population, suggesting that targeting had prevented phage replication absent these mutations.[137]
+
+Another S. thermophilus experiment showed that phages can infect and replicate in hosts that have only one targeting spacer. Yet another showed that sensitive hosts can exist in environments with high-phage titres.[138] The chemostat and observational studies suggest many nuances to CRISPR and phage (co)evolution.
+
+Identification
+CRISPRs are widely distributed among bacteria and archaea[63] and show some sequence similarities.[111] Their most notable characteristic is their repeating spacers and direct repeats. This characteristic makes CRISPRs easily identifiable in long sequences of DNA, since the number of repeats decreases the likelihood of a false positive match.[139]
+
+Analysis of CRISPRs in metagenomic data is more challenging, as CRISPR loci do not typically assemble, due to their repetitive nature or through strain variation, which confuses assembly algorithms. Where many reference genomes are available, polymerase chain reaction (PCR) can be used to amplify CRISPR arrays and analyse spacer content.[96][105][140][141][142][143] However, this approach yields information only for specifically targeted CRISPRs and for organisms with sufficient representation in public databases to design reliable polymerase PCR primers. Degenerate repeat-specific primers can be used to amplify CRISPR spacers directly from environmental samples; amplicons containing two or three spacers can be then computationally assembled to reconstruct long CRISPR arrays.[143]
+
+The alternative is to extract and reconstruct CRISPR arrays from shotgun metagenomic data. This is computationally more difficult, particularly with second generation sequencing technologies (e.g. 454, Illumina), as the short read lengths prevent more than two or three repeat units appearing in a single read. CRISPR identification in raw reads has been achieved using purely de novo identification[144] or by using direct repeat sequences in partially assembled CRISPR arrays from contigs (overlapping DNA segments that together represent a consensus region of DNA)[136] and direct repeat sequences from published genomes[145] as a hook for identifying direct repeats in individual reads.
+
+Use by phages
+Another way for bacteria to defend against phage infection is by having chromosomal islands. A subtype of chromosomal islands called phage-inducible chromosomal island (PICI) is excised from a bacterial chromosome upon phage infection and can inhibit phage replication.[146] PICIs are induced, excised, replicated, and finally packaged into small capsids by certain staphylococcal temperate phages. PICIs use several mechanisms to block phage reproduction. In the first mechanism, PICI-encoded Ppi differentially blocks phage maturation by binding or interacting specifically with phage TerS, hence blocking phage TerS/TerL complex formation responsible for phage DNA packaging. In the second mechanism PICI CpmAB redirects the phage capsid morphogenetic protein to make 95% of SaPI-sized capsid and phage DNA can package only 1/3rd of their genome in these small capsids and hence become nonviable phage.[147] The third mechanism involves two proteins, PtiA and PtiB, that target the LtrC, which is responsible for the production of virion and lysis proteins. This interference mechanism is modulated by a modulatory protein, PtiM, binds to one of the interference-mediating proteins, PtiA, and hence achieves the required level of interference.[148]
+
+One study showed that lytic ICP1 phage, which specifically targets Vibrio cholerae serogroup O1, has acquired a CRISPR-Cas system that targets a V. cholera PICI-like element. The system has 2 CRISPR loci and 9 Cas genes. It seems to be homologous to the I-F system found in Yersinia pestis. Moreover, like the bacterial CRISPR-Cas system, ICP1 CRISPR-Cas can acquire new sequences, which allows phage and host to co-evolve.[149][150]
+
+Certain archaeal viruses were shown to carry mini-CRISPR arrays containing one or two spacers. It has been shown that spacers within the virus-borne CRISPR arrays target other viruses and plasmids, suggesting that mini-CRISPR arrays represent a mechanism of heterotypic superinfection exclusion and participate in interviral conflicts.[143]
+
+Applications
+Main article: CRISPR gene editing
+CRISPR gene editing is a revolutionary technology that allows for precise, targeted modifications to the DNA of living organisms. Developed from a natural defense mechanism found in bacteria, CRISPR-Cas9 is the most commonly used system. Gene editing with CRISPR-Cas9 involves a Cas9 nuclease and an engineered guide RNA, which come together to allow for the precise "cutting" of one or both strands of DNA at specific locations within the genome.[151] It makes use of the cell's natural DNA repair systems, including non-homologous end joining, homology-directed repair, or mismatch repair, to modify, insert, or delete genetic material at these specific cut sites. [151][152] This technology has transformed fields such as genetics, medicine,[153][154][155] and agriculture,[156] offering potential treatments for genetic disorders, advancements in crop engineering, and research into the fundamental workings of life. However, its ethical implications and potential unintended consequences have sparked significant debate.[157][158]
