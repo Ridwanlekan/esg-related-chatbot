@@ -1,8 +1,13 @@
 # Solution workflow — ESG Workspace Chatbot
 
-Status: current as of 2026-10-13 (`main`). Incorporates the organisation,
+Status: current as of 2026-10-14 (`main`). Incorporates the organisation,
 billing, free-tier, owner-console and multilingual work; the app hardening
 (security headers + admin CSRF) is documented in `README.md` §Security.
+
+Deployment and operations are covered elsewhere: the Azure runbook is
+`doc/deployment.md`, the repeatable update/deploy/acceptance-test loop is
+`doc/azure-update-and-test.md`, and a non-technical UI test script you can share
+with a client is `doc/client-ui-test-walkthrough.md`.
 
 This document is the end-to-end workflow of the shipped system: who the actors
 are, what each one does, and how the pieces fit together. It reflects the

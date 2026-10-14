@@ -11,6 +11,7 @@ A retrieval-augmented generation (RAG) chatbot platform where each user signs up
 - **Friendly, day-aware greetings**: greetings ("hi", "good morning") are answered with a persona-specific, date/time-aware greeting (incl. emoji) based on the user's timezone — no LLM call.
 - **Strict workspace scoping**: each bot's system prompt answers only from retrieved context and refuses out-of-scope topics; retrieval physically can't reach other workspaces.
 - **Persistent vector index** (SQLite + sqlite-vec): embeddings are stored on disk, so startup is instant and the LLM/embedding models aren't re-run on every launch.
+- **Concurrency-safe stores**: every SQLite store (users, admin, sessions, indexes) opens its own connection per thread, with WAL journaling and a busy-timeout — parallel requests never lock up or corrupt a shared handle.
 - **Incremental ingestion**: unchanged documents are skipped (content-hash based); edited files are re-indexed; deleted files are pruned from the index automatically.
 - **Multi-format ingestion**: Docling parses PDF, Office, HTML, Markdown, AsciiDoc, CSV, images (OCR), audio/video (ASR), and more into clean Markdown before chunking.
 - **Metadata-aware**: each chunk tracks its source file, chunk index, document hash, and page range, with source-filtered retrieval.
@@ -40,6 +41,7 @@ esg-chatbot/
 │   ├── download_links.py # HMAC-signed, short-lived per-document download tokens
 │   ├── security.py       # rate limiting, security headers, proxy trust
 │   ├── admin_security.py # admin session cookie + CSRF (double-submit)
+│   ├── sqlite_support.py # shared thread-safe SQLite helper (per-thread conns, WAL)
 │   ├── telemetry.py      # usage/cost ledger (questions, tokens, voice, cost)
 │   ├── smalltalk.py      # greeting detection + day/date-aware persona replies
 │   ├── ingest.py         # chunking + incremental ingestion pipeline
@@ -60,6 +62,10 @@ esg-chatbot/
 │   └── demo/             # placeholder docs (Jupiter, Ada, CRISPR)
 ├── evals/                # retrieval/answer eval set
 ├── doc/                  # reference docs, env template
+│   ├── deployment.md              # Azure runbook (provision, OIDC, go-live)
+│   ├── azure-update-and-test.md   # redeploy an update + run the acceptance suite
+│   ├── solution-workflow.md       # end-to-end product workflow
+│   ├── client-ui-test-walkthrough.md  # shareable UI test script for a client
 │   └── env_example.txt   # copy to .env and fill in
 ├── models/               # local embedding model (downloaded, gitignored)
 ├── .index/               # generated vector indexes + sessions + users (gitignored)
@@ -243,6 +249,8 @@ docker compose up --build     # bake models, then serve on :8000
 ## Deployment (CI/CD)
 
 > Step-by-step Azure runbook (provisioning, OIDC, app settings, first boot, go-live): [`doc/deployment.md`](doc/deployment.md).
+> Repeatable update loop (redeploy an update to the throwaway B2 app and run the black-box acceptance suite): [`doc/azure-update-and-test.md`](doc/azure-update-and-test.md). Helper scripts: `scripts/azure-test-up.sh`, `scripts/azure-test-suite.sh`, `scripts/azure-test-down.sh`.
+> Shareable, non-technical UI test script for a client: [`doc/client-ui-test-walkthrough.md`](doc/client-ui-test-walkthrough.md).
 
 **Container publishing** — `.github/workflows/container.yml` builds the image on every PR (validation only) and, on `main`/version tags, pushes to GitHub Container Registry:
 
@@ -403,12 +411,17 @@ Setting either `VOICE_STT_PROVIDER=openai` or `VOICE_TTS_PROVIDER=openai` moves 
 
 One consequence worth knowing before choosing `openai` TTS: Kokoro speaks UK English by default (`VOICE_TTS_LANG`), which suits an ESG reporting audience. The Azure speech voices are US English unless a locale is specified, and `VOICE_TTS_VOICE` for that path takes `alloy`/`nova`/`onyx`/`shimmer` rather than Kokoro's `af_heart` style names.
 
-**Admin UI**: open `http://localhost:8000/admin` — a full admin console with four tabs, protected by the `API_KEY` (entered once in the page, stored in `localStorage`, sent as `Authorization: Bearer <API_KEY>`):
+**Admin UI**: open `http://localhost:8000/admin` — the cross-customer platform console, protected by the `API_KEY` (entered once in the page, stored in `localStorage`, sent as `Authorization: Bearer <API_KEY>`; with `ADMIN_BASIC_USER`/`ADMIN_BASIC_PASS` set you can instead sign in to an `HttpOnly` session cookie, plus `X-Admin-TOTP` when `ADMIN_TOTP_SECRET` is set). It has seven tabs:
 
-- **Overview** — live totals (workspaces, indexed chunks, users, sessions), per-workspace cards with quick **↑ Upload** and **Re-index** buttons, and a live progress bar while an ingestion run is in progress (polls `/ingest/status`).
-- **Documents** — drag-and-drop (or click-to-browse) uploads to any workspace (saved to `data/<category>/` and the index is rebuilt in place) plus a per-workspace, filterable file table showing size and indexed state, with safe delete (file removed + index rebuilt to drop stale chunks).
-- **Workspaces** — create custom workspaces (category + label + emoji + blurb), edit metadata of any workspace, and delete custom ones. Built-in (`WORKSPACES` env) workspaces can be edited but not deleted. Cards show file and chunk counts. New categories instantly appear in the `/ui` signup pills and become routable/indexable.
-- **Users** — create users, edit name/category, reset passwords (generates a random one), and delete accounts, with per-user session counts, **last login**, name/email search and load-more pagination.
+- **Overview** — live totals (workspaces, indexed chunks, users, sessions), per-workspace cards with quick **Refresh status** / **Re-index all** buttons, and a live progress bar while an ingestion run is in progress (polls `/ingest/status`).
+- **Organisations** — the **Master library** (upload curated originals that serve nobody until assigned), create/delete customer organisations, assign master documents to an organisation's workspaces, and manage each organisation's **Content**, **Billing**, and **People** (roles, workspace access, move a free account in, transfer ownership).
+- **Documents** — drag-and-drop (or click-to-browse) uploads to any workspace (saved to `data/<category>/` and the index is rebuilt in place), **shared documents** published to several workspaces at once, and a per-workspace, filterable file table showing size and indexed state, with safe delete (file removed + index rebuilt to drop stale chunks).
+- **Workspaces** — create custom workspaces (category + label + emoji + blurb), edit metadata of any workspace, delete custom ones, and mint **invite links** (workspace + organisation + uses + expiry). Built-in (`WORKSPACES` env) workspaces can be edited but not deleted. Cards show file and chunk counts. New categories instantly appear in the `/ui` signup dropdown and become routable/indexable.
+- **Users** — create users, edit name/category, reset passwords (generates a random one), delete accounts, watch the **free-account** cap, confirm or resend **pending email confirmations** (and read the **outbox** when no SMTP relay is set), with per-user session counts, **last login**, name/email search and load-more pagination.
+- **Audit** — the cross-customer audit log (when, actor, event, object, detail), filterable.
+- **Usage & Cost** — cross-customer token/cost analytics with editable cost rates, range selection, per-workspace / per-call-type / top-users breakdowns and CSV export.
+
+Organisation owners and admins use the separate organisation console at **`/owner`** (Overview, Analytics, People, Billing) — see [`doc/solution-workflow.md`](doc/solution-workflow.md).
 
 | Endpoint            | Auth   | Purpose                                                          |
 | ------------------- | ------ | ---------------------------------------------------------------- |
