@@ -10,6 +10,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 
+from chatbot.sqlite_support import SqliteDatabase
 from chatbot.workspaces import workspace_names
 
 logger = logging.getLogger("esg.users")
@@ -274,8 +275,7 @@ class UserStore:
         self.secret = _auth_secret(provided=secret)
         if db_path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self._db = SqliteDatabase(db_path, row_factory=sqlite3.Row)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS users ("
             "id TEXT PRIMARY KEY, "
@@ -322,6 +322,10 @@ class UserStore:
         )
         self.conn.commit()
         self._ensure_schema()
+
+    @property
+    def conn(self):
+        return self._db.connection
 
     def _ensure_schema(self):
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(users)").fetchall()}
@@ -1376,4 +1380,4 @@ class UserStore:
         )
 
     def close(self):
-        self.conn.close()
+        self._db.close()

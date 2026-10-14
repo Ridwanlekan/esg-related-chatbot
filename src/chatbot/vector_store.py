@@ -7,6 +7,8 @@ from dataclasses import dataclass
 import numpy as np
 import sqlite_vec
 
+from chatbot.sqlite_support import SqliteDatabase
+
 
 @dataclass(frozen=True)
 class SearchResult:
@@ -99,11 +101,21 @@ class SQLiteVecStore(VectorStore):
         self.db_path = db_path
         self.dim = dim
         os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.enable_load_extension(True)
-        sqlite_vec.load(self.conn)
+
+        def _load_vec_extension(conn):
+            # sqlite-vec is a loadable extension, so every connection needs it
+            # before vec0 virtual tables can be queried.
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+
+        self._db = SqliteDatabase(
+            db_path, row_factory=sqlite3.Row, setup=_load_vec_extension
+        )
         self._create_schema()
+
+    @property
+    def conn(self):
+        return self._db.connection
 
     def _create_schema(self):
         self.conn.execute(
@@ -385,4 +397,4 @@ class SQLiteVecStore(VectorStore):
         return self.conn.execute("SELECT COUNT(*) AS c FROM chunks").fetchone()["c"]
 
     def close(self):
-        self.conn.close()
+        self._db.close()

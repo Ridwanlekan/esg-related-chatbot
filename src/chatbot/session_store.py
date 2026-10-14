@@ -4,6 +4,8 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 
+from chatbot.sqlite_support import SqliteDatabase
+
 
 def _now():
     return datetime.now(timezone.utc).isoformat()
@@ -26,8 +28,7 @@ class SessionStore:
         self.retention = int(retention if retention is not None else os.environ.get("MAX_RETAINED_SESSIONS", "500"))
         if db_path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        self._db = SqliteDatabase(db_path, row_factory=sqlite3.Row)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS sessions ("
             "id TEXT PRIMARY KEY, "
@@ -45,6 +46,10 @@ class SessionStore:
         )
         self._migrate_message_sources()
         self.conn.commit()
+
+    @property
+    def conn(self):
+        return self._db.connection
 
     def _migrate_user_id(self):
         cols = {
@@ -200,4 +205,4 @@ class SessionStore:
         return uuid.uuid4().hex
 
     def close(self):
-        self.conn.close()
+        self._db.close()
