@@ -120,6 +120,55 @@ is private. The scripts are the fast path — §2 onward is the production path
 
 ---
 
+## 1d. Acceptance test suite
+
+`scripts/azure-test-suite.sh` is a black-box acceptance run against a *running*
+deployment. It needs no cloud credentials — just the app URL and the admin API
+key — so it works equally on the throwaway app from §1c and on production.
+
+```bash
+BASE=https://<app>.azurewebsites.net \
+API_KEY=<admin API key> \
+bash scripts/azure-test-suite.sh
+```
+
+It prints a PASS/FAIL/SKIP/INFO table and exits non-zero if anything fails.
+Requires `curl`, `jq`, `xargs` (and `python3` for the voice tests).
+
+| Section | Covers |
+| --- | --- |
+| A | liveness, `/metrics`, 404s, security headers |
+| B | admin console + admin API (workspace CRUD, built-in protection) |
+| C | free-tier self-service: signup, `/me`, verify, login, password reset |
+| D | tenant setup: create an org + its verified owner via the admin API, assign and ingest a document |
+| E | retrieval & chat **as that organisation's owner** (chat, search, stream, sessions, multilingual, cross-tenant isolation) |
+| F | document link minting, token download, tampered-token rejection |
+| G | voice STT/TTS and non-audio rejection |
+| H | organisations, usage and billing endpoints (informational) |
+| I | security: unauthorized access, prompt-injection echo, rate limiting |
+| J | latency, concurrency, restart persistence, OOM |
+
+It creates a throwaway custom workspace, an organisation, an org owner, and a
+free-tier user, then **deletes all of them** at the end (`KEEP=1` to leave them).
+
+| Env var | Effect |
+| --- | --- |
+| `CAT` | workspace/category to exercise (default `finance`) |
+| `SKIP_VOICE=1` | skip section G (memory-heavy) |
+| `RUN_LOAD=1` | enable the concurrent-chat burst in J |
+| `RUN_RESTART=1 RG=<rg> APP=<app>` | add an `az webapp restart` persistence check |
+| `KEEP=1` | do not delete the throwaway test objects |
+
+> **Rate limiting (I5) only trips when the request IP is stable.** The limiter
+> keys on the client IP from the proxy header, so the test pins a fixed
+> `X-Forwarded-For`. This works only because the app trusts forwarded headers
+> (`TRUSTED_PROXY_IPS=*`, set by `azure-test-up.sh`); without that — or behind a
+> proxy that does not set a stable client IP — per-IP limiting silently does
+> nothing. Expect a few `INFO`/`SKIP` rows (options above); a clean run is
+> **0 FAIL**.
+
+---
+
 ## 2. Provision Azure
 
 Run these in Cloud Shell. Replace `<...>` placeholders.
@@ -276,6 +325,7 @@ Recommended first-boot checks:
 1. Create an organisation + owner (`/admin` → Organisations), add a member.
 2. Sign in at `/ui`, ask a workspace question, click a citation, open the source.
 3. `GET /admin/status` confirms per-workspace chunk counts.
+4. Run the acceptance suite (§1d) against the live URL — a clean run is 0 FAIL.
 
 ---
 
@@ -352,6 +402,8 @@ az webapp ssh      -g "$RG" -n "$APP"          # shell into the container
 | `azure/login` fails | OIDC subject mismatch | federated credential must match the environment subject |
 | App shows "Application Error" / 503 on start | missing `AZURE_OPENAI_*` (fails fast) | set the app settings in §3 |
 | `/health` ok but `/chat` 503 | index empty | seed + re-index (§5) |
+| Free-tier `/chat` 503 but a customer org works | free users read the pooled `_sample` organisation, not the global tree | assign content to the user's organisation, or seed the sample pack (§5) |
+| Rate limiting never returns 429 | limiter keys on the client IP from the proxy header; an absent/unstable `X-Forwarded-For` makes every request its own bucket | ensure the proxy sets a stable `X-Forwarded-For` and the app trusts it (`TRUSTED_PROXY_IPS`), or rate-limit at the front end |
 | Container pull fails | private GHCR without creds | add registry credentials (§2.2a) |
 | `/admin` or `/ui` shows "not found" | `static/*.html` missing from the installed wheel | declare `package-data` in `pyproject.toml` (`chatbot = ["static/*.html"]`) and rebuild |
 | Admin cookie not set | HTTPS required | use the https URL; `ADMIN_SESSION_SECURE=1` |
