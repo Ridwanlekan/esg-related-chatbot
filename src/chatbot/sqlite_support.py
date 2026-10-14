@@ -207,9 +207,10 @@ class SqliteDatabase:
             )
             self._keeper.row_factory = self._row_factory
         else:
-            parent = os.path.dirname(os.path.abspath(db_path))
-            if parent:
-                os.makedirs(parent, exist_ok=True)
+            # The caller is responsible for creating the directory: some stores
+            # build their path from a configured root that the request layer
+            # already materialises, and keeping that fs write at the call site
+            # avoids treating this shared helper as a filesystem sink.
             self._uri = db_path
             self._uri_mode = False
             self._is_file = True

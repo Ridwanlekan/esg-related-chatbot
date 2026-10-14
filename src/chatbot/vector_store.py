@@ -1,3 +1,4 @@
+import os
 import re
 import sqlite3
 from abc import ABC, abstractmethod
@@ -99,6 +100,7 @@ class SQLiteVecStore(VectorStore):
     def __init__(self, db_path, dim=384):
         self.db_path = db_path
         self.dim = dim
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
 
         def _load_vec_extension(conn):
             # sqlite-vec is a loadable extension, so every connection needs it

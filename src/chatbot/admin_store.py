@@ -48,6 +48,8 @@ class AdminStore:
 
     def __init__(self, db_path):
         self.db_path = db_path
+        if db_path != ":memory:":
+            os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self._lock = threading.Lock()
         self._db = SqliteDatabase(db_path, row_factory=sqlite3.Row)
         self.conn.execute(

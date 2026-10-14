@@ -26,6 +26,8 @@ class SessionStore:
     def __init__(self, db_path, retention=None):
         self.db_path = db_path
         self.retention = int(retention if retention is not None else os.environ.get("MAX_RETAINED_SESSIONS", "500"))
+        if db_path != ":memory:":
+            os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self._db = SqliteDatabase(db_path, row_factory=sqlite3.Row)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS sessions ("

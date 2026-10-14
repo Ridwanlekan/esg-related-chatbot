@@ -273,6 +273,8 @@ class UserStore:
     def __init__(self, db_path, secret=None):
         self.db_path = db_path
         self.secret = _auth_secret(provided=secret)
+        if db_path != ":memory:":
+            os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         self._db = SqliteDatabase(db_path, row_factory=sqlite3.Row)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS users ("
