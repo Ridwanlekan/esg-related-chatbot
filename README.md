@@ -264,6 +264,7 @@ docker compose up --build     # bake models, then serve on :8000
 > Step-by-step Azure runbook (provisioning, OIDC, app settings, first boot, go-live): [`doc/deployment.md`](doc/deployment.md).
 > Repeatable update loop (redeploy an update to the throwaway B2 app and run the black-box acceptance suite): [`doc/azure-update-and-test.md`](doc/azure-update-and-test.md). Helper scripts: `scripts/azure-test-up.sh`, `scripts/azure-test-suite.sh`, `scripts/azure-test-down.sh`.
 > Shareable, non-technical UI test script for a client: [`doc/client-ui-test-walkthrough.md`](doc/client-ui-test-walkthrough.md).
+> One-page recipe to run the app and restore your data + chat history for a demo: [`doc/demo-runbook.md`](doc/demo-runbook.md).
 > Reset a deployment to a clean testing state (keeps only the `_sample` free tier and its launch pack): `scripts/reset-testing-state.py` (dry run by default; add `--yes` to apply).
 
 **Container publishing** — `.github/workflows/container.yml` builds the image on every PR (validation only) and, on `main`/version tags, pushes to GitHub Container Registry:

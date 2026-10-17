@@ -336,6 +336,9 @@ Instead of seeding a fresh deployment by hand, you can ship **everything** from
 your machine — documents, the master library, accounts, organisations, the admin
 store and the chat history — in one bundle. Two scripts do it:
 
+> For a demo, see the one-page [`doc/demo-runbook.md`](demo-runbook.md) that
+> chains this section with the throwaway-app setup in §1c.
+
 | Script | Does |
 | --- | --- |
 | `scripts/pack-state.py` | Bundles `DATA_DIR` + `INDEX_DIR` into `dist/esg-state-<stamp>.tar.gz` |
