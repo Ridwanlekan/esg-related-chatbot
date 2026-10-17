@@ -2663,9 +2663,11 @@ def create_app(
         # The master file is shared storage; the registry row is the record. The
         # file goes first so a failed unlink cannot leave a row that 404s on the
         # next delete.
-        (content_library.library_root() / os.path.basename(name)).unlink(
-            missing_ok=True
-        )
+        library_root = content_library.library_root().resolve()
+        target = (library_root / name).resolve()
+        if target.parent != library_root:
+            raise HTTPException(status_code=400, detail="Invalid document name.")
+        target.unlink(missing_ok=True)
         store.remove_library_doc(name)
         reindexed = {}
         for org_id, cats in by_org.items():
