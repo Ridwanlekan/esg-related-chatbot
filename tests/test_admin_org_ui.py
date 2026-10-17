@@ -42,12 +42,17 @@ def test_every_tab_button_actually_has_a_click_listener():
     assert not missing, f"tabs declared but with no click listener: {sorted(missing)}"
 
 
-def test_switching_to_the_tab_loads_both_halves():
-    """The tab is useless if it opens empty, and the two halves load separately."""
+def test_showTab_loads_the_right_panels():
+    """A tab that opens empty is useless. The master library moved to the
+    Content tab, while Organisations now also hosts the invite links."""
     body = _sync_fn("showTab")
     assert 'name === "tab-organisations"' in body
-    assert "loadLibrary()" in body
     assert "loadOrganisations()" in body
+    assert "loadInvites()" in body
+    assert 'name === "tab-content"' in body
+    assert "loadLibrary()" in body
+    assert "loadSharedDocuments()" in body
+    assert "loadWorkspaces()" in body
 
 
 def test_every_element_the_tab_touches_exists_in_the_markup():
@@ -89,6 +94,23 @@ class TestEndpointsMatchTheApi:
         assert '"/admin/library/unassign"' in body
         assert "categories: [cat]" in body
         assert "filenames: [filename]" in body
+
+    def test_library_delete_posts_the_real_endpoint(self):
+        body = _fn("deleteLibraryDoc")
+        assert '"/admin/library/delete"' in body
+        assert "filename, force" in body
+
+    def test_assign_shortcut_opens_the_organisations_tab(self):
+        """The Content tab's Assign… button should carry the chosen master with
+        it, not just describe a journey the operator has to repeat by hand."""
+        body = _sync_fn("assignShortcut")
+        assert 'showTab("tab-organisations")' in body
+        assert "pendingAssign = filename" in body
+
+    def test_the_shortcut_tick_reaches_the_organisation_picker(self):
+        body = _sync_fn("renderOrgContent")
+        assert "pendingAssign" in body
+        assert 'label.classList.add("pending")' in body
 
     def test_organisation_content_is_read_per_organisation(self):
         body = _fn("loadOrgContent")
@@ -135,6 +157,14 @@ class TestDestructivePaths:
         body = _fn("unassignContent")
         assert "Users lose it immediately" in body
 
+    def test_library_delete_confirms_and_warns_about_served_copies(self):
+        """Deleting a master silently pulls every organisation's copy; the
+        confirm has to say so before it fires."""
+        body = _fn("deleteLibraryDoc")
+        assert "cannot be undone" in body
+        assert "served copies will be removed" in body
+        assert "assigned to" in body
+
 
 class TestHonestRendering:
     def test_a_missing_master_file_is_reported(self):
@@ -164,6 +194,13 @@ class TestHonestRendering:
         body = _sync_fn("renderOrgContent")
         assert "have.has(d.filename)" in body
         assert "cb.disabled = cb.checked" in body
+
+    def test_every_library_row_offers_delete_and_assign(self):
+        """The library used to be write-only: upload, then no way back out and
+        no way to reach an assignment without leaving the tab by hand."""
+        body = _sync_fn("renderLibrary")
+        assert "deleteLibraryDoc(d.filename" in body
+        assert "assignShortcut(d.filename)" in body
 
 
 class TestSeatManagementUi:

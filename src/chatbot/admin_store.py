@@ -72,7 +72,8 @@ class AdminStore:
         )
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS invites ("
-            "token TEXT PRIMARY KEY, "
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "token TEXT NOT NULL UNIQUE, "
             "category TEXT NOT NULL, "
             "label TEXT, "
             "max_uses INTEGER NOT NULL, "
@@ -80,7 +81,8 @@ class AdminStore:
             "created_at TEXT NOT NULL, "
             "expires_at TEXT NOT NULL, "
             "actor TEXT, "
-            "organisation_id TEXT)"
+            "organisation_id TEXT, "
+            "revoked_at TEXT)"
         )
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS usage ("
@@ -181,6 +183,7 @@ class AdminStore:
         self._migrate_usage_units()
         self._migrate_usage_organisation()
         self._migrate_invites_organisation()
+        self._migrate_invites_identity()
 
     @property
     def conn(self):
@@ -367,6 +370,46 @@ class AdminStore:
             self.conn.execute("ALTER TABLE invites ADD COLUMN organisation_id TEXT")
             self.conn.commit()
 
+    def _migrate_invites_identity(self):
+        """Give each invite a stable id and a revoked flag.
+
+        Before this a row was only addressable by its token, which has to be
+        pasted back to revoke it and cannot distinguish "revoked" from
+        "deleted". A table keyed on the token cannot take an AUTOINCREMENT id
+        through ALTER, so the table is rebuilt once: same columns, plus the id
+        and revoked_at, with the existing rows copied across. Runs after the
+        organisation migration so the copied row set already has that column.
+        """
+        cols = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(invites)").fetchall()
+        }
+        if "id" in cols and "revoked_at" in cols:
+            return
+        self.conn.execute("ALTER TABLE invites RENAME TO invites_legacy")
+        self.conn.execute(
+            "CREATE TABLE invites ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "token TEXT NOT NULL UNIQUE, "
+            "category TEXT NOT NULL, "
+            "label TEXT, "
+            "max_uses INTEGER NOT NULL, "
+            "uses INTEGER NOT NULL DEFAULT 0, "
+            "created_at TEXT NOT NULL, "
+            "expires_at TEXT NOT NULL, "
+            "actor TEXT, "
+            "organisation_id TEXT, "
+            "revoked_at TEXT)"
+        )
+        self.conn.execute(
+            "INSERT INTO invites (token, category, label, max_uses, uses, "
+            "created_at, expires_at, actor, organisation_id) "
+            "SELECT token, category, label, max_uses, uses, created_at, "
+            "expires_at, actor, organisation_id FROM invites_legacy"
+        )
+        self.conn.execute("DROP TABLE invites_legacy")
+        self.conn.commit()
+
     def list_workspaces(self):
         rows = self.conn.execute(
             "SELECT * FROM workspaces ORDER BY category"
@@ -530,7 +573,7 @@ class AdminStore:
         now = datetime.now(timezone.utc)
         expires = now + timedelta(hours=int(ttl_hours))
         org = (organisation_id or "").strip() or None
-        self.conn.execute(
+        cur = self.conn.execute(
             "INSERT INTO invites (token, category, label, max_uses, uses, "
             "created_at, expires_at, actor, organisation_id) "
             "VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)",
@@ -540,6 +583,7 @@ class AdminStore:
         )
         self.conn.commit()
         return {
+            "id": cur.lastrowid,
             "token": token,
             "category": cat,
             "label": (label or "").strip() or None,
@@ -552,7 +596,8 @@ class AdminStore:
 
     def _invite_row(self, token_hash):
         return self.conn.execute(
-            "SELECT category, label, max_uses, uses, expires_at, organisation_id "
+            "SELECT category, label, max_uses, uses, expires_at, "
+            "organisation_id, revoked_at "
             "FROM invites WHERE token = ?",
             (token_hash,),
         ).fetchone()
@@ -574,6 +619,9 @@ class AdminStore:
 
     @staticmethod
     def _invite_status(row):
+        revoked = row["revoked_at"] if "revoked_at" in row.keys() else None
+        if revoked:
+            return False, "That invitation link has been revoked."
         if row["uses"] >= row["max_uses"]:
             return False, "That invitation link has already been used up."
         try:
@@ -601,10 +649,9 @@ class AdminStore:
                 "organisation_id": row["organisation_id"]}
 
     def list_invites(self, organisation_id=None):
-        now = datetime.now(timezone.utc)
         sql = (
-            "SELECT category, label, max_uses, uses, created_at, expires_at, "
-            "actor, organisation_id "
+            "SELECT id, category, label, max_uses, uses, created_at, "
+            "expires_at, actor, organisation_id, revoked_at "
             "FROM invites"
         )
         params = []
@@ -619,10 +666,24 @@ class AdminStore:
             invites.append({**dict(r), "valid": usable, "reason": reason, "token": None})
         return invites
 
+    def revoke_invite(self, invite_id):
+        """Mark an invite revoked. It stays visible, but no longer works."""
+        cur = self.conn.execute(
+            "UPDATE invites SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL",
+            (_now(), int(invite_id)),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
     def delete_invite(self, token):
         cur = self.conn.execute(
             "DELETE FROM invites WHERE token = ?", (self._hash_token(token),)
         )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def delete_invite_by_id(self, invite_id):
+        cur = self.conn.execute("DELETE FROM invites WHERE id = ?", (int(invite_id),))
         self.conn.commit()
         return cur.rowcount > 0
 
@@ -714,6 +775,57 @@ class AdminStore:
         if not user_id:
             return 0
         sql = "SELECT COUNT(*) FROM usage WHERE user_id = ? AND kind = 'question'"
+        params = [user_id]
+        if since:
+            sql += " AND at >= ?"
+            params.append(since)
+        try:
+            with self._lock:
+                row = self.conn.execute(sql, params).fetchone()
+            return int(row[0] or 0)
+        except sqlite3.Error:
+            return 0
+
+    def tokens_in_period(self, organisation_id, since=None):
+        """Prompt+completion tokens an organisation has spent, since `since`.
+
+        Counted across every usage row that carries tokens, not just the
+        per-request "question" row: the question is what is billable, but the
+        rewrite and the answer are what cost tokens, and the cap exists to
+        bound that cost.
+        """
+        if not organisation_id:
+            return 0
+        sql = (
+            "SELECT COALESCE(SUM(prompt_tokens), 0) + "
+            "COALESCE(SUM(completion_tokens), 0) FROM usage "
+            "WHERE organisation_id = ?"
+        )
+        params = [organisation_id]
+        if since:
+            sql += " AND at >= ?"
+            params.append(since)
+        try:
+            with self._lock:
+                row = self.conn.execute(sql, params).fetchone()
+            return int(row[0] or 0)
+        except sqlite3.Error:
+            return 0
+
+    def tokens_for_user(self, user_id, since=None):
+        """Prompt+completion tokens one account has spent, the free-tier meter.
+
+        The shared sample organisation has no billing period to key on, so its
+        token ceiling is counted per account, exactly as its question
+        allowance is.
+        """
+        if not user_id:
+            return 0
+        sql = (
+            "SELECT COALESCE(SUM(prompt_tokens), 0) + "
+            "COALESCE(SUM(completion_tokens), 0) "
+            "FROM usage WHERE user_id = ?"
+        )
         params = [user_id]
         if since:
             sql += " AND at >= ?"

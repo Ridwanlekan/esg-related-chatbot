@@ -72,6 +72,7 @@ from chatbot.security import RateLimiter, int_env, make_auth_check, make_rate_li
 from chatbot.session_store import SessionStore
 from chatbot import users as users_mod
 from chatbot.users import (
+    DEFAULT_ORGANISATION_ID,
     EMAIL_RE,
     ORG_ROLE_ADMIN,
     ORG_ROLE_OWNER,
@@ -314,8 +315,8 @@ class SignupRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=8, max_length=256)
     name: str = Field(min_length=1, max_length=120)
-    category: str = Field(min_length=1, max_length=40)
     invite: str | None = Field(default=None, max_length=256)
+    category: str | None = Field(default=None, max_length=40)
 
 
 class InviteCreateRequest(BaseModel):
@@ -478,6 +479,13 @@ class ContentUnassignRequest(BaseModel):
     filenames: list[str] = Field(min_length=1)
 
 
+class LibraryDeleteRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    # Refuse by default when the master is assigned anywhere; the operator must
+    # acknowledge that the served copies will be pulled too.
+    force: bool = False
+
+
 class OrgRoleRequest(BaseModel):
     organisation_id: str = Field(min_length=1, max_length=64)
     user_id: str = Field(min_length=1, max_length=64)
@@ -552,6 +560,11 @@ class SharedUnlinkRequest(BaseModel):
 class CostRatesRequest(BaseModel):
     price_input_per_m: float = Field(ge=0)
     price_output_per_m: float = Field(ge=0)
+
+
+class PublicBaseUrlRequest(BaseModel):
+    # Empty clears the override so links fall back to the request's own origin.
+    url: str = Field(default="", max_length=255)
 
 
 class TTSRequest(BaseModel):
@@ -1339,6 +1352,63 @@ def create_app(
             ),
         )
 
+    def token_quota_status(user):
+        """How much of the plan's token ceiling an account has left, or None.
+
+        A seat in the shared sample organisation is on the free tier and is
+        metered per account (the sample organisation is shared, so a per-
+        organisation count would let one signup exhaust everyone's). A seat in
+        a customer organisation is metered per organisation against that
+        organisation's plan and billing period. Organisations with no plan
+        (never subscribed, or administratively created) and enterprise are
+        unmetered, so this answers None and no check is applied.
+        """
+        if user_store is None:
+            return None
+        org_id = user.get("organisation_id")
+        store = app.state.admin_store
+        if store is None:
+            return None
+        if org_id == SAMPLE_ORGANISATION_ID:
+            cap = billing.token_cap("free")
+            used = store.tokens_for_user(user["id"])
+        else:
+            org = user_store.get_organisation(org_id) if org_id else None
+            if org is None or org.get("system_owned"):
+                return None
+            cap = billing.token_cap(org.get("plan"))
+            used = store.tokens_in_period(org["id"], since=org.get("current_period_start"))
+        if cap is None:
+            return None
+        return {
+            "cap": cap,
+            "used": used,
+            "remaining": max(0, cap - used),
+            "reached": used >= cap,
+        }
+
+    def require_token_quota(user):
+        """Refuse a question once the plan's token ceiling is spent.
+
+        A hard stop rather than a billable overage: the question pool is what an
+        organisation pays for, this bounds what answering those questions costs.
+        Answered with 402 and the same shape as the free question ceiling so the
+        frontend renders it as an upgrade prompt. Checked only once a question is
+        known to need the model, so small talk never trips it.
+        """
+        status = token_quota_status(user)
+        if not status or not status["reached"]:
+            return
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "This workspace has used its {} token allowance for the "
+                "current billing period. Upgrade the plan or wait for the next "
+                "period to keep asking — open the Billing page for options."
+                .format(status["cap"])
+            ),
+        )
+
     def public_base_url(request: Request):
         """The origin a verification link should point at.
 
@@ -1626,12 +1696,27 @@ def create_app(
             # Lets the console tell an organisation-scoped deployment from a
             # legacy single-tenant one and describe the right place to manage
             # content, without changing any of the reads above.
-            payload["organisations"] = len(user_store.list_organisations())
+            payload["organisations"] = len(
+                [o for o in user_store.list_organisations()
+                 if o["id"] != DEFAULT_ORGANISATION_ID]
+            )
         return payload
 
     @app.get("/admin/workspaces", dependencies=admin_gate_deps)
     def admin_workspaces(get_store: AdminStore = admin_store_dep):
         base = set(base_workspace_names())
+        # An organisation-scoped deployment keeps every customer's documents under
+        # its own tree, so the global data/ counts read zero. Count the
+        # organisations that actually provision each workspace instead, so the
+        # admin list says something true in that deployment rather than an empty
+        # row; in a single-tree deployment the field is absent (null).
+        org_use = {}
+        if user_store is not None:
+            for org in user_store.list_organisations():
+                if org.get("system_owned"):
+                    continue
+                for cat in org_workspace_categories(org["id"]):
+                    org_use[cat] = org_use.get(cat, 0) + 1
         rows = []
         for cat in workspace_names():
             meta = workspace_meta(cat)
@@ -1650,6 +1735,9 @@ def create_app(
                     "custom": cat not in base,
                     "data_file_count": file_count,
                     "chunks": chunk_count,
+                    "organisation_count": (
+                        org_use.get(cat, 0) if user_store is not None else None
+                    ),
                 }
             )
         return {"workspaces": rows}
@@ -1712,6 +1800,26 @@ def create_app(
                 status_code=403,
                 detail="Built-in workspaces cannot be deleted; exclude them via the "
                 "WORKSPACES env variable instead.",
+            )
+        # A category can be empty globally yet still be provisioned by
+        # organisations (their copies live under data/organisations/...). Deleting
+        # the category would strand those customers without their workspace, so
+        # refuse while any organisation still holds it.
+        holders = []
+        if user_store is not None:
+            for org in user_store.list_organisations():
+                if org.get("system_owned"):
+                    continue
+                if category in org_workspace_categories(org["id"]):
+                    holders.append(org.get("name") or org["id"])
+        if holders:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Workspace '{category}' is provisioned by {len(holders)} "
+                    f"organisation(s): " + ", ".join(sorted(holders)[:10]) +
+                    ". Unassign it from them before deleting."
+                ),
             )
         folder = Path(root_data_dir()) / category
         documents = sorted(
@@ -2402,6 +2510,11 @@ def create_app(
         store = app.state.admin_store
         out = []
         for org in user_store.list_organisations():
+            # `_default` is the content-less backfill pen for accounts that
+            # predate organisations. It is not a place anybody administers, so
+            # it is kept out of the console and only `_sample` is shown.
+            if org["id"] == DEFAULT_ORGANISATION_ID:
+                continue
             entry = dict(org)
             entry["user_count"] = user_store.count_for_organisation(org["id"])
             # Who owns the org is the first thing an operator scans for: the
@@ -2506,6 +2619,58 @@ def create_app(
         log_audit(request, "library.upload", "library_document", ",".join(saved),
                   subject or "")
         return {"saved_files": saved}
+
+    @app.post("/admin/library/delete", dependencies=admin_gate_deps, response_model=dict)
+    async def admin_library_delete(request: Request, req: LibraryDeleteRequest):
+        """Remove one master document from the library.
+
+        A master that is still assigned somewhere has served copies on disk;
+        deleting the library row without them would leave assignments pointing
+        at a file nobody can re-assign. So the default is to refuse and name the
+        organisations, and `force` pulls every served copy first.
+        """
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store not configured.")
+        name = shared_docs.safe_name(req.filename)
+        if not name or store.get_library_doc(name) is None:
+            raise HTTPException(status_code=404, detail="Not in the master library.")
+        assigned = [
+            row for row in store.list_content_assignments()
+            if row["filename"] == name
+        ]
+        orgs = sorted({row["organisation_id"] for row in assigned})
+        if orgs and not req.force:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"'{name}' is assigned to {len(orgs)} organisation(s): "
+                    + ", ".join(orgs)
+                    + ". Deleting it removes those served copies too; re-send "
+                    "with force to proceed."
+                ),
+            )
+        by_org: dict[str, set[str]] = {}
+        for row in assigned:
+            try:
+                content_library.remove(row["organisation_id"], row["category"], name)
+            except ValueError:
+                pass
+            store.remove_content_assignment(
+                row["organisation_id"], row["category"], name
+            )
+            by_org.setdefault(row["organisation_id"], set()).add(row["category"])
+        # The master file is shared storage; the registry row is the record. The
+        # file goes first so a failed unlink cannot leave a row that 404s on the
+        # next delete.
+        (content_library.library_root() / name).unlink(missing_ok=True)
+        store.remove_library_doc(name)
+        reindexed = {}
+        for org_id, cats in by_org.items():
+            reindexed[org_id] = await _reindex(request, sorted(cats), org_id)
+        log_audit(request, "library.delete", "library_document", name,
+                  ",".join(orgs))
+        return {"deleted": name, "detached_from": orgs, "reindexed": reindexed}
 
     @app.get("/admin/migrations/legacy-content", dependencies=admin_gate_deps)
     def admin_legacy_content_scan():
@@ -2786,10 +2951,25 @@ def create_app(
                 # assignment would otherwise look intact.
                 "present": row["filename"] in served,
             })
+        # The assign picker in the console only offers docs flagged "present",
+        # so the library here must carry the same fields /admin/library exposes
+        # (a master file on disk plus the organisations it is already assigned
+        # to). Without "present" every checkbox renders unchecked and the
+        # picker looks empty even when the master library has documents.
+        library = store.list_library_docs()
+        root = content_library.library_root()
+        assignments = store.list_content_assignments()
+        for doc in library:
+            doc["present"] = (root / doc["filename"]).exists()
+            doc["assigned_to"] = [
+                row["organisation_id"]
+                for row in assignments
+                if row["filename"] == doc["filename"]
+            ]
         return {
             "organisation_id": organisation_id,
             "assignments": by_category,
-            "library": store.list_library_docs(),
+            "library": library,
             "workspaces": workspace_names(),
         }
 
@@ -3656,6 +3836,46 @@ def create_app(
         )
         return rates
 
+    @app.get("/admin/settings/public-base-url", dependencies=admin_gate_deps)
+    def admin_get_public_base_url(store: AdminStore = admin_store_dep):
+        """Origin used in verification/reset links, and what an empty value means.
+
+        Empty is not an error: the app then infers the origin from the incoming
+        request, which is right for a direct or same-origin deployment. It has to
+        be set explicitly when the app sits behind a proxy or a public hostname it
+        cannot infer (doc/env_example.txt), so this surfaces both the override and
+        the origin that would be used without it.
+        """
+        configured = store.get_setting("public_base_url") or ""
+        return {
+            "url": configured,
+            "effective": configured or "http://localhost:8000",
+            "source": "setting" if configured else "request",
+        }
+
+    @app.put("/admin/settings/public-base-url", dependencies=admin_gate_deps)
+    def admin_set_public_base_url(req: PublicBaseUrlRequest, request: Request,
+                                  store: AdminStore = admin_store_dep):
+        raw = (req.url or "").strip().rstrip("/")
+        if raw:
+            parsed = urllib.parse.urlparse(raw)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Enter a full origin like https://app.example.com "
+                    "(http or https).",
+                )
+        store.set_setting("public_base_url", raw)
+        log_audit(
+            request, "settings.public_base_url", "settings", None,
+            raw or "(cleared; using the request origin)",
+        )
+        return {
+            "url": raw,
+            "effective": raw or "http://localhost:8000",
+            "source": "setting" if raw else "request",
+        }
+
     @app.get("/admin/usage/export.csv", dependencies=admin_gate_deps)
     def admin_usage_csv(range: str = "7d", category: str | None = None,
                         store: AdminStore = admin_store_dep):
@@ -3806,7 +4026,36 @@ def create_app(
             raise HTTPException(status_code=503, detail="Admin store is disabled")
         if not store.delete_invite(token):
             raise HTTPException(status_code=404, detail="Invite not found")
-        log_audit(request, "invite.delete", "workspace", None, "invite revoked")
+        log_audit(request, "invite.delete", "workspace", None, "invite deleted")
+        return {"deleted": True}
+
+    @app.post("/admin/invites/id/{invite_id}/revoke", dependencies=admin_gate_deps)
+    def admin_revoke_invite(invite_id: int, request: Request):
+        """Turn off an invite without destroying its row.
+
+        Revoked and deleted are deliberately different: a revoked link still
+        appears in the list (so its history is visible) but is refused at
+        redemption, while a deleted one is gone. Neither needs the token, which
+        is only ever shown once at creation.
+        """
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store is disabled")
+        if not store.revoke_invite(invite_id):
+            raise HTTPException(
+                status_code=404, detail="Invite not found or already revoked"
+            )
+        log_audit(request, "invite.revoke", "invite", str(invite_id), "invite revoked")
+        return {"revoked": True}
+
+    @app.delete("/admin/invites/id/{invite_id}", dependencies=admin_gate_deps)
+    def admin_delete_invite_by_id(invite_id: int, request: Request):
+        store = app.state.admin_store
+        if store is None:
+            raise HTTPException(status_code=503, detail="Admin store is disabled")
+        if not store.delete_invite_by_id(invite_id):
+            raise HTTPException(status_code=404, detail="Invite not found")
+        log_audit(request, "invite.delete", "invite", str(invite_id), "invite deleted")
         return {"deleted": True}
 
     @app.get("/invites/{token}")
@@ -3890,7 +4139,7 @@ def create_app(
         if not user.get("email_verified_at"):
             verification = _issue_and_send_verification(user, request)
         log_audit(request, "auth.signup", "user", user.get("id"),
-                  f"email={req.email} category={req.category} invite={bool(req.invite)} "
+                  f"email={req.email} category={user.get('category')} invite={bool(req.invite)} "
                   f"verified={bool(user.get('email_verified_at'))}")
         token = user_store.token_for(user)
         return AuthResponse(
@@ -4171,6 +4420,7 @@ def create_app(
         sources = []
         if reply is None:
             require_free_tier_quota(user)
+            require_token_quota(user)
             usage_events = []
             try:
                 reply = await run_in_threadpool(
@@ -4223,6 +4473,7 @@ def create_app(
         # composer can turn into an upgrade prompt.
         if reply is None:
             require_free_tier_quota(user)
+            require_token_quota(user)
 
         def event_stream():
             chunks = []

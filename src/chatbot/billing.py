@@ -66,6 +66,21 @@ _INTERVALS = frozenset({"month", "year"})
 _QUESTION_POOL = {"team": 500, "business": 2000, "enterprise": None}
 _INCLUDED_SEATS = {"team": 5, "business": 15, "enterprise": None}
 
+# Prompt+completion tokens a plan may spend per billing period. Unlike the
+# question pool this is a hard ceiling, not a billable overage: the question
+# pool is what an organisation pays for, the token cap is what bounds the cost
+# of answering those questions. Enterprise is agreed per customer, so it is
+# unmetered like its pool. Free is metered per account rather than per
+# organisation (the sample organisation is shared by every self-service
+# signup), which is why `token_cap` accepts a plan name the catalogue does not
+# sell.
+_TOKEN_CAP = {
+    "free": 50_000,
+    "team": 5_000_000,
+    "business": 20_000_000,
+    "enterprise": None,
+}
+
 # Event names of the two meters created in Stripe. The overage prices carry
 # `recurring.meter`, so an event under these names is what ends up invoiced -
 # they are contract, not configuration, and are named after the usage they
@@ -587,7 +602,8 @@ def build_checkout_session(user_store, org, caller, *, plan, interval,
         line_items=line_items,
         metadata=metadata,
         subscription_data={"metadata": metadata},
-        success_url=success_url or f"{base_url}/ui",
+        success_url=success_url
+        or f"{base_url}/ui?upgrade=1&session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=cancel_url or f"{base_url}/ui",
         allow_promotion_codes=False,
     )
@@ -931,6 +947,16 @@ def question_pool(plan):
     return _QUESTION_POOL.get(plan) if plan else None
 
 
+def token_cap(plan):
+    """Prompt+completion tokens a plan may spend per period, or None.
+
+    None means unmetered: enterprise has an agreed pool, and an organisation
+    that has never subscribed is not governed by a plan at all. Free is not in
+    `_PLANS`, so callers pass the literal "free" for the shared sample tier.
+    """
+    return _TOKEN_CAP.get(plan) if plan else None
+
+
 def included_seats(plan):
     """Users a plan includes per workspace, or None when seats are unlimited."""
     return _INCLUDED_SEATS.get(plan) if plan else None
@@ -962,6 +988,7 @@ def plan_catalog():
                 "label": PLAN_LABELS.get(plan, plan.title()),
                 "question_pool": question_pool(plan),
                 "included_seats": included_seats(plan),
+                "token_cap": token_cap(plan),
                 "intervals": intervals,
                 "purchasable": bool(env_var and intervals),
             }
@@ -1108,6 +1135,12 @@ def usage_summary(user_store, admin_store, org):
     )
     by_workspace = user_store.organisation_workspace_seats(org["id"])
     included = included_seats(plan)
+    cap = token_cap(plan)
+    tokens_used = (
+        admin_store.tokens_in_period(org["id"], since=period_start)
+        if admin_store is not None and period_start
+        else 0
+    )
     return {
         "organisation_id": org["id"],
         "plan": plan,
@@ -1119,6 +1152,12 @@ def usage_summary(user_store, admin_store, org):
             "used": used,
             "overage": max(0, used - pool) if pool is not None else 0,
             "metered": pool is not None and bool(org.get("stripe_customer_id")),
+        },
+        "tokens": {
+            "cap": cap,
+            "used": tokens_used,
+            "remaining": max(0, cap - tokens_used) if cap is not None else None,
+            "reached": cap is not None and tokens_used >= cap,
         },
         "seats": {
             "included_per_workspace": included,

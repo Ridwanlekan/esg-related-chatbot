@@ -1,8 +1,8 @@
-"""The signup workspace picker must stay a bounded control.
+"""The signup form must not ask the caller to pick a workspace.
 
-It used to render one clickable pill per workspace inside a flex row, so every
-workspace an admin created widened the auth card. This pins the control to a
-single <select> so the picker cannot silently grow again.
+Free self-service signup lands in the shared sample organisation, so the
+category/workspace picker was removed. These tests pin the form to name/email/
+password so the unbounded picker cannot silently return.
 """
 
 import re
@@ -11,31 +11,31 @@ from pathlib import Path
 UI = (Path(__file__).resolve().parents[1] / "src/chatbot/static/ui.html").read_text()
 
 
-def test_signup_workspace_picker_is_a_select():
-    """The category control in the Create-account form must be a dropdown."""
-    form = re.search(r'<div id="signup-form".*?</div>\s*</div>', UI, re.S)
-    assert form, "signup form not found"
-    assert '<select id="signup-cat">' in form.group(0)
-    assert 'class="cats"' not in form.group(0)
+def test_signup_form_has_no_workspace_picker():
+    form = re.search(
+        r'<div id="signup-form" class="hidden">(.*?)</div>\s*<div id="auth-err"',
+        UI,
+        re.S,
+    )
+    assert form
+    fields = form.group(1)
+    assert '<select id="signup-cat">' not in fields
+    assert 'id="cat-pills"' not in fields
 
 
-def test_no_per_workspace_pills_remain():
-    """No control may render a growable list of one-node-per-workspace."""
-    assert 'class="cats"' not in UI
-    assert ".cat.active" not in UI
-    # nothing builds a .cat element any more
-    assert not re.search(r'class="cat[ "]', UI)
+def test_no_category_control_remains():
+    assert 'id="signup-cat"' not in UI
+    assert 'id="cat-pills"' not in UI
 
 
-def test_workspace_options_are_built_as_option_elements():
-    """Options, so the control height is independent of workspace count."""
-    body = re.search(r'async function loadWorkspaces\(\).*?\n\}', UI, re.S).group(0)
-    assert "<option value=" in body
-    assert "sel.innerHTML" in body
-    # the select is marked disabled rather than left editable when invite-only
-    assert "sel.disabled = !!inviteCategory" in body
+def test_signup_payload_does_not_send_a_category():
+    body = re.search(r"async function submitAuth\(endpoint\) \{(.*?)\n\}", UI, re.S)
+    assert body
+    assert "selectedCat" not in body.group(1)
 
 
-def test_select_style_is_defined_for_the_dark_auth_card():
-    """A bare <select> would render as a white native box on the dark card."""
-    assert re.search(r"\.auth-card input, \.auth-card select\s*\{", UI)
+def test_invite_badge_is_rendered_instead_of_a_picker():
+    assert 'id="signup-invite-note"' in UI
+    body = re.search(r"async function loadWorkspaces\(\) \{(.*?)\n\}", UI, re.S)
+    assert body
+    assert "signup-invite-note" in body.group(1)

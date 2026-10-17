@@ -6,7 +6,7 @@ A retrieval-augmented generation (RAG) chatbot platform where each user signs up
 
 ## Features
 
-- **User accounts & workspace routing**: signup/login (JWT) lets users pick a category (Finance or HR). The authenticated category selects the matching RAG workspace — no LLM supervisor needed, routing is deterministic and billable on the token.
+- **User accounts & workspace routing**: signup/login (JWT) lands free self-service accounts in the shared sample organisation; the account's active workspace selects the matching RAG workspace — no LLM supervisor needed, routing is deterministic and billable on the token.
 - **Per-workspace vector indexes**: each category gets its own data folder + index (hard isolation). A Finance user can never retrieve HR chunks.
 - **Friendly, day-aware greetings**: greetings ("hi", "good morning") are answered with a persona-specific, date/time-aware greeting (incl. emoji) based on the user's timezone — no LLM call.
 - **Strict workspace scoping**: each bot's system prompt answers only from retrieved context and refuses out-of-scope topics; retrieval physically can't reach other workspaces.
@@ -21,7 +21,7 @@ A retrieval-augmented generation (RAG) chatbot platform where each user signs up
 - **HTTP API + UI**: FastAPI service with streaming (SSE), per-user session memory (SQLite), signup/login UI, and a self-contained browser UI (`/ui`, no CDN).
 - **Voice mode**: a mic button beside the chat input records a question, transcribes it into the composer for review, then reads the answer back aloud. Both halves default to local models with no per-request cost — faster-whisper for STT, Kokoro for TTS — and either can be switched to the Azure OpenAI endpoint with one env var.
 - **Organisations, roles & the owner console**: users belong to an **organisation** with a role (`owner`, `admin`, or a seat). Owners and admins manage members, seats, invites and workspace access from the organisation console at **`/owner`**, and can reach every workspace the organisation owns. The platform admin console (`/admin`) stays above it for cross-customer operations.
-- **Plans, billing & free tier**: organisations buy a plan (Team / Business / Enterprise) that grants workspaces, seats and a monthly question pool; billing runs through Stripe (Checkout, customer portal, metered extra seats and question overage). Free self-registration lands in a shared capped sample organisation with email confirmation.
+- **Plans, billing & free tier**: organisations buy a plan (Team / Business / Enterprise) that grants workspaces, seats, a monthly question pool and a per-plan token ceiling (hard stop; unmetered on Enterprise); billing runs through Stripe (Checkout, customer portal, metered extra seats and question overage). Free self-registration lands in a shared capped sample organisation with email confirmation.
 - **Multilingual answers**: chat, voice and UI answer in **English, Simplified Chinese (zh-Hans) and Hindi (hi)**. A question written in Chinese or Hindi is answered in that language; retrieval itself stays English-only, translating the query first.
 
 ## Project Structure
@@ -175,8 +175,10 @@ shared free organisation; paid, invited and admin-created seats start confirmed.
 `SMTP_HOST` (plus `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM`) sends
 real mail through a relay. **With no `SMTP_HOST`, mail is written to the admin
 outbox instead**: the signup response and `GET /admin/emails` both carry the
-confirmation link, so nobody is locked out for want of a relay. Set
-`public_base_url` in admin settings so links match the public hostname.
+confirmation link, so nobody is locked out for want of a relay. Set the link
+origin in **/admin → Users → "Email link origin"** so links match the public
+hostname when the app runs behind a proxy; left blank, links use the request's
+own origin.
 
 An unconfirmed free account is refused at `/chat`, `/chat/stream`, `/search`,
 `/voice/*` and `/documents/link`, with 403 and an explanation. `/me` and
@@ -197,6 +199,8 @@ for the full end-to-end workflow.
 organisation owns; a seat reaches only the workspaces explicitly granted to it
 (and may hold several, switching with `POST /me/workspace`). System
 organisations (`_sample`, `_default`) have no owner and are never billed.
+`_default` only holds accounts created before organisations existed, so the
+admin console hides it and shows just `_sample`.
 
 **Organisation console** at **`/owner`** (manager-gated, always scoped to the
 caller's own organisation — no route accepts an `organisation_id`):
@@ -221,13 +225,22 @@ return. Related variables: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`,
 Locally, Stripe webhooks do not arrive without a forwarder:
 
 ```bash
-stripe listen --forward-to localhost:8000/billing/webhook
-# without it: reconcile via POST /admin/organisations/{id}/billing/refresh
+# --api-key pins the CLI to the same account as STRIPE_SECRET_KEY (the CLI's
+# logged-in account/sandbox may differ and then no real events are forwarded).
+# Recent CLIs also require an explicit --events list.
+stripe listen --api-key "$(grep -E '^STRIPE_SECRET_KEY=' .env | cut -d= -f2-)" \
+  --events checkout.session.completed,customer.subscription.created,customer.subscription.updated,customer.subscription.deleted,invoice.paid,invoice.payment_failed \
+  --forward-to localhost:8000/billing/webhook
+# The listener prints "Your webhook signing secret is whsec_...". That secret is
+# per-account: copy it into STRIPE_WEBHOOK_SECRET. A secret from a different
+# account/sandbox makes every event fail signature verification (a 400), so
+# nothing ever reflects even though the listener is running.
+# without it: reconcile with POST /admin/organisations/{id}/billing/refresh
 ```
 
 The **platform admin console** at `/admin` sits above the org console for
 cross-customer work (create/delete organisations, move users, assign content
-from the library, run legacy migrations, and cross-customer Usage & Cost).
+from the library, and cross-customer Usage & Cost).
 
 ## Retrieval pipeline
 
@@ -251,6 +264,7 @@ docker compose up --build     # bake models, then serve on :8000
 > Step-by-step Azure runbook (provisioning, OIDC, app settings, first boot, go-live): [`doc/deployment.md`](doc/deployment.md).
 > Repeatable update loop (redeploy an update to the throwaway B2 app and run the black-box acceptance suite): [`doc/azure-update-and-test.md`](doc/azure-update-and-test.md). Helper scripts: `scripts/azure-test-up.sh`, `scripts/azure-test-suite.sh`, `scripts/azure-test-down.sh`.
 > Shareable, non-technical UI test script for a client: [`doc/client-ui-test-walkthrough.md`](doc/client-ui-test-walkthrough.md).
+> Reset a deployment to a clean testing state (keeps only the `_sample` free tier and its launch pack): `scripts/reset-testing-state.py` (dry run by default; add `--yes` to apply).
 
 **Container publishing** — `.github/workflows/container.yml` builds the image on every PR (validation only) and, on `main`/version tags, pushes to GitHub Container Registry:
 
@@ -411,12 +425,11 @@ Setting either `VOICE_STT_PROVIDER=openai` or `VOICE_TTS_PROVIDER=openai` moves 
 
 One consequence worth knowing before choosing `openai` TTS: Kokoro speaks UK English by default (`VOICE_TTS_LANG`), which suits an ESG reporting audience. The Azure speech voices are US English unless a locale is specified, and `VOICE_TTS_VOICE` for that path takes `alloy`/`nova`/`onyx`/`shimmer` rather than Kokoro's `af_heart` style names.
 
-**Admin UI**: open `http://localhost:8000/admin` — the cross-customer platform console, protected by the `API_KEY` (entered once in the page, stored in `localStorage`, sent as `Authorization: Bearer <API_KEY>`; with `ADMIN_BASIC_USER`/`ADMIN_BASIC_PASS` set you can instead sign in to an `HttpOnly` session cookie, plus `X-Admin-TOTP` when `ADMIN_TOTP_SECRET` is set). It has seven tabs:
+**Admin UI**: open `http://localhost:8000/admin` — the cross-customer platform console, protected by the `API_KEY` (entered once in the page, stored in `localStorage`, sent as `Authorization: Bearer <API_KEY>`; with `ADMIN_BASIC_USER`/`ADMIN_BASIC_PASS` set you can instead sign in to an `HttpOnly` session cookie, plus `X-Admin-TOTP` when `ADMIN_TOTP_SECRET` is set). It has six tabs:
 
 - **Overview** — live totals (workspaces, indexed chunks, users, sessions), per-workspace cards with quick **Refresh status** / **Re-index all** buttons, and a live progress bar while an ingestion run is in progress (polls `/ingest/status`).
-- **Organisations** — the **Master library** (upload curated originals that serve nobody until assigned), create/delete customer organisations, assign master documents to an organisation's workspaces, and manage each organisation's **Content**, **Billing**, and **People** (roles, workspace access, move a free account in, transfer ownership).
-- **Documents** — drag-and-drop (or click-to-browse) uploads to any workspace (saved to `data/<category>/` and the index is rebuilt in place), **shared documents** published to several workspaces at once, and a per-workspace, filterable file table showing size and indexed state, with safe delete (file removed + index rebuilt to drop stale chunks).
-- **Workspaces** — create custom workspaces (category + label + emoji + blurb), edit metadata of any workspace, delete custom ones, and mint **invite links** (workspace + organisation + uses + expiry). Built-in (`WORKSPACES` env) workspaces can be edited but not deleted. Cards show file and chunk counts. New categories instantly appear in the `/ui` signup dropdown and become routable/indexable.
+- **Organisations** — create/delete customer organisations, assign master documents to an organisation's workspaces, and manage each organisation's **Content & assignments**, **Billing**, and **People** (roles, workspace access, move a free account in, transfer ownership). Also mints **invite links** (workspace + organisation + uses + expiry) that can be **revoked** (link stops working, row stays visible) or **deleted** (row removed) without re-entering the one-time token; creation is confirmed before a token is minted.
+- **Content** — the **Master library** (upload curated originals that serve nobody until assigned; each row offers **Assign…**, which jumps to Organisations with that document preselected, and **Delete**, which refuses while the file is assigned unless you confirm pulling the served copies), **shared documents** published to several workspaces at once, and workspace definitions: create custom workspaces (category + label + emoji + blurb), edit metadata of any workspace, delete custom ones. Built-in (`WORKSPACES` env) workspaces can be edited but not deleted. Cards show file and chunk counts. New categories become routable/indexable.
 - **Users** — create users, edit name/category, reset passwords (generates a random one), delete accounts, watch the **free-account** cap, confirm or resend **pending email confirmations** (and read the **outbox** when no SMTP relay is set), with per-user session counts, **last login**, name/email search and load-more pagination.
 - **Audit** — the cross-customer audit log (when, actor, event, object, detail), filterable.
 - **Usage & Cost** — cross-customer token/cost analytics with editable cost rates, range selection, per-workspace / per-call-type / top-users breakdowns and CSV export.
