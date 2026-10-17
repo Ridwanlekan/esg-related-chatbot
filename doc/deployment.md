@@ -378,11 +378,27 @@ lost). It also pushes the Stripe/SMTP values so billing and mail work.
 ### What the push does, and its one caveat
 
 `azure-push-state.sh` reads the app's **publishing credentials**, `PUT`s the
-bundle to the Kudu VFS, runs a `tar -xzf` through the Kudu command API, restarts
-the app and waits for `/health`. It **replaces** `/home/esg-data` and
-`/home/esg-index` on the target, so **do it while the app is idle** — anything
-written on Azure during the swap is lost. For production, quiesce traffic first;
-the throwaway app is fine as-is.
+bundle to the Kudu VFS, clears `/home/esg-data` and `/home/esg-index`, unpacks
+`tar -xzf` through the Kudu command API, restarts the app and waits for
+`/health`. It **replaces** both trees on the target, so **anything written on
+Azure during the swap is lost**.
+
+It **stops the app first** and starts it again at the end (a shell `trap` starts
+it even if the script fails midway). This is not optional: a running app
+recreates `users.sqlite3`/`sessions.sqlite3`-style files under
+`/home/esg-index` while the clear is happening, so `rm -rf` can fail with
+*"Directory not empty"*. Kudu (the `*.scm.azurewebsites.net` sidecar) stays
+reachable while the site is stopped, so the upload and unpack still work. For
+production, quiesce traffic first; the throwaway app is fine as-is.
+
+Two Kudu quirks the script handles for you:
+
+- **Writes need `If-Match`.** A bare `PUT`/`DELETE` to the VFS returns **412**;
+  both are sent with `If-Match: *` ("no concurrency check").
+- **The command API is not a shell.** It execs the first token with the rest as
+  `argv`, so a `cmd1 && cmd2` string is not run by a shell — `rm` receives
+  `&&`/`tar`/`-xzf` as literal arguments (`rm: invalid option -- 'x'`). Each
+  step is therefore dispatched as its own single command.
 
 **Embedding model must match.** The `vectors_*.sqlite3` files are only reusable
 if the deployment's image uses the same embedding model that built them (the

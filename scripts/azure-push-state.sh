@@ -18,12 +18,15 @@
 #   --sync-env         also copy every key in .env to app settings, so the
 #                      deployment keeps the same AUTH_SECRET (logins, citation
 #                      links and history stay valid) plus Stripe/SMTP config
-#   --no-restart       leave the app as-is instead of restarting it
+#   --no-restart       start the app but do not wait for /health afterwards
 #   -y, --yes          skip the confirmation prompt
 #
 # What is replaced: /home/esg-data (documents) and /home/esg-index (users,
 # sessions/chat history, workspaces and vector indexes). Everything else in
 # /home is left alone.
+#
+# The app is stopped for the swap (otherwise it recreates files under
+# /home/esg-index mid-clear) and started again at the end, even on failure.
 #
 set -euo pipefail
 
@@ -41,6 +44,16 @@ PLATFORM_KEYS='WEBSITES_PORT WEBSITES_ENABLE_APP_SERVICE_STORAGE WEBSITES_CONTAI
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+APP_STOPPED=0
+start_app() {
+  if [ "$APP_STOPPED" = "1" ]; then
+    printf '\n==> Starting the app\n'
+    az webapp start -g "$RG" -n "$APP" -o none >/dev/null 2>&1 || true
+    APP_STOPPED=0
+  fi
+}
+trap start_app EXIT
+
 while [ $# -gt 0 ]; do
   case "$1" in
     -g) RG="${2:?}"; shift 2 ;;
@@ -53,7 +66,7 @@ while [ $# -gt 0 ]; do
     *) die "unknown argument: $1" ;;
   esac
 done
-RESTART=$(( NO_RESTART ? 0 : 1 ))
+WAIT_HEALTH=$(( NO_RESTART ? 0 : 1 ))
 
 command -v az >/dev/null 2>&1 || die "Azure CLI (az) not found."
 command -v curl >/dev/null 2>&1 || die "curl not found."
@@ -136,35 +149,30 @@ if [ "$SYNC_ENV" = "1" ]; then
 fi
 
 say "Uploading bundle to /home/esg-state.tar.gz"
+# Kudu's VFS requires If-Match for writes (a bare PUT is a 412); the wildcard
+# means "no concurrency check". Clear any leftover from an earlier run first.
+curl -fsS -u "$SCM_USER:$SCM_PASS" -H "If-Match: *" -X DELETE \
+  "$SCM/api/vfs/esg-state.tar.gz" >/dev/null 2>&1 || true
 curl -fsS -u "$SCM_USER:$SCM_PASS" \
+  -H "If-Match: *" \
   -H "Content-Type: application/octet-stream" \
   --data-binary @"$BUNDLE" -X PUT "$SCM/api/vfs/esg-state.tar.gz" \
   >/dev/null || die "Upload failed."
 
-say "Extracting onto /home"
-PAYLOAD="$("$PYTHON" - <<'PY'
+kudu_run() {
+  local cmd="$1" payload result
+  payload="$("$PYTHON" -c 'import json,sys; print(json.dumps({"command": sys.argv[1], "dir": "/home"}))' "$cmd")"
+  result="$(curl -fsS -u "$SCM_USER:$SCM_PASS" \
+    -H "Content-Type: application/json" \
+    --data-binary "$payload" -X POST "$SCM/api/command")" \
+    || die "Kudu command request failed: $cmd"
+  "$PYTHON" - "$result" <<'PY'
 import json, sys
-inner = (
-    "rm -rf /home/esg-data /home/esg-index && "
-    "tar -xzf /home/esg-state.tar.gz -C /home && "
-    "rm -f /home/esg-state.tar.gz && "
-    "echo '--- esg-index ---' && ls -la /home/esg-index && "
-    "echo '--- esg-data ---' && ls -la /home/esg-data"
-)
-print(json.dumps({"command": inner, "dir": "/home"}))
-PY
-)"
-RESULT="$(curl -fsS -u "$SCM_USER:$SCM_PASS" \
-  -H "Content-Type: application/json" \
-  --data-binary "$PAYLOAD" -X POST "$SCM/api/command")" \
-  || die "Extraction request failed."
-
-"$PYTHON" - "$RESULT" <<'PY' || die "tar failed on the server (see output above)."
-import json, sys
+raw = sys.argv[1]
 try:
-    data = json.loads(sys.argv[1])
+    data = json.loads(raw)
 except ValueError:
-    print(sys.argv[1])
+    print(raw)
     sys.exit(0)
 out = (data.get("Output") or "").strip()
 err = (data.get("Error") or "").strip()
@@ -174,13 +182,26 @@ if err:
     print(err, file=sys.stderr)
 sys.exit(0 if data.get("ExitCode", 0) == 0 else 1)
 PY
+}
 
-if [ "$RESTART" = "1" ]; then
-  say "Restarting the app (opens the new stores)"
-  az webapp restart -g "$RG" -n "$APP" -o none
+say "Stopping the app for a clean swap (Kudu stays reachable)"
+az webapp stop -g "$RG" -n "$APP" -o none
+APP_STOPPED=1
+sleep 10
 
+say "Extracting onto /home"
+# The Kudu command API does not run a shell — it execs the first token with the
+# rest as argv — so every step is one simple command, no && or pipes.
+kudu_run "rm -rf /home/esg-data /home/esg-index" || die "could not clear old dirs."
+kudu_run "tar -xzf /home/esg-state.tar.gz -C /home" || die "tar failed on the server."
+kudu_run "rm -f /home/esg-state.tar.gz" || true
+kudu_run "ls -la /home/esg-index"
+kudu_run "ls -la /home/esg-data"
+
+start_app
+if [ "$WAIT_HEALTH" = "1" ]; then
   URL="https://$APP.azurewebsites.net"
-  say "Waiting for $URL/health"
+  say "Waiting for $URL/health (first boot loads the models)"
   up=false
   for _ in $(seq 1 60); do
     code="$(curl -s -o /dev/null -w '%{http_code}' "$URL/health" 2>/dev/null || true)"
