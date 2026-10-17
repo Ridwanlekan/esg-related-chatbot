@@ -154,6 +154,27 @@ def list_documents(organisation_id, category):
     return sorted(p.name for p in folder.iterdir() if p.is_file() and not p.name.startswith("."))
 
 
+def _sample_source_candidates(name, source, organisation_id, categories):
+    """Where the launch pack has been seen, most authoritative first.
+
+    The library is the curated original. A deployment migrated from the
+    pre-organisation build may instead keep the pack loose at the data root or
+    inside the legacy workspace tree, and a deployment that already seeded once
+    has it in the sample organisation's own served copy. Surfacing the served
+    copy last means a restart never warns about a pack that is already served —
+    ``materialise`` sees the source and destination are the same file and does
+    nothing — while an edited library original still wins when one exists.
+    """
+    yield source / name
+    root = Path(root_data_dir())
+    yield root / name
+    for category in workspace_names():
+        yield root / category / name
+    yield root / SHARED_DIR_NAME / name
+    for category in categories:
+        yield workspace_dir(organisation_id, category) / name
+
+
 def seed_sample_pack(organisation_id=SAMPLE_ORGANISATION_ID, categories=("finance",), source_dir=None):
     """Assign the launch pack to the sample organisation.
 
@@ -168,13 +189,17 @@ def seed_sample_pack(organisation_id=SAMPLE_ORGANISATION_ID, categories=("financ
     source = Path(source_dir) if source_dir else library_root()
     placed = []
     for name in SAMPLE_PACK:
-        candidate = source / name
-        if not candidate.is_file():
-            # Also accept a document already sitting at the data root, which is
-            # where the pre-organisation build kept the loose pack.
-            alt = Path(root_data_dir()) / name
-            candidate = alt if alt.is_file() else candidate
-        if not candidate.is_file():
+        candidate = next(
+            (
+                path
+                for path in _sample_source_candidates(
+                    name, source, organisation_id, categories
+                )
+                if path.is_file()
+            ),
+            None,
+        )
+        if candidate is None:
             logger.warning("Sample pack document not found: %s", name)
             continue
         for category in categories:

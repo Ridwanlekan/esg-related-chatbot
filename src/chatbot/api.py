@@ -4799,27 +4799,6 @@ def create_app(
         for category in categories:
             yield get_bot(request, category)
 
-    def org_workspace_bots(request: Request):
-        """Per-organisation workspace bots for re-indexing.
-
-        The /ingest endpoints walk the global workspace tree, but assigned
-        content lives per organisation: copies are materialised under
-        data/organisations/<org>/<cat> and indexed into that organisation's own
-        vector store (get_org_bot). A re-index that stops at the global tree
-        reports success while rebuilding nothing, so an org-mode deployment also
-        walks every provisioned organisation workspace. Explicitly injected
-        registries (which supply their own bots for every organisation) and
-        single-bot apps keep winning, and empty user stores contribute nothing.
-        """
-        app_ = request.app
-        if app_.state.bot is not None or app_.state.workspace_registry:
-            return
-        if user_store is None:
-            return
-        for org in user_store.list_organisations():
-            for category in user_store.organisation_workspace_categories(org["id"]):
-                yield get_org_bot(request, org["id"], category)
-
     def global_reindex_bots(request: Request):
         """Legacy global-tree bots, but only for workspaces that hold files.
 
@@ -4846,14 +4825,21 @@ def create_app(
                 yield get_bot(request, category)
 
     def workspace_reindex_categories(request: Request, category: str | None):
-        """Organisations holding a workspace, the legacy global tree aside."""
+        """Organisations holding a workspace, the legacy global tree aside.
+
+        Uses the content-aware set (seats plus indexed folders), not just seats.
+        An organisation can hold a workspace purely through assigned content —
+        no member has joined it — and a re-index must still rebuild that
+        workspace's index, or a stale index keeps serving deleted documents
+        (``org_workspace_categories`` already unions the two).
+        """
         if request.app.state.bot is not None or request.app.state.workspace_registry:
             return []
         if user_store is None:
             return []
         orgs = []
         for org in user_store.list_organisations():
-            cats = user_store.organisation_workspace_categories(org["id"])
+            cats = org_workspace_categories(org["id"])
             if category is None:
                 for cat in cats:
                     orgs.append((org["id"], cat))

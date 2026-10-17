@@ -176,6 +176,27 @@ class TestOrganisationIndexIsolation:
         assert len(OrgBot.built) == before, "a second bot was constructed for the same scope"
 
 
+class TestGlobalReindexCoverage:
+    """Re-index all must rebuild workspaces an organisation holds by assignment.
+
+    An organisation can hold a workspace with no seated member: the content is
+    assigned but nobody has joined it. Enumerating seats alone then rebuilds
+    nothing and reports success, leaving a stale index that keeps serving
+    deleted documents.
+    """
+
+    def test_ingest_rebuilds_a_content_only_workspace(self, env):
+        c, _ = env
+        make_org(c, "acme")
+        assign(c, "acme", "acme.pdf")
+        assert c.app.state.user_store.organisation_workspace_categories("acme") == []
+        bot = c.app.state.org_bots[("acme", "finance")]
+        before = bot.ingest_calls
+        res = c.post("/ingest", headers=auth())
+        assert res.status_code == 200, res.text
+        assert bot.ingest_calls == before + 1
+
+
 class TestAdminWorkspaceCatalogue:
     """The Content tab's "All workspaces" list stays useful in org-scoped mode.
 

@@ -182,6 +182,20 @@ class TestSamplePack:
         seed_sample_pack(categories=("finance",))
         assert list_documents("_sample", "finance") == ["overview_of_esg.pdf"]
 
+    def test_falls_back_to_legacy_workspace_folder(self, lib):
+        """The pre-organisation build also kept the pack in workspace folders."""
+        write_pdf(lib / "data" / "finance" / "overview_of_esg.pdf")
+        seed_sample_pack(categories=("finance",))
+        assert list_documents("_sample", "finance") == ["overview_of_esg.pdf"]
+
+    def test_already_served_pack_needs_no_source_and_does_not_warn(self, lib, caplog):
+        """A restart with the pack already served must not log a warning."""
+        write_pdf(workspace_dir("_sample", "finance") / "overview_of_esg.pdf")
+        with caplog.at_level("WARNING", logger="esg.content_library"):
+            placed = seed_sample_pack(categories=("finance",))
+        assert placed == [("finance", "overview_of_esg.pdf")]
+        assert "not found" not in caplog.text
+
     def test_customer_org_cannot_be_seeded(self, lib):
         write_pdf(library_root() / "overview_of_esg.pdf")
         with pytest.raises(ValueError, match="Only the system sample"):
