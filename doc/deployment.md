@@ -30,7 +30,8 @@ GitHub main push
 - The image already contains the models (embeddings, reranker, whisper, Kokoro),
   so the container needs no runtime downloads.
 - **Data is not in the image** — `/home/esg-data` and `/home/esg-index` are
-  created empty on first boot. You seed them (see §5).
+  created empty on first boot. You seed them (§5) or ship your existing data and
+  chat history wholesale (§5b).
 - `Deploy` is inert until the repo variables in §1 are set.
 
 ---
@@ -326,6 +327,92 @@ Recommended first-boot checks:
 2. Sign in at `/ui`, ask a workspace question, click a citation, open the source.
 3. `GET /admin/status` confirms per-workspace chunk counts.
 4. Run the acceptance suite (§1d) against the live URL — a clean run is 0 FAIL.
+
+---
+
+## 5b. Ship existing data and chat history
+
+Instead of seeding a fresh deployment by hand, you can ship **everything** from
+your machine — documents, the master library, accounts, organisations, the admin
+store and the chat history — in one bundle. Two scripts do it:
+
+| Script | Does |
+| --- | --- |
+| `scripts/pack-state.py` | Bundles `DATA_DIR` + `INDEX_DIR` into `dist/esg-state-<stamp>.tar.gz` |
+| `scripts/azure-push-state.sh` | Uploads the bundle over the Kudu API and unpacks it onto `/home` |
+
+The bundle carries exactly the two trees the app persists, laid out as
+`esg-data/` (→ `/home/esg-data`) and `esg-index/` (→ `/home/esg-index`):
+
+- **`esg-data/`** — `library/`, `organisations/<org>/`, `_shared/`, workspace trees.
+- **`esg-index/`** — `users.sqlite3` (accounts, orgs, roles), `sessions.sqlite3`
+  (**the chat history**), `workspaces.sqlite3` (workspaces, assignments, settings,
+  outbox, usage) and `vectors_*.sqlite3` (+ `organisations/<org>/…`).
+
+SQLite files are captured with the `sqlite3` **backup API**, not a plain copy, so
+a database with an un-checkpointed write-ahead log travels whole and restores as
+a single consistent file (no `-wal`/`-shm` sidecars). Local junk that must never
+travel — `data/.index`, `data/admin.db`, `.DS_Store` — is excluded automatically.
+
+### Quick path (throwaway test app)
+
+```bash
+# 1. Bring up a throwaway B2 app. Reuse your local secrets so logins and
+#    citation links keep working: export them from .env first.
+set -a; . <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env); set +a
+scripts/azure-test-up.sh                       # prints the app URL + API key
+RG=esg-chatbot-test-rg APP=<app-from-output> \
+  scripts/azure-push-state.sh --sync-env --yes
+
+# 2. Open https://<app>.azurewebsites.net/ui and sign in with an existing account.
+#    Your sessions/history are in the sidebar; the master library is under
+#    /admin → Content.
+```
+
+`--sync-env` copies every key from `.env` into the app's settings (skipping
+platform-managed ones). That is what keeps **`AUTH_SECRET` identical** to your
+machine: it is what signs session cookies and citation links, so a different
+value logs everyone out and 404s old citation links (the history itself is not
+lost). It also pushes the Stripe/SMTP values so billing and mail work.
+
+### What the push does, and its one caveat
+
+`azure-push-state.sh` reads the app's **publishing credentials**, `PUT`s the
+bundle to the Kudu VFS, runs a `tar -xzf` through the Kudu command API, restarts
+the app and waits for `/health`. It **replaces** `/home/esg-data` and
+`/home/esg-index` on the target, so **do it while the app is idle** — anything
+written on Azure during the swap is lost. For production, quiesce traffic first;
+the throwaway app is fine as-is.
+
+**Embedding model must match.** The `vectors_*.sqlite3` files are only reusable
+if the deployment's image uses the same embedding model that built them (the
+image bakes the models, so `:latest` from the same build does). If you changed
+models, ship the documents and re-index instead:
+
+```bash
+RG=… APP=… scripts/azure-push-state.sh --bundle dist/esg-state-*.tar.gz --no-restart
+# then restart with an empty index dir and re-index from /admin, or:
+az webapp ssh -g "$RG" -n "$APP"   # inside: rm -f /home/esg-index/vectors_*.sqlite3, then /admin → Re-index
+```
+
+### Manual fallback
+
+If the Kudu VFS path differs on your host (or you prefer to see it happen), the
+shell inside the container shares the same `/home`:
+
+```bash
+az webapp ssh -g "$RG" -n "$APP"
+# inside the container:
+#   (upload the bundle with `az webapp ssh` + a second terminal, or upload it
+#    yourself via the Kudu UI at https://<app>.scm.azurewebsites.net)
+rm -rf /home/esg-data /home/esg-index && tar -xzf /home/esg-state.tar.gz -C /home
+exit
+az webapp restart -g "$RG" -n "$APP"
+```
+
+Confirm the shipment afterwards: `/admin` → **Organisations** shows your orgs,
+`/admin/status` shows non-zero chunk counts, `/admin` → **Users** lists the
+accounts, and `/ui` shows the prior sessions in the sidebar.
 
 ---
 

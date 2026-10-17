@@ -2089,7 +2089,7 @@ def create_app(
             if not name:
                 continue
             payload = await f.read()
-            target = root / name
+            target = root / os.path.basename(name)
             tmp = target.with_name(target.name + ".partial")
             try:
                 tmp.write_bytes(payload)
@@ -2598,7 +2598,7 @@ def create_app(
             name = shared_docs.safe_name(f.filename)
             if not name:
                 continue
-            target = root / name
+            target = root / os.path.basename(name)
             payload = await f.read()
             tmp = target.with_name(target.name + ".partial")
             try:
@@ -2663,7 +2663,9 @@ def create_app(
         # The master file is shared storage; the registry row is the record. The
         # file goes first so a failed unlink cannot leave a row that 404s on the
         # next delete.
-        (content_library.library_root() / name).unlink(missing_ok=True)
+        (content_library.library_root() / os.path.basename(name)).unlink(
+            missing_ok=True
+        )
         store.remove_library_doc(name)
         reindexed = {}
         for org_id, cats in by_org.items():
@@ -2819,7 +2821,7 @@ def create_app(
         docs = store.list_library_docs(subject=subject or None)
         root = content_library.library_root()
         for doc in docs:
-            doc["present"] = (root / doc["filename"]).exists()
+            doc["present"] = (root / os.path.basename(doc["filename"])).exists()
             doc["assigned_to"] = [
                 row["organisation_id"]
                 for row in store.list_content_assignments()
@@ -2862,7 +2864,7 @@ def create_app(
         assigned, skipped = [], []
         for filename in dict.fromkeys(req.filenames):
             name = shared_docs.safe_name(filename)
-            source = root / name if name else None
+            source = root / os.path.basename(name) if name else None
             if not name or not source.is_file():
                 skipped.append({"filename": filename, "reason": "Not in the library."})
                 continue
@@ -2960,7 +2962,7 @@ def create_app(
         root = content_library.library_root()
         assignments = store.list_content_assignments()
         for doc in library:
-            doc["present"] = (root / doc["filename"]).exists()
+            doc["present"] = (root / os.path.basename(doc["filename"])).exists()
             doc["assigned_to"] = [
                 row["organisation_id"]
                 for row in assignments
