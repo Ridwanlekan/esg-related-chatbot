@@ -103,6 +103,14 @@ def assign(c, org_id, filename, categories=("finance",)):
     return res.json()
 
 
+def upload_master(c, filename, payload=b"%PDF master", **meta):
+    """Register a master document the way the console does, via the API."""
+    res = c.post("/admin/library/upload", headers=auth(), data=meta,
+                 files={"files": (filename, payload, "application/pdf")})
+    assert res.status_code == 200, res.text
+    return res.json()
+
+
 def member_token(c, email, org_id, category="finance"):
     """Create a user inside `org_id` and return its session token.
 
@@ -166,6 +174,54 @@ class TestOrganisationIndexIsolation:
         c.post("/chat", headers={"authorization": f"Bearer {token}"},
                json={"question": "hello", "session_id": None})
         assert len(OrgBot.built) == before, "a second bot was constructed for the same scope"
+
+
+class TestAdminWorkspaceCatalogue:
+    """The Content tab's "All workspaces" list stays useful in org-scoped mode.
+
+    Global file/chunk counts are meaningless here (each customer keeps its own
+    copy), so the console reports how many organisations provision each
+    workspace instead. That count must follow assigned content, not just seats.
+    """
+
+    def test_workspaces_report_how_many_organisations_use_each(self, env):
+        c, _ = env
+        make_org(c, "acme")
+        make_org(c, "globex")
+        assign(c, "acme", "acme.pdf")
+        assign(c, "globex", "globex.pdf")
+        rows = c.get("/admin/workspaces", headers=auth()).json()["workspaces"]
+        by_cat = {r["category"]: r for r in rows}
+        assert by_cat["finance"]["organisation_count"] == 2
+        assert by_cat["hr"]["organisation_count"] == 0
+
+    def test_delete_refuses_a_workspace_an_organisation_still_holds(self, env):
+        c, _ = env
+        make_org(c, "acme")
+        created = c.post("/admin/workspaces", headers=auth(),
+                         json={"category": "climate", "label": "Climate Risk"})
+        assert created.status_code == 200, created.text
+        assign(c, "acme", "acme.pdf", categories=("climate",))
+        out = c.delete("/admin/workspaces/climate", headers=auth())
+        assert out.status_code == 409
+        assert "acme" in out.json()["detail"]
+
+    def test_organisation_count_is_absent_for_a_single_tenant_app(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setenv("INDEX_DIR", str(tmp_path / "index"))
+        monkeypatch.setenv("WORKSPACES", "finance")
+        app = create_app(
+            session_store=SessionStore(db_path=str(tmp_path / "s.sqlite3")),
+            user_store=None,
+            workspaces={"finance": OrgBot("finance")},
+            api_key="secret-admin-key",
+            rate_limit=0,
+        )
+        client = TestClient(app)
+        row = client.get(
+            "/admin/workspaces", headers={"authorization": "Bearer secret-admin-key"}
+        ).json()["workspaces"][0]
+        assert row["organisation_count"] is None
 
 
 class TestAssignmentReindexesTheRightIndex:
@@ -317,6 +373,76 @@ class TestOrganisationDownloadEndpoint:
         res = c.get("/documents/download", headers={"authorization": f"Bearer {token}"},
                     params={"source": "overview_of_esg.pdf"})
         assert res.status_code == 200, res.text
+
+
+class TestLibraryDeletion:
+    def test_delete_removes_an_unassigned_master(self, env):
+        c, _ = env
+        upload_master(c, "solo.pdf")
+        path = content_library.library_root() / "solo.pdf"
+        assert path.exists()
+        res = c.post("/admin/library/delete", headers=auth(),
+                     json={"filename": "solo.pdf"})
+        assert res.status_code == 200, res.text
+        assert res.json()["deleted"] == "solo.pdf"
+        assert res.json()["detached_from"] == []
+        assert not path.exists()
+        assert c.get("/admin/library", headers=auth()).json()["documents"] == []
+
+    def test_delete_refuses_while_assigned_and_names_the_orgs(self, env):
+        c, _ = env
+        make_org(c, "acme")
+        upload_master(c, "shared.pdf")
+        c.post("/admin/library/assign", headers=auth(), json={
+            "organisation_id": "acme", "categories": ["finance"],
+            "filenames": ["shared.pdf"]})
+        res = c.post("/admin/library/delete", headers=auth(),
+                     json={"filename": "shared.pdf"})
+        assert res.status_code == 409, res.text
+        assert "acme" in res.json()["detail"]
+        # The refusal leaves both master and served copy untouched.
+        assert (content_library.library_root() / "shared.pdf").exists()
+        assert list_documents("acme", "finance") == ["shared.pdf"]
+
+    def test_forced_delete_pulls_the_served_copy_and_reindexes(self, env):
+        c, _ = env
+        make_org(c, "acme")
+        upload_master(c, "shared.pdf")
+        c.post("/admin/library/assign", headers=auth(), json={
+            "organisation_id": "acme", "categories": ["finance"],
+            "filenames": ["shared.pdf"]})
+        bot = c.app.state.org_bots[("acme", "finance")]
+        before = bot.ingest_calls
+        res = c.post("/admin/library/delete", headers=auth(),
+                     json={"filename": "shared.pdf", "force": True})
+        assert res.status_code == 200, res.text
+        assert res.json()["detached_from"] == ["acme"]
+        assert not (content_library.library_root() / "shared.pdf").exists()
+        assert list_documents("acme", "finance") == []
+        assert bot.ingest_calls == before + 1
+        assert c.get("/admin/library", headers=auth()).json()["documents"] == []
+
+    def test_forced_delete_touches_every_organisation_that_holds_it(self, env):
+        c, _ = env
+        make_org(c, "acme")
+        make_org(c, "globex")
+        upload_master(c, "shared.pdf")
+        for org in ("acme", "globex"):
+            c.post("/admin/library/assign", headers=auth(), json={
+                "organisation_id": org, "categories": ["finance"],
+                "filenames": ["shared.pdf"]})
+        res = c.post("/admin/library/delete", headers=auth(),
+                     json={"filename": "shared.pdf", "force": True})
+        assert res.status_code == 200, res.text
+        assert res.json()["detached_from"] == ["acme", "globex"]
+        for org in ("acme", "globex"):
+            assert list_documents(org, "finance") == []
+
+    def test_delete_of_an_unregistered_file_is_404(self, env):
+        c, _ = env
+        res = c.post("/admin/library/delete", headers=auth(),
+                     json={"filename": "nope.pdf"})
+        assert res.status_code == 404
 
 
 class TestExplicitRegistryKeepsPrecedence:

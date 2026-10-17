@@ -624,6 +624,7 @@ function meter(used, included) {
 
 function renderBilling(usage, plans) {
   const q = usage.questions || {};
+  const t = usage.tokens || {};
   const s = usage.seats || {};
   const active = ["active", "past_due", "trialing"].includes(usage.billing_status);
   const hasCustomer = usage.reporting && usage.reporting.configured;
@@ -635,6 +636,7 @@ function renderBilling(usage, plans) {
        <span class="muted">${usage.period_end ? "renews " + new Date(usage.period_end).toLocaleDateString() : ""}</span>
      </div>
      <div style="margin-top:12px"><b>Questions</b>${meter(q.used || 0, q.included)}</div>
+     <div style="margin-top:12px"><b>Tokens</b>${meter(t.used || 0, t.cap)}</div>
      <div style="margin-top:12px"><b>Seats</b>
        <div class="muted">${s.total || 0} total · ${s.extra || 0} extra billed · ${s.included_per_workspace == null ? "unlimited per workspace" : s.included_per_workspace + " included per workspace"}</div>
      </div>
@@ -643,11 +645,12 @@ function renderBilling(usage, plans) {
   $("billing-plans").innerHTML = (plans || []).map((p) => {
     const current = p.plan === usage.plan;
     const pool = p.question_pool == null ? "Unmetered questions" : `${p.question_pool} questions / period`;
+    const tokens = p.token_cap == null ? "Unmetered tokens" : `${p.token_cap.toLocaleString()} tokens / period`;
     const seats = p.included_seats == null ? "Unlimited seats" : `${p.included_seats} seats / workspace`;
     const canBuy = p.purchasable && !active && role === "owner";
     return `<div class="plan ${current ? "current" : ""}">
       <div class="pname">${esc(p.label)} ${current ? '<span class="tag ok">current</span>' : ""}</div>
-      <div class="pmeta"><b>${esc(pool)}</b><br><b>${esc(seats)}</b></div>
+      <div class="pmeta"><b>${esc(pool)}</b><br><b>${esc(tokens)}</b><br><b>${esc(seats)}</b></div>
       ${canBuy ? `<button class="primary" data-buy="${esc(p.plan)}">Choose ${esc(p.label)}</button>` : ""}
       ${!p.purchasable ? '<div class="muted">Not configured on this deployment</div>' : ""}
       ${active && role === "owner" ? '<div class="muted">Use the billing portal to change the live subscription.</div>' : ""}

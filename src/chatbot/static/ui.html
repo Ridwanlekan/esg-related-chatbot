@@ -202,12 +202,10 @@
       <input id="signup-name" type="text" autocomplete="name" placeholder="Jane Smith">
       <label for="signup-email">Email</label>
       <input id="signup-email" type="email" autocomplete="email" placeholder="you@company.com">
-      <label for="signup-cat">Workspace (category)</label>
-      <select id="signup-cat"><option value="">Loading workspaces…</option></select>
-      <div id="cat-pills"></div>
       <label for="signup-password">Password</label>
       <input id="signup-password" type="password" autocomplete="new-password" placeholder="8+ characters">
       <button id="signup-btn" class="primary">Create account</button>
+      <div id="signup-invite-note" class="hidden" style="margin-top:8px"></div>
     </div>
 
     <div id="auth-err" class="auth-err"></div>
@@ -301,7 +299,6 @@ let sessionId = null;
 let streaming = false;
 let sessionOffset = 0;
 let activeTab = "login";
-let selectedCat = "finance";
 let inviteToken = "";
 let inviteCategory = "";
 let inviteOrganisation = "";
@@ -373,12 +370,6 @@ function setActiveTab(tab) {
   setAuthError("");
 }
 
-function selectCat(cat) {
-  selectedCat = cat;
-  const sel = $("signup-cat");
-  if (sel && sel.value !== cat) sel.value = cat;
-}
-
 function escHtml(s) {
   return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -387,45 +378,21 @@ function escHtml(s) {
 
 async function loadWorkspaces() {
   try {
-    const res = await fetch("/workspaces");
-    const data = await res.json();
-    const sel = $("signup-cat");
-    const pills = $("cat-pills");
-    // A dropdown, not one pill per workspace: the list is unbounded, and pills
-    // in a flex row stretched the auth card sideways as workspaces were added.
-    const empty = (msg) => {
-      sel.innerHTML = '<option value="">' + msg + "</option>";
-      sel.disabled = true;
-      selectedCat = "";
-    };
-    if (!data.length) return empty("No workspaces available");
-    const visible = data.filter((w) => !inviteCategory || w.category === inviteCategory);
-    if (!visible.length) return empty("No workspaces available");
-    if (!visible.some((w) => w.category === selectedCat)) {
-      selectedCat = visible[0].category;
-    }
-    sel.innerHTML = visible
-      .map(
-        (w) =>
-          '<option value="' + escHtml(w.category) + '"' +
-          (w.category === selectedCat ? " selected" : "") + ">" +
-          escHtml(w.emoji || "📄") + " " + escHtml(w.label || w.category) +
-          "</option>"
-      )
-      .join("");
-    // An invite pins the workspace; disabling stops a stray edit from
-    // submitting a category the invite was not issued for.
-    sel.disabled = !!inviteCategory;
-    pills.innerHTML = "";
+    const note = $("signup-invite-note");
+    if (!note) return;
     if (inviteCategory) {
       const badge = document.createElement("div");
-      badge.className = "muted";
-      badge.style.marginTop = "8px";
+      badge.className = "tag";
       badge.textContent = "🔒 Invite-only signup for " + inviteCategory +
         (inviteOrganisation ? " · joining " + inviteOrganisation : " · free tier");
-      pills.appendChild(badge);
+      note.innerHTML = "";
+      note.appendChild(badge);
+      note.classList.remove("hidden");
+    } else {
+      note.innerHTML = "";
+      note.classList.add("hidden");
     }
-  } catch (e) { /* keep the select inert on failure */ }
+  } catch (e) { /* ignore */ }
 }
 
 async function api(path, opts = {}) {
@@ -446,7 +413,7 @@ async function submitAuth(endpoint) {
   const password = (isLogin ? $("login-password") : $("signup-password")).value;
   const body = isLogin
     ? { email, password }
-    : { email, password, name: $("signup-name").value.trim(), category: selectedCat, invite: inviteToken || undefined };
+    : { email, password, name: $("signup-name").value.trim(), invite: inviteToken || undefined };
   setAuthError(""); setBusy(btn, true, isLogin ? "Signing in…" : "Creating account…");
   try {
     const res = await fetch("/auth/" + endpoint, {
@@ -1442,7 +1409,6 @@ $("forgot-link").addEventListener("click", (e) => {
   submitForgot();
 });
 $("signup-btn").addEventListener("click", () => submitAuth("signup"));
-$("signup-cat").addEventListener("change", (e) => selectCat(e.target.value));
 
 // ---- D18 email verification -----------------------------------------------
 // The server refuses /chat for an unconfirmed free account. This keeps the

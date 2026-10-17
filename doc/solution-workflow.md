@@ -43,7 +43,9 @@ question pool, and many employees consume it.
 | Free-tier account | user in the system sample organisation `_sample` | The sample workspace, verified email, capped questions (see §5). |
 
 An organisation is either **system-owned** (`_sample`, `_default` — no owner, not
-a customer, never billed) or a **customer organisation**. Roles live only in
+a customer, never billed; `_default` is the content-less backfill pen for
+pre-organisation accounts and is hidden from the admin console, which shows only
+`_sample`) or a **customer organisation**. Roles live only in
 `org_roles`; the owner is singular and is enforced in code, not by a unique
 index. The earliest member of a customer organisation becomes its owner via the
 startup `backfill_org_roles` if no owner was set.
@@ -192,17 +194,23 @@ account**, the twin of the account-count cap:
 - Only accounts in `_sample` are subject to it; any seat in a customer
   organisation is governed by that organisation's plan instead.
 
+Free accounts are also subject to a **token ceiling** (50,000 prompt+completion
+tokens per account), the hard twin of the per-plan cap in section 6: the
+question cap bounds how many things they can ask, the token ceiling bounds what
+answering costs. It is enforced in the same place, per account, and answered
+with the same 402.
+
 ---
 
 ## 6. Adoption and entitlements
 
 Plan tiers (from the pricing proposal's table):
 
-| Plan | Question pool / period | Seats / workspace | Notes |
-| --- | --- | --- | --- |
-| Team | 500 | 5 | monthly or annual |
-| Business | 2,000 | 15 | monthly or annual |
-| Enterprise | agreed | unlimited | annual commitment only |
+| Plan | Question pool / period | Seats / workspace | Token ceiling / period | Notes |
+| --- | --- | --- | --- | --- |
+| Team | 500 | 5 | 5,000,000 | monthly or annual |
+| Business | 2,000 | 15 | 20,000,000 | monthly or annual |
+| Enterprise | agreed | unlimited | unmetered | annual commitment only |
 
 - **Per workspace billing.** The base fee is charged at quantity = the number of
   workspaces the organisation has provisioned. A workspace with no seats and no
@@ -212,6 +220,12 @@ Plan tiers (from the pricing proposal's table):
   anything missed.
 - **Question overage**, past the pool, is reported one event per question
   through `esg.question` as it crosses the pool.
+- **Token ceiling**, per plan per billing period, is a hard stop rather than an
+  overage: once an organisation's prompt+completion tokens for the period reach
+  the table above, further questions are refused with **402** until the next
+  period (or an upgrade). Enterprise is unmetered, and an organisation with no
+  plan is not governed. It is checked in `/chat` and `/chat/stream` only once a
+  question is known to need the model, so small talk never trips it.
 
 ---
 
@@ -255,10 +269,21 @@ Plan tiers (from the pricing proposal's table):
 ## 9. Platform admin console (`/admin`)
 
 API-key gated (plus optional Basic/TOTP layers). Tabs: Overview, Organisations,
-Documents, Workspaces, Users, Audit, and **Usage & Cost** (cross-customer
-tokens, estimated spend, per-workspace/kind/user breakdowns, CSV export). This
-is where organisations are created, users moved between them, content assigned,
-and legacy migrations run.
+Content, Users, Audit, and **Usage & Cost** (cross-customer tokens, estimated
+spend, per-workspace/kind/user breakdowns, CSV export). This is where
+organisations are created, users moved between them, and content assigned from
+the master library. **Content** holds the platform-level material — the master
+library, **shared documents** (one copy published to several workspaces), and
+workspace definitions (create/edit/delete). Each master row carries **Assign…**
+(jumps to Organisations with the document preselected) and **Delete**; deleting
+a master that is still assigned is refused unless the operator confirms pulling
+the served copies, so no assignment is ever left pointing at a file that is
+gone. Invite links live under
+**Organisations** and are created, **revoked** and **deleted** here: creation is
+confirmed before a token is minted (a cancelled confirmation leaves nothing
+behind), revocation turns a link off while keeping its row visible, and deletion
+removes the row entirely — neither needs the token, which is only ever shown
+once.
 
 ---
 
@@ -318,15 +343,25 @@ A Postman collection generated from the live OpenAPI schema lives in
 
 ## 12. Deployment note
 
-Locally, Stripe webhooks do not arrive unless a forwarder is running. Start one
-with:
+Locally, Stripe webhooks do not arrive unless a forwarder is running. `--api-key`
+pins the CLI to the same account as `STRIPE_SECRET_KEY` (the CLI's logged-in
+account or sandbox can differ, in which case it forwards nothing useful), and
+recent CLIs require an explicit `--events` list:
 
 ```bash
-stripe listen --forward-to localhost:8000/billing/webhook
+stripe listen --api-key "$(grep -E '^STRIPE_SECRET_KEY=' .env | cut -d= -f2-)" \
+  --events checkout.session.completed,customer.subscription.created,customer.subscription.updated,customer.subscription.deleted,invoice.paid,invoice.payment_failed \
+  --forward-to localhost:8000/billing/webhook
 ```
 
-Without it, subscriptions do not activate automatically; reconcile from Stripe
-with `POST /admin/organisations/{id}/billing/refresh`.
+The listener prints its own `whsec_...` signing secret; copy it into
+`STRIPE_WEBHOOK_SECRET`. The secret is per-account, so one taken from a different
+account or sandbox makes every event fail signature verification with a 400 and
+nothing reflects even while the listener runs.
+
+The CLI only forwards events that occur while it is running; past events are not
+replayed. Without it, reconcile with
+`POST /admin/organisations/{id}/billing/refresh`.
 
 ---
 

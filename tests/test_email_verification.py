@@ -402,6 +402,52 @@ class TestVerificationEndpoints:
         assert body["verification"]["verified"] is False
 
 
+# ---- the public base URL setting -------------------------------------------
+
+
+class TestPublicBaseUrl:
+    def test_read_requires_admin(self, env):
+        c, _ = env
+        assert c.get("/admin/settings/public-base-url").status_code == 401
+        assert c.put("/admin/settings/public-base-url",
+                     json={"url": "https://app.example.com"}).status_code == 401
+
+    def test_blank_by_default_and_falls_back_to_request(self, env):
+        c, _ = env
+        data = c.get("/admin/settings/public-base-url", headers=admin_auth()).json()
+        assert data["url"] == ""
+        assert data["source"] == "request"
+
+    def test_setting_changes_the_verification_link(self, env):
+        c, _ = env
+        saved = c.put(
+            "/admin/settings/public-base-url",
+            headers=admin_auth(),
+            json={"url": "https://app.example.com/"},
+        ).json()
+        assert saved["url"] == "https://app.example.com"  # trailing slash normalised
+        assert saved["source"] == "setting"
+        signup(c)
+        mail = c.app.state.admin_store.list_emails()
+        assert "https://app.example.com/verify-email?token=" in mail[0]["body"]
+
+    def test_rejects_a_value_that_is_not_an_origin(self, env):
+        c, _ = env
+        for bad in ("example.com", "ftp://example.com", "javascript:alert(1)"):
+            res = c.put("/admin/settings/public-base-url",
+                        headers=admin_auth(), json={"url": bad})
+            assert res.status_code == 422, bad
+
+    def test_empty_clears_the_override(self, env):
+        c, _ = env
+        c.put("/admin/settings/public-base-url", headers=admin_auth(),
+              json={"url": "https://app.example.com"})
+        cleared = c.put("/admin/settings/public-base-url", headers=admin_auth(),
+                        json={"url": ""}).json()
+        assert cleared["url"] == ""
+        assert cleared["source"] == "request"
+
+
 # ---- the outbox ------------------------------------------------------------
 
 

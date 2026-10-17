@@ -400,6 +400,9 @@ class TestCheckoutSession:
         ]
         assert session["subscription_data"]["metadata"]["plan"] == "team"
         assert session["metadata"]["organisation_id"] == "acme"
+        # Returning from Stripe carries the session id so the on-return sync can
+        # confirm a checkout whose webhook never arrived.
+        assert "{CHECKOUT_SESSION_ID}" in session["success_url"]
         # a brand-new customer is created and remembered on the organisation
         assert calls["customer"]["email"] == "owner@acme.com"
         assert store.get_organisation("acme")["stripe_customer_id"] == "cus_1"

@@ -154,15 +154,24 @@ TOKENIZERS_PARALLELISM = False
 # EMAIL_VERIFICATION_REQUIRED = 1 # 1 gates free accounts behind a confirmed email
 # VERIFICATION_TOKEN_TTL_HOURS = 48   # lifetime of a confirmation link
 #
-# Locally, Stripe webhooks do not arrive without a forwarder:
-#   stripe listen --forward-to localhost:8000/billing/webhook
-# Without it, reconcile with POST /admin/organisations/{id}/billing/refresh.
+# Locally, Stripe webhooks do not arrive without a forwarder. --api-key pins the
+# CLI to the STRIPE_SECRET_KEY account (the CLI's own login/sandbox may differ),
+# and recent CLIs require an explicit --events list:
+#   stripe listen --api-key "$STRIPE_SECRET_KEY" \
+#     --events checkout.session.completed,customer.subscription.created,customer.subscription.updated,customer.subscription.deleted,invoice.paid,invoice.payment_failed \
+#     --forward-to localhost:8000/billing/webhook
+# The listener prints "Your webhook signing secret is whsec_..."; copy that into
+# STRIPE_WEBHOOK_SECRET. It is per-account, so a secret from a different account
+# or sandbox makes every event fail signature verification (400) and nothing
+# reflects. Without the forwarder, reconcile with
+# POST /admin/organisations/{id}/billing/refresh.
 
 # --- Email (verification + password reset) ------------------------------------
 # With SMTP_HOST set, mail goes through the relay; otherwise messages are written
 # to the admin outbox (viewed at /admin/emails) so onboarding still works with no
-# mail path. Set public_base_url in admin settings so emailed links match the
-# public hostname. For production, verify your sending domain (SPF/DKIM/DMARC).
+# mail path. Set the link origin in /admin -> Users -> "Email link origin" so
+# emailed links match the public hostname (blank = use the request's origin).
+# For production, verify your sending domain (SPF/DKIM/DMARC).
 #
 # SMTP_HOST = ""                  # e.g. smtp.postmarkapp.com; empty = admin outbox fallback
 # SMTP_PORT = 587                 # STARTTLS only; implicit TLS (465) is not implemented

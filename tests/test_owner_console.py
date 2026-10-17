@@ -260,3 +260,107 @@ class TestPlanCatalog:
         team = next(p for p in plans if p["plan"] == "team")
         assert team["purchasable"] is True
         assert "month" in team["intervals"]
+
+    def test_each_plan_carries_its_token_cap(self, client, app):
+        user, token = add_manager(app, "acme", role="owner")
+        plans = client.get("/org/plans", headers=auth(token)).json()["plans"]
+        caps = {p["plan"]: p["token_cap"] for p in plans}
+        assert caps == {"team": 5_000_000, "business": 20_000_000, "enterprise": None}
+
+
+# ---- per-plan token ceiling ----------------------------------------------
+
+
+class TestTokenCap:
+    def test_cap_table_matches_the_agreed_allowances(self):
+        from chatbot import billing
+
+        assert billing.token_cap("free") == 50_000
+        assert billing.token_cap("team") == 5_000_000
+        assert billing.token_cap("business") == 20_000_000
+        # Enterprise is agreed per customer and an unplanned org is unmetered.
+        assert billing.token_cap("enterprise") is None
+        assert billing.token_cap(None) is None
+
+    def test_free_account_is_blocked_once_its_tokens_are_spent(self, client, app):
+        res = client.post("/auth/signup", json={
+            "email": "free@corp.com", "password": "password123",
+            "name": "Free", "category": "finance",
+        })
+        payload = res.json()
+        uid = payload["user"]["id"]
+        client.app.state.user_store.set_verified(uid)
+        app.state.admin_store.record_usage(
+            kind="llm", user_id=uid, organisation_id=SAMPLE_ORGANISATION_ID,
+            prompt_tokens=50_000, completion_tokens=0,
+        )
+        r = client.post(
+            "/chat",
+            json={"question": "What does our risk policy say about flooding?"},
+            headers=auth(payload["token"]),
+        )
+        assert r.status_code == 402
+        assert "token allowance" in r.json()["detail"].lower()
+
+    def test_free_account_under_the_cap_is_not_blocked(self, client, app):
+        res = client.post("/auth/signup", json={
+            "email": "free@corp.com", "password": "password123",
+            "name": "Free", "category": "finance",
+        })
+        payload = res.json()
+        uid = payload["user"]["id"]
+        client.app.state.user_store.set_verified(uid)
+        app.state.admin_store.record_usage(
+            kind="llm", user_id=uid, organisation_id=SAMPLE_ORGANISATION_ID,
+            prompt_tokens=49_999, completion_tokens=0,
+        )
+        r = client.post(
+            "/chat",
+            json={"question": "What does our risk policy say about flooding?"},
+            headers=auth(payload["token"]),
+        )
+        assert r.status_code != 402
+
+    def test_paid_org_is_blocked_once_its_period_tokens_are_spent(self, client, app):
+        _, _token = add_manager(app, "acme", role="owner")
+        store = app.state.user_store
+        store.set_organisation_billing(
+            "acme", plan="team", current_period_start="2020-01-01T00:00:00+00:00"
+        )
+        member = app.state.user_store.create_user(
+            "seat@acme.com", "password123", "Seat", "finance",
+            organisation_id="acme", verified=True,
+        )
+        token = app.state.user_store.token_for(member)
+        app.state.admin_store.record_usage(
+            kind="llm", user_id=member["id"], organisation_id="acme",
+            prompt_tokens=5_000_000, completion_tokens=0,
+        )
+        r = client.post(
+            "/chat",
+            json={"question": "What does our risk policy say about flooding?"},
+            headers=auth(token),
+        )
+        assert r.status_code == 402
+        assert "token allowance" in r.json()["detail"].lower()
+
+    def test_enterprise_is_never_capped(self, client, app):
+        add_manager(app, "acme", role="owner")
+        member = app.state.user_store.create_user(
+            "seat@acme.com", "password123", "Seat", "finance",
+            organisation_id="acme", verified=True,
+        )
+        token = app.state.user_store.token_for(member)
+        app.state.user_store.set_organisation_billing(
+            "acme", plan="enterprise", current_period_start="2020-01-01T00:00:00+00:00",
+        )
+        app.state.admin_store.record_usage(
+            kind="llm", user_id=member["id"], organisation_id="acme",
+            prompt_tokens=999_000_000, completion_tokens=0,
+        )
+        r = client.post(
+            "/chat",
+            json={"question": "What does our risk policy say about flooding?"},
+            headers=auth(token),
+        )
+        assert r.status_code != 402

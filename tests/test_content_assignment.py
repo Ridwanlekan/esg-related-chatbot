@@ -102,7 +102,15 @@ class TestOrganisationCrud:
         c, _ = env
         make_org(c)
         orgs = {o["id"] for o in c.get("/admin/organisations", headers=auth()).json()["organisations"]}
-        assert {"acme", "_sample", "_default"} <= orgs
+        assert {"acme", "_sample"} <= orgs
+
+    def test_list_hides_the_default_backfill_org(self, env):
+        """`_default` only ever holds pre-organisation accounts; it is not a
+        place anybody administers, so the console must not show it."""
+        c, _ = env
+        assert c.app.state.user_store.get_organisation("_default") is not None
+        orgs = {o["id"] for o in c.get("/admin/organisations", headers=auth()).json()["organisations"]}
+        assert "_default" not in orgs
 
     def test_list_reports_user_counts(self, env):
         c, _ = env
@@ -120,6 +128,30 @@ class TestOrganisationCrud:
         c, _ = env
         assert c.get("/admin/organisations").status_code == 401
         assert c.post("/admin/organisations", json={"id": "x"}).status_code == 401
+
+
+class TestOrganisationContentLibrary:
+    """The console's assign picker reads `library` from this endpoint and only
+    offers documents flagged `present`; without it the picker renders empty even
+    when the master library holds files (regression)."""
+
+    def test_library_flags_present_master_files(self, env):
+        c, _ = env
+        make_org(c)
+        upload_library(c, "a.pdf")
+        body = c.get("/admin/organisations/acme/content", headers=auth()).json()
+        docs = {d["filename"]: d for d in body["library"]}
+        assert docs["a.pdf"]["present"] is True
+        assert docs["a.pdf"]["assigned_to"] == []
+
+    def test_library_reports_which_organisations_hold_a_document(self, env):
+        c, _ = env
+        make_org(c)
+        upload_library(c, "a.pdf")
+        assign(c, "acme", ["a.pdf"], ["finance"])
+        body = c.get("/admin/organisations/acme/content", headers=auth()).json()
+        docs = {d["filename"]: d for d in body["library"]}
+        assert docs["a.pdf"]["assigned_to"] == ["acme"]
 
 
 class TestDeleteConfirmation:

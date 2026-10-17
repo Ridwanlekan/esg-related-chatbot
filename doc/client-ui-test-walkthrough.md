@@ -75,12 +75,15 @@ This is the setup a platform operator does for each new customer.
    and click **Save**. You should see a **Connected** badge.
 
 **A2. Add documents to the master library.**
-1. Go to the **Organisations** tab. The top card is **Master library**.
+1. Go to the **Content** tab. The first card is **Master library**.
 2. Drag a PDF/Word/Excel file onto the drop zone, give it a **Subject** (e.g.
    `climate-disclosure`), and click **Add to library**.
 3. The file appears in the library table marked **not assigned** — meaning no
    customer can see it yet. *(This is deliberate: nothing is shared until you
    assign it on purpose.)*
+4. Each row offers **Assign…** (jumps to Organisations with this file already
+   ticked) and **Delete**. Delete refuses while the file is assigned, and asks
+   you to confirm pulling the served copies before it removes the master.
 
 **A3. Create a customer organisation.**
 1. Still on **Organisations**, in the **Organisations** card enter an id
@@ -88,20 +91,22 @@ This is the setup a platform operator does for each new customer.
 2. Click **Create**. The organisation now appears in the list.
 
 **A4 (optional). Create a workspace.**
-- Go to the **Workspaces** tab → **Create workspace**. Give it a category name,
+- Go to the **Content** tab → **Create workspace**. Give it a category name,
   a label, an emoji, and a one-line description (this is what users see at
   sign-up). Click **Create**. *(Built-in Finance and HR workspaces already
   exist, so this step is only needed for a new one.)*
 
 **A5. Assign documents to the organisation's workspace.**
-1. Back on **Organisations**, in the organisation's row click **Content**.
+1. Back on **Organisations**, in the organisation's row click **Content & assignments**.
+   *(Or click **Assign…** on a **Content** tab row to arrive here with that file
+   ticked for you.)*
 2. Pick the workspace in the dropdown.
 3. Under **Assign from the master library**, tick a document, then click
    **Assign to <workspace>**. The document now appears under **Served in
    <workspace>**.
 
 **A6 (optional). Upload a document straight into a workspace.**
-- In the same **Content** area, use **Upload to this workspace**. The file is
+- In the same **Content & assignments** area, use **Upload to this workspace**. The file is
   added to the master library and assigned to this organisation only.
 
 **A7. Create a user inside the organisation.**
@@ -112,10 +117,14 @@ This is the setup a platform operator does for each new customer.
 3. Click **Create**.
 
 **A8 (optional). Invite someone instead.**
-1. **Workspaces** tab → **Invite links** card.
+1. **Organisations** tab → **Invite links** card.
 2. Choose the **Category** (workspace) and **Organisation**, set **Uses allowed**
-   and **Expires in (h)**, then click **Create invite**. Copy the one-time link
-   and send it. Anyone opening it joins that organisation's workspace.
+   and **Expires in (h)**, then click **Create invite**. Confirm the summary — a
+   cancelled confirmation creates nothing. Copy the one-time link and send it.
+   Anyone opening it joins that organisation's workspace.
+3. Use **Revoke** to turn a link off while keeping it visible (status shows
+   *revoked*), or **Delete** to remove it from the list entirely. Neither asks
+   for the token.
 
 **A9 (optional). Move a free visitor into the customer.**
 1. **Organisations** tab → the organisation's **People in <name>** card →
@@ -133,6 +142,9 @@ This is the setup a platform operator does for each new customer.
   date range and **⬇ Export CSV**.
 - **Audit** tab — a record of important actions.
 - **Users** tab → **Free accounts** shows how full the free tier is.
+- On the **Users** tab, **Edit** a person to change their name/workspace or set a
+  chosen password (type one, or **Generate**); leaving the password blank keeps
+  the current one.
 
 ---
 

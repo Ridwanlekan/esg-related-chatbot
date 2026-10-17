@@ -823,9 +823,12 @@ class UserStore:
             raise ValueError(
                 f"Password must be at least {MIN_PASSWORD_LENGTH} characters."
             )
-        if category not in self.categories():
+        cats = self.categories()
+        if not category:
+            category = cats[0] if cats else "finance"
+        if category not in cats:
             raise ValueError(
-                f"Category must be one of: {', '.join(self.categories())}."
+                f"Category must be one of: {', '.join(cats)}."
             )
         # Unspecified means the free self-service path (Section 3.5): everyone
         # lands in the shared sample organisation with the curated pack.

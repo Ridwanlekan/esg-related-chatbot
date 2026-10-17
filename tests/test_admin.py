@@ -667,6 +667,47 @@ class TestInvites:
         assert dele.status_code == 200
         assert c.get(f"/invites/{tok}").status_code == 404
 
+    def test_revoke_invite_by_id_keeps_it_listed_but_dead(self, admin_env):
+        c, _, _ = admin_env
+        inv = c.post(
+            "/admin/invites",
+            headers=auth("secret-admin-key"),
+            json={"category": "finance"},
+        ).json()
+        assert inv["id"]
+        res = c.post(
+            f"/admin/invites/id/{inv['id']}/revoke", headers=auth("secret-admin-key")
+        )
+        assert res.status_code == 200
+        # The link is dead ...
+        assert c.get(f"/invites/{inv['token']}").status_code == 404
+        # ... but the row survives, flagged so an operator can see what happened.
+        listed = c.get("/admin/invites", headers=auth("secret-admin-key")).json()
+        row = next(i for i in listed["invites"] if i["id"] == inv["id"])
+        assert row["revoked_at"]
+        assert row["valid"] is False
+        assert "revoked" in row["reason"].lower()
+        # Revoking twice is a 404, not a silent success.
+        again = c.post(
+            f"/admin/invites/id/{inv['id']}/revoke", headers=auth("secret-admin-key")
+        )
+        assert again.status_code == 404
+
+    def test_delete_invite_by_id_removes_the_row(self, admin_env):
+        c, _, _ = admin_env
+        inv = c.post(
+            "/admin/invites",
+            headers=auth("secret-admin-key"),
+            json={"category": "finance"},
+        ).json()
+        res = c.delete(
+            f"/admin/invites/id/{inv['id']}", headers=auth("secret-admin-key")
+        )
+        assert res.status_code == 200
+        assert c.get(f"/invites/{inv['token']}").status_code == 404
+        listed = c.get("/admin/invites", headers=auth("secret-admin-key")).json()
+        assert all(i["id"] != inv["id"] for i in listed["invites"])
+
 
 class TestAdminAuthGate:
     def _gated_app(self, tmp_path, basic=False, totp=None, secret="x"):

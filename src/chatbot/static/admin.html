@@ -61,6 +61,9 @@
   .ws-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--panel-2, rgba(255,255,255,.03)); border: 1px solid var(--border); border-radius: 999px; padding: 2px 6px 2px 10px; font-size: 12px; }
   .ws-chip button { border: 0; background: transparent; color: var(--muted); cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px; }
   .ws-chip button:hover { color: var(--err); }
+  .ws-chip.pending { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .lib-actions { display: flex; gap: 6px; justify-content: flex-end; }
+  .lib-actions button { padding: 3px 8px; font-size: 12px; }
   .tabs { display: flex; gap: 8px; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
   .tabs button {
     border-radius: 8px 8px 0 0; border: 1px solid transparent; border-bottom: none;
@@ -203,8 +206,7 @@
   <div class="tabs">
     <button id="tab-overview" class="active">Overview</button>
     <button id="tab-organisations">Organisations</button>
-    <button id="tab-documents">Documents</button>
-    <button id="tab-workspaces">Workspaces</button>
+    <button id="tab-content">Content</button>
     <button id="tab-users">Users</button>
     <button id="tab-audit">Audit</button>
     <button id="tab-usage">Usage &amp; Cost</button>
@@ -233,25 +235,6 @@
 
   <section id="view-organisations" class="hidden">
     <div class="card">
-      <h2>Master library <span class="muted">(curated originals — serves nobody until assigned)</span></h2>
-      <div class="row-form">
-        <div class="field"><label>Subject</label><input id="lib-subject" placeholder="e.g. climate-disclosure"></div>
-        <div class="field"><label>Jurisdiction</label><input id="lib-jurisdiction" placeholder="e.g. HK"></div>
-        <div class="field"><label>Effective date</label><input id="lib-effective" placeholder="2026-01-01"></div>
-        <div class="field"><label>Version</label><input id="lib-version" placeholder="v1"></div>
-      </div>
-      <div class="dropzone" id="lib-dz">
-        <strong>Drop master documents here</strong>
-        <small>PDF, DOCX, XLSX… these are the originals. Assign them to an organisation below.</small>
-        <small id="lib-dz-files">No files chosen yet.</small>
-      </div>
-      <input id="lib-file-input" type="file" multiple>
-      <div class="hint">Uploading registers a master copy only. No user sees anything until you assign it on purpose.</div>
-      <div class="field"><button id="btn-lib-upload" class="primary">Add to library</button></div>
-      <div id="library-list"><div class="muted">Loading…</div></div>
-    </div>
-
-    <div class="card">
       <h2>Organisations</h2>
       <div class="toolbar">
         <input id="org-id" placeholder="id, e.g. acme-ltd">
@@ -261,11 +244,6 @@
       </div>
       <div class="hint">A paying customer's organisation. Accounts are created into it and given content by explicit assignment.</div>
       <div id="org-list"><div class="muted">Loading…</div></div>
-
-      <div class="toolbar" style="margin-top:14px">
-        <button id="btn-legacy-scan" class="small">Check for pre-organisation content…</button>
-      </div>
-      <div id="legacy-box"><div class="muted"></div></div>
     </div>
 
     <div class="card hidden" id="org-detail-card">
@@ -299,22 +277,42 @@
       </div>
       <div id="org-members-list"><div class="muted">Loading…</div></div>
     </div>
+
+    <div class="card">
+      <h2>Invite links <span class="muted">(invite-only signup)</span></h2>
+      <div class="row-form">
+        <div class="field"><label>Category</label><select id="invite-cat"></select></div>
+        <div class="field"><label>Organisation</label><select id="invite-org"></select></div>
+        <div class="field"><label>Uses allowed</label><input id="invite-uses" type="number" min="1" max="1000" value="1"></div>
+        <div class="field"><label>Expires in (h)</label><input id="invite-ttl" type="number" min="1" max="8760" value="168"></div>
+        <div class="field"><label>Note (optional)</label><input id="invite-label" placeholder="e.g. audit team"></div>
+        <div class="field"><button id="btn-create-invite" class="primary">Create invite</button></div>
+      </div>
+      <div class="hint">Anyone with the one-time link can create an account in that workspace without opening signup for everyone. Choosing an organisation puts the new account in it — that is how a customer's own people join; on <em>Free</em> the account joins the shared sample. The full link is shown only once, at creation time.</div>
+      <div id="invite-list"><div class="muted" id="invite-empty">No active invites. Create one above — the full link is shown once (copy it immediately).</div></div>
+    </div>
   </section>
 
-  <section id="view-documents" class="hidden">
+  <section id="view-content" class="hidden">
     <div class="card">
-      <h2>Upload files</h2>
-      <div class="toolbar">
-        <select id="up-cat" style="flex:0 0 200px"></select>
-        <button id="btn-upload" class="primary" style="flex:0 0 auto">Upload &amp; index</button>
+      <h2>Master library <span class="muted">(curated originals — serves nobody until assigned)</span></h2>
+      <div class="row-form">
+        <div class="field"><label>Subject</label><input id="lib-subject" placeholder="e.g. climate-disclosure"></div>
+        <div class="field"><label>Jurisdiction</label><input id="lib-jurisdiction" placeholder="e.g. HK"></div>
+        <div class="field"><label>Effective date</label><input id="lib-effective" placeholder="2026-01-01"></div>
+        <div class="field"><label>Version</label><input id="lib-version" placeholder="v1"></div>
       </div>
-      <div class="dropzone" id="dropzone">
-        <div class="dz-title">Drag &amp; drop files here</div>
-        <div>— or click to browse —</div>
-        <small id="dz-files">No files chosen yet.</small>
+      <div class="dropzone" id="lib-dz">
+        <strong>Drop master documents here</strong>
+        <small>PDF, DOCX, XLSX… these are the originals. Assign them to an organisation on the Organisations tab.</small>
+        <small id="lib-dz-files">No files chosen yet.</small>
       </div>
-      <input id="file-input" type="file" multiple>
+      <input id="lib-file-input" type="file" multiple>
+      <div class="hint">Uploading registers a master copy only. No user sees anything until you assign it on purpose.</div>
+      <div class="field"><button id="btn-lib-upload" class="primary">Add to library</button></div>
+      <div id="library-list"><div class="muted">Loading…</div></div>
     </div>
+
     <div class="card">
       <h2>Shared documents <span class="muted">(served to several workspaces)</span></h2>
       <div class="hint" style="margin-bottom:10px">One copy is stored in <code>data/_shared/</code> and linked into each workspace you pick. Every workspace sees the same file, so there is a single version to maintain and no way for departments to drift apart. Re-uploading a shared document updates every linked workspace.</div>
@@ -336,17 +334,7 @@
       </div>
       <div id="shared-list"><div class="muted">Loading…</div></div>
     </div>
-    <div class="card">
-      <h2>Documents by workspace</h2>
-      <div class="toolbar">
-        <input id="doc-search" placeholder="Filter by file name…">
-        <button id="btn-refresh-docs" class="small">Refresh</button>
-      </div>
-      <div id="documents"><div class="muted">Loading…</div></div>
-    </div>
-  </section>
 
-  <section id="view-workspaces" class="hidden">
     <div class="card">
       <h2>Create workspace</h2>
       <div class="row-form">
@@ -358,6 +346,7 @@
       </div>
       <div class="hint">Only lowercase letters, numbers, <code>-</code> and <code>_</code> (2–30 chars). The category names a folder in <code>data/</code> and its own vector index.</div>
     </div>
+
     <div class="card">
       <h2>All workspaces</h2>
       <div class="toolbar">
@@ -366,19 +355,6 @@
         <a id="dl-workspaces-csv" class="small" style="font-size:12px" href="#" download>⬇ Export CSV</a>
       </div>
       <div id="ws-list"><div class="muted">Loading…</div></div>
-    </div>
-    <div class="card">
-      <h2>Invite links <span class="muted">(invite-only signup)</span></h2>
-      <div class="row-form">
-        <div class="field"><label>Category</label><select id="invite-cat"></select></div>
-        <div class="field"><label>Organisation</label><select id="invite-org"></select></div>
-        <div class="field"><label>Uses allowed</label><input id="invite-uses" type="number" min="1" max="1000" value="1"></div>
-        <div class="field"><label>Expires in (h)</label><input id="invite-ttl" type="number" min="1" max="8760" value="168"></div>
-        <div class="field"><label>Note (optional)</label><input id="invite-label" placeholder="e.g. audit team"></div>
-        <div class="field"><button id="btn-create-invite" class="primary">Create invite</button></div>
-      </div>
-      <div class="hint">Anyone with the one-time link can create an account in that workspace without opening signup for everyone. Choosing an organisation puts the new account in it — that is how a customer's own people join; on <em>Free</em> the account joins the shared sample. The full link is shown only once, at creation time.</div>
-      <div id="invite-list"><div class="muted" id="invite-empty">No active invites. Create one above — the full link is shown once (copy it immediately).</div></div>
     </div>
   </section>
 
@@ -409,6 +385,19 @@
       </div>
       <div id="outbox-list"><div class="muted">Loading…</div></div>
       <div class="actions"><button id="btn-refresh-outbox" class="small">Refresh</button></div>
+    </div>
+    <div class="card" id="base-url-card">
+      <h2>Email link origin</h2>
+      <div class="hint">
+        The origin put into verification and password-reset links. Leave blank to
+        use the address the browser requested. Set it when the app runs behind a
+        proxy or on a public hostname it cannot infer from the request.
+      </div>
+      <div class="toolbar">
+        <input id="base-url-input" placeholder="https://app.yourdomain.com" style="min-width:320px">
+        <button id="btn-save-base-url" class="primary small">Save</button>
+        <span class="muted" id="base-url-status"></span>
+      </div>
     </div>
     <div class="card">
       <h2>Create user</h2>
@@ -538,8 +527,7 @@ function csrfToken() {
 const tabs = [
   ["tab-overview", "view-overview"],
   ["tab-organisations", "view-organisations"],
-  ["tab-documents", "view-documents"],
-  ["tab-workspaces", "view-workspaces"],
+  ["tab-content", "view-content"],
   ["tab-users", "view-users"],
   ["tab-audit", "view-audit"],
   ["tab-usage", "view-usage"],
@@ -556,14 +544,16 @@ function notify(msg, kind = "ok") {
 }
 
 function showTab(name) {
+  // The library's "Assign…" shortcut arms pendingAssign then opens this tab;
+  // navigating anywhere else disarms it so it cannot surprise a later visit.
+  if (name !== "tab-organisations") pendingAssign = null;
   for (const [btn, view] of tabs) {
     $(btn).classList.toggle("active", btn === name);
     $(view).classList.toggle("hidden", btn !== name);
   }
-  if (name === "tab-organisations") { loadLibrary(); loadOrganisations(); }
-  if (name === "tab-documents") { loadDocuments(); loadCategories(); loadSharedDocuments(); }
-  if (name === "tab-workspaces") { loadWorkspaces(); loadInvites(); loadCategories(); }
-  if (name === "tab-users") { loadUsers(); loadVerifications(); loadOutbox(); }
+  if (name === "tab-organisations") { loadOrganisations(); loadInvites(); loadCategories(); }
+  if (name === "tab-content") { loadLibrary(); loadSharedDocuments(); loadWorkspaces(); loadCategories(); }
+  if (name === "tab-users") { loadUsers(); loadVerifications(); loadOutbox(); loadBaseUrl(); }
   if (name === "tab-audit") loadAudit();
   if (name === "tab-usage") loadUsage();
   if (name === "tab-overview") refreshStatus();
@@ -848,7 +838,7 @@ function renderOverview(data) {
     const note = elm("div", "muted");
     note.innerHTML = "Organisation-scoped: each of the " + data.organisations +
       " organisation(s) indexes its own copy of the content assigned to it. " +
-      "Manage content under <b>Organisations → Content</b>. " +
+      "Assign master documents to a customer under <b>Organisations</b>. " +
       "<b>Re-index all</b> rebuilds every organisation's index.";
     box.appendChild(note);
     renderProgress(data.progress);
@@ -877,12 +867,6 @@ function renderOverview(data) {
 
     const actions = document.createElement("div");
     actions.className = "ws-actions";
-    const up = document.createElement("button");
-    up.dataset.label = "Upload";
-    up.textContent = "↑ Upload";
-    up.onclick = () => { $("up-cat").value = ws.category; showTab("tab-documents"); };
-    actions.appendChild(up);
-
     const btn = document.createElement("button");
     btn.dataset.label = "Re-index " + ws.category;
     btn.textContent = "Re-index";
@@ -984,7 +968,6 @@ async function loadCategories() {
     if (!res.ok) throw new Error(res.status + " " + res.statusText);
     const ws = await res.json();
     const opts = ws.map((w) => '<option value="' + esc(w.category) + '">' + esc(w.label || w.category) + "</option>").join("");
-    $("up-cat").innerHTML = opts;
     $("user-cat").innerHTML = opts;
     $("invite-cat").innerHTML = opts;
     await loadOrgOptions();
@@ -1144,7 +1127,6 @@ async function uploadShared() {
       (where.length ? where.join(", ") : "no workspace") + ".");
     sharedPicker.reset();
     await loadSharedDocuments();
-    await loadDocuments();
     refreshStatus();
   } catch (e) { notify("Publish failed: " + e.message, "err"); }
   finally { stopIngestWatch("sharedWatch"); setBusy(btn, false); }
@@ -1167,7 +1149,6 @@ async function replaceShared(filename) {
       notify("Updated " + filename + " in " +
         Object.keys(d.reindexed || {}).join(", ") + ".");
       await loadSharedDocuments();
-      await loadDocuments();
     } catch (e) { notify("Update failed: " + e.message, "err"); }
   };
   pick.click();
@@ -1202,7 +1183,6 @@ async function addSharedTargets(filename) {
       notify(s.category + " skipped: " + s.reason, "warn");
     }
     await loadSharedDocuments();
-    await loadDocuments();
   } catch (e) { notify("Link failed: " + e.message, "err"); }
 }
 
@@ -1216,7 +1196,6 @@ async function unlinkShared(filename, category) {
     });
     notify("Detached " + filename + " from " + category + ".");
     await loadSharedDocuments();
-    await loadDocuments();
     refreshStatus();
   } catch (e) { notify("Detach failed: " + e.message, "err"); }
 }
@@ -1233,138 +1212,8 @@ async function deleteShared(filename, n) {
     notify("Deleted " + filename + " from " +
       (d.detached_from || []).join(", ") + ".");
     await loadSharedDocuments();
-    await loadDocuments();
     refreshStatus();
   } catch (e) { notify("Delete failed: " + e.message, "err"); }
-}
-
-/* ---------------- documents ---------------- */
-
-const DOC_PAGE = 100;
-let docCache = {};   // category -> { files, total_files, offset }
-
-async function loadDocuments() {
-  const box = $("documents");
-  try {
-    await fetchDocPage(null, 0);
-  } catch (e) {
-    box.innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
-    return;
-  }
-  renderDocuments($("doc-search").value.trim().toLowerCase());
-}
-
-async function fetchDocPage(category, offset) {
-  const q = "limit=" + DOC_PAGE + "&offset=" + offset;
-  const url = category
-    ? "/admin/documents?" + q + "&category=" + encodeURIComponent(category)
-    : "/admin/documents?" + q;
-  const res = await api(url, { headers: authHeaders() });
-  const data = await res.json();
-  for (const g of data.documents || []) {
-    const prev = docCache[g.category] || { files: [], total_files: 0 };
-    docCache[g.category] = {
-      files: offset === 0 ? g.files : prev.files.concat(g.files),
-      total_files: g.total_files,
-      offset: offset + g.files.length,
-    };
-  }
-}
-
-function renderDocuments(q) {
-  const box = $("documents");
-  box.innerHTML = "";
-  const cats = Object.keys(docCache);
-  if (!cats.length) { box.appendChild(elm("div", "muted", "No workspaces.")); return; }
-  for (const cat of cats) {
-    const g = docCache[cat];
-    const files = (g.files || []).filter((f) => !q || f.name.toLowerCase().includes(q));
-    const group = document.createElement("div");
-    group.className = "doc-group";
-    const h = elm("h3", "", cat + " ");
-    h.appendChild(elm("span", "count", (g.total_files || 0) + " file(s)"));
-    group.appendChild(h);
-    if (!files.length) {
-      group.appendChild(elm("div", "muted", q ? "No files match." : "No files in data/" + cat));
-    } else {
-      for (const f of files) {
-        const row = document.createElement("div");
-        row.className = "file-row";
-        const tag = elm("span", "tag " + (f.indexed ? "ok" : "warn"),
-          f.indexed ? "indexed" : "not indexed");
-        row.appendChild(tag);
-        if (f.shared) {
-          const st = elm("span", "tag custom", "shared");
-          st.title = "Served from data/_shared/" + f.shared +
-            " — edit or detach it in the Shared documents panel above.";
-          row.appendChild(st);
-        }
-        row.appendChild(elm("span", "name", f.name));
-        row.appendChild(elm("span", "muted", fmtSize(f.size)));
-        if (f.shared) {
-          const detach = elm("button", "small", "Detach");
-          detach.onclick = () => unlinkShared(f.shared, cat);
-          row.appendChild(detach);
-        } else {
-          const del = elm("button", "small danger", "Delete");
-          del.onclick = () => deleteDoc(cat, f.name);
-          row.appendChild(del);
-        }
-        group.appendChild(row);
-      }
-    }
-    if (!q && g.offset < (g.total_files || 0)) {
-      const more = elm("button", "small", "Load more (" + (g.total_files - g.offset) + " more)");
-      more.onclick = async () => {
-        more.disabled = true;
-        try { await fetchDocPage(cat, g.offset); renderDocuments(q); }
-        catch (e) { notify(e.message, "err"); more.disabled = false; }
-      };
-      group.appendChild(more);
-    }
-    box.appendChild(group);
-  }
-}
-
-async function deleteDoc(category, name) {
-  if (!confirm('Delete "' + name + '" from ' + category + ' and rebuild its index?')) return;
-  try {
-    await api("/admin/documents/delete", {
-      method: "POST", headers: authHeaders(),
-      body: JSON.stringify({ category, filename: name }),
-    });
-    notify("Deleted " + name + " — index rebuilt.");
-    await loadDocuments();
-    refreshStatus();
-  } catch (e) { notify("Delete failed: " + e.message, "err"); }
-}
-
-function chosenFiles() {
-  return privatePicker.files();
-}
-
-async function uploadFiles() {
-  const files = chosenFiles();
-  if (!files.length) { notify("Choose or drop at least one file first.", "warn"); return; }
-  const cat = $("up-cat").value;
-  const fd = new FormData();
-  fd.append("category", cat);
-  for (const f of files) fd.append("files", f, f.name);
-
-  const btn = $("btn-upload");
-  setBusy(btn, true, "uploading & indexing…");
-  watchIngest(btn, "upWatch");
-  log("[" + cat + "] upload started (" + files.length + " file(s); re-reading all data dir files)…");
-  try {
-    const res = await api("/admin/upload", { method: "POST", headers: authHeaders(false), body: fd });
-    const d = await res.json();
-    log("[" + cat + "] done — docs seen: " + d.documents_seen + ", chunks: " + d.chunks_upserted + ", stale removed: " + d.stale_chunks_removed);
-    notify("Uploaded " + d.saved_files.length + " file(s) — " + d.chunks_upserted + " chunks upserted.");
-    privatePicker.reset();
-    await loadDocuments();
-    refreshStatus();
-  } catch (e) { notify("Upload failed: " + e.message, "err"); }
-  finally { stopIngestWatch("upWatch"); setBusy(btn, false); }
 }
 
 /* ---- drag & drop ---- */
@@ -1425,7 +1274,6 @@ function wireDropzone(dzId, inputId, labelId, stashKey) {
   };
 }
 
-const privatePicker = wireDropzone("dropzone", "file-input", "dz-files", "_dropFiles");
 const sharedPicker = wireDropzone(
   "shared-dz", "shared-file-input", "shared-dz-files", "_sharedDropFiles"
 );
@@ -1461,7 +1309,7 @@ function renderLibrary() {
     box.appendChild(
       elm("div", "muted",
         "The master library is empty. Add a document above, then assign it to an " +
-        "organisation below.")
+        "organisation on the Organisations tab.")
     );
     return;
   }
@@ -1469,7 +1317,8 @@ function renderLibrary() {
   table.className = "table";
   table.innerHTML =
     "<thead><tr><th>Document</th><th>Subject</th><th>Jurisdiction</th>" +
-    "<th>Effective</th><th>Version</th><th>Size</th><th>Assigned to</th></tr></thead>";
+    "<th>Effective</th><th>Version</th><th>Size</th><th>Assigned to</th>" +
+    "<th></th></tr></thead>";
   const tbody = document.createElement("tbody");
   for (const d of libraryCache) {
     const tr = document.createElement("tr");
@@ -1489,10 +1338,75 @@ function renderLibrary() {
     const assigned = d.assigned_to || [];
     tr.appendChild(elm("td", "",
       assigned.length ? assigned.join(", ") : "not assigned"));
+
+    const actions = elm("td", "lib-actions");
+    if (d.present) {
+      const assign = elm("button", "small", "Assign…");
+      assign.title = "Pick an organisation to assign this document to.";
+      assign.onclick = () => assignShortcut(d.filename);
+      actions.appendChild(assign);
+    }
+    const del = elm("button", "small danger", "Delete");
+    del.title = "Remove this master document from the library.";
+    del.onclick = () => deleteLibraryDoc(d.filename, assigned);
+    actions.appendChild(del);
+    tr.appendChild(actions);
+
     tbody.appendChild(tr);
   }
   table.appendChild(tbody);
   box.appendChild(table);
+}
+
+// Set by the library's "Assign…" shortcut; read once by renderOrgContent so the
+// chosen master is ticked the moment an organisation's content panel opens.
+let pendingAssign = null;
+
+function assignShortcut(filename) {
+  pendingAssign = filename;
+  showTab("tab-organisations");
+  notify("Pick an organisation and open its Content & assignments — '" +
+    filename + "' will be ticked for you.");
+  const list = $("org-list");
+  if (list) list.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function deleteLibraryDoc(filename, assignedTo) {
+  const orgs = assignedTo || [];
+  const extra = orgs.length
+    ? "\n\nIt is assigned to: " + orgs.join(", ") +
+      ". Their served copies will be removed too."
+    : "";
+  if (!confirm('Delete "' + filename + '" from the master library?' + extra +
+      "\n\nThis cannot be undone.")) return;
+  const send = (force) => api("/admin/library/delete", {
+    method: "POST", headers: authHeaders(),
+    body: JSON.stringify({ filename, force }),
+  });
+  try {
+    const res = await send(orgs.length > 0);
+    const d = await res.json();
+    notify("Deleted " + d.deleted + " from the library" +
+      (orgs.length ? " and pulled its served copies." : "."));
+    pendingAssign = pendingAssign === filename ? null : pendingAssign;
+    await loadLibrary();
+    if (selectedOrg) await loadOrgContent();
+    refreshStatus();
+  } catch (e) {
+    // The server re-checks assignments; a stale list can hide a fresh one.
+    if (!orgs.length && /assigned to/i.test(e.message) &&
+        confirm(e.message + "\n\nDelete it anyway and pull those copies?")) {
+      try {
+        const d = await (await send(true)).json();
+        notify("Deleted " + d.deleted + " from the library and pulled its copies.");
+        await loadLibrary();
+        if (selectedOrg) await loadOrgContent();
+        refreshStatus();
+        return;
+      } catch (e2) { notify("Delete failed: " + e2.message, "err"); return; }
+    }
+    notify("Delete failed: " + e.message, "err");
+  }
 }
 
 async function uploadLibrary() {
@@ -1630,7 +1544,8 @@ function renderOrganisations() {
     tr.appendChild(statusCell);
     tr.appendChild(elm("td", "", o.system_owned ? "system" : "customer"));
     const actions = elm("td");
-    const open = elm("button", "small", "Content");
+    const open = elm("button", "small", "Content & assignments");
+    open.title = "Open this organisation's content: assign from the master library, upload, and manage members.";
     open.onclick = () => selectOrganisation(o);
     actions.appendChild(open);
     if (!o.system_owned) {
@@ -1690,6 +1605,12 @@ function renderOrgContent() {
     cb.checked = have.has(d.filename);
     cb.disabled = cb.checked;
     if (cb.checked) cb.title = "Already assigned in some workspace.";
+    if (pendingAssign && d.filename === pendingAssign && !cb.disabled) {
+      // Arrived from the library's "Assign…" shortcut: tick the chosen master
+      // so the operator only has to pick the workspace.
+      cb.checked = true;
+      label.classList.add("pending");
+    }
     label.appendChild(cb);
     label.appendChild(elm("span", "tag", d.subject || d.filename));
     chips.appendChild(label);
@@ -1977,6 +1898,7 @@ async function assignContent() {
     const skipped = (d.skipped || []).map((s) => s.filename + " (" + s.reason + ")");
     notify("Assigned " + (d.assigned || []).length + " document(s) to " +
       selectedOrg.id + "." + (skipped.length ? " Skipped: " + skipped.join("; ") : ""));
+    pendingAssign = null;
     await loadOrgContent();
     await loadOrganisations();
   } catch (e) { notify("Assign failed: " + e.message, "err"); }
@@ -1999,61 +1921,6 @@ async function unassignContent(filename) {
     await loadOrgContent();
     await loadOrganisations();
   } catch (e) { notify("Remove failed: " + e.message, "err"); }
-}
-
-async function scanLegacyContent() {
-  const box = $("legacy-box");
-  try {
-    const res = await api("/admin/migrations/legacy-content", {
-      headers: authHeaders(),
-    });
-    const d = await res.json();
-    box.innerHTML = "";
-    if (!d.count) {
-      box.appendChild(
-        elm("div", "muted", "No pre-organisation content found.")
-      );
-      return;
-    }
-    box.appendChild(
-      elm("div", "warn", d.count + " document(s) predate organisations. They " +
-        "still resolve through a temporary citation fallback.")
-    );
-    const list = document.createElement("div");
-    for (const doc of d.documents) {
-      list.appendChild(
-        elm("div", "ws-chip",
-          doc.filename + " · " + doc.category + (doc.shared ? " (shared)" : ""))
-      );
-    }
-    box.appendChild(list);
-    if (d.orphaned_shared && d.orphaned_shared.length) {
-      for (const o of d.orphaned_shared) {
-        box.appendChild(elm("div", "warn", o.reason));
-      }
-    }
-    if (!selectedOrg) {
-      box.appendChild(
-        elm("div", "muted", "Select an organisation above to inherit this content.")
-      );
-      return;
-    }
-    if (!confirm("Import these " + d.count + " document(s) into the library and " +
-      "assign them to " + selectedOrg.id + "?\n\nEach document keeps the " +
-      "workspace it was already in. Originals are copied, not moved.")) return;
-    const m = await api("/admin/migrations/legacy-content", {
-      method: "POST", headers: authHeaders(),
-      body: JSON.stringify({ organisation_id: selectedOrg.id }),
-    });
-    const r = await m.json();
-    const skipped = (r.skipped || []).length;
-    notify("Imported " + r.imported.length + ", assigned " +
-      (r.assigned || []).length + (skipped ? ", " + skipped + " skipped." : "."));
-    await loadOrgContent();
-    await scanLegacyContent();
-  } catch (e) {
-    box.innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
-  }
 }
 
 async function uploadToOrganisation() {
@@ -2160,16 +2027,18 @@ async function loadWorkspaces() {
 function renderWorkspaces(q) {
   const box = $("ws-list");
   box.innerHTML = "";
-  if (orgScoped) {
-    box.appendChild(elm("div", "muted",
-      "Organisation-scoped deployment: each organisation provisions its own " +
-      "workspaces and indexes its own copy of the content assigned to it. " +
-      "See Organisations → Content per customer. Use Create workspace above to " +
-      "add a new category."));
-    return;
-  }
   const list = wsCache.filter((w) =>
     !q || (w.category + " " + (w.label || "") + " " + (w.blurb || "")).toLowerCase().includes(q));
+  // The list is the master catalog of workspace categories in both modes. In an
+  // organisation-scoped deployment the per-workspace file/chunk counts are not
+  // the plot (each customer keeps its own copy), so each card reports how many
+  // organisations provision it instead.
+  if (orgScoped) {
+    box.appendChild(elm("div", "hint",
+      "Organisation-scoped: each organisation indexes its own copy of the " +
+      "documents assigned to it — manage those under Organisations. The count " +
+      "below is how many organisations provision each workspace."));
+  }
   if (!list.length) { box.appendChild(elm("div", "muted", q ? "No workspaces match." : "No workspaces yet.")); return; }
   for (const ws of list) box.appendChild(workspaceCard(ws));
 }
@@ -2188,8 +2057,13 @@ function workspaceCard(ws) {
   title.appendChild(elm("span", "tag" + (ws.custom ? " custom" : ""), ws.custom ? "custom" : "built-in"));
   view.appendChild(title);
   const stats = elm("div", "stats", ws.blurb || "");
-  stats.appendChild(elm("span", " stats", "  ·  " + (ws.data_file_count || 0) + " file(s) · " +
-    (ws.chunks == null ? "—" : ws.chunks) + " chunks"));
+  if (orgScoped) {
+    const n = ws.organisation_count;
+    stats.appendChild(elm("span", " stats", "  ·  " + (n == null ? "—" : n) + " organisation(s)"));
+  } else {
+    stats.appendChild(elm("span", " stats", "  ·  " + (ws.data_file_count || 0) + " file(s) · " +
+      (ws.chunks == null ? "—" : ws.chunks) + " chunks"));
+  }
   view.appendChild(stats);
   meta.appendChild(view);
 
@@ -2203,11 +2077,6 @@ function workspaceCard(ws) {
 
   const actions = document.createElement("div");
   actions.className = "ws-actions";
-
-  const upBtn = elm("button", "small", "↑ Upload");
-  upBtn.title = "Upload files to " + ws.category;
-  upBtn.onclick = () => { $("up-cat").value = ws.category; showTab("tab-documents"); };
-  actions.appendChild(upBtn);
 
   const editBtn = elm("button", "small", "Edit");
   editBtn.onclick = () => {
@@ -2225,7 +2094,13 @@ function workspaceCard(ws) {
 
   if (ws.custom) {
     const del = elm("button", "small danger", "Delete");
-    del.onclick = () => deleteWorkspace(ws.category, ws.data_file_count);
+    if (orgScoped && ws.organisation_count) {
+      del.disabled = true;
+      del.title = "In use by " + ws.organisation_count +
+        " organisation(s) — unassign it there first.";
+    } else {
+      del.onclick = () => deleteWorkspace(ws.category, ws.data_file_count);
+    }
     actions.appendChild(del);
   }
 
@@ -2339,13 +2214,23 @@ function renderInvites(invites) {
     tr.appendChild(elm("td", "muted", relTime(inv.created_at)));
     tr.appendChild(elm("td", "muted", relTime(inv.expires_at)));
     const tdStatus = document.createElement("td");
-    const tag = elm("span", "tag " + (inv.valid ? "ok" : "warn"), inv.valid ? "valid" : (inv.reason || "expired"));
+    const label = inv.revoked_at ? "revoked" : (inv.valid ? "valid" : "expired");
+    const tag = elm("span", "tag " + (inv.valid ? "ok" : "warn"), label);
+    if (!inv.valid && inv.reason) tag.title = inv.reason;
     tdStatus.appendChild(tag);
     tr.appendChild(tdStatus);
     const tdAct = document.createElement("td");
     const revoke = elm("button", "small danger", "Revoke");
+    revoke.disabled = !!inv.revoked_at;
+    revoke.title = inv.revoked_at
+      ? "Already revoked"
+      : "Revoke: the link stops working but stays in this list";
     revoke.onclick = () => revokeInvite(inv);
     tdAct.appendChild(revoke);
+    const del = elm("button", "small danger", "Delete");
+    del.title = "Delete: remove the invite from this list entirely";
+    del.onclick = () => deleteInvite(inv);
+    tdAct.appendChild(del);
     tr.appendChild(tdAct);
     tbody.appendChild(tr);
   }
@@ -2354,13 +2239,28 @@ function renderInvites(invites) {
 }
 
 async function revokeInvite(inv) {
-  const key = prompt("Revoking " + inv.category + " invite requires its token. Paste the invite token (the part after /invites/):");
-  if (!key) return;
+  if (!inv.id) return;
+  if (!confirm("Revoke the " + inv.category + " invite?" +
+      "\n\nThe link stops working immediately but stays in this list so you " +
+      "can see it was revoked.")) return;
   try {
-    await api("/admin/invites/" + encodeURIComponent(key), { method: "DELETE", headers: authHeaders() });
+    await api("/admin/invites/id/" + encodeURIComponent(inv.id) + "/revoke",
+      { method: "POST", headers: authHeaders() });
     notify("Invite revoked.");
     loadInvites();
   } catch (e) { notify("Revoke failed: " + e.message, "err"); }
+}
+
+async function deleteInvite(inv) {
+  if (!inv.id) return;
+  if (!confirm("Delete the " + inv.category + " invite?" +
+      "\n\nIt disappears from this list. This cannot be undone.")) return;
+  try {
+    await api("/admin/invites/id/" + encodeURIComponent(inv.id),
+      { method: "DELETE", headers: authHeaders() });
+    notify("Invite deleted.");
+    loadInvites();
+  } catch (e) { notify("Delete failed: " + e.message, "err"); }
 }
 
 async function createInvite() {
@@ -2374,6 +2274,14 @@ async function createInvite() {
   // did before invitations could name an organisation.
   const org = $("invite-org") ? $("invite-org").value : "";
   if (org) payload.organisation_id = org;
+  // Confirm before creating: the token is minted server-side and only shown
+  // once, so a cancelled confirmation must not leave an untracked invite. The
+  // admin's own summary is the last chance to back out.
+  const where = org ? "organisation " + org : "the free (sample) tier";
+  if (!confirm("Create an invite for " + payload.category + " into " + where + "?" +
+      "\n\nUses: " + payload.max_uses + " · expires in " + payload.ttl_hours +
+      "h.\n\nCreate it only when you are ready to copy the link — it is shown " +
+      "once and cannot be retrieved later.")) return;
   try {
     const res = await api("/admin/invites", {
       method: "POST", headers: authHeaders(), body: JSON.stringify(payload),
@@ -2462,6 +2370,35 @@ async function loadOutbox() {
   }
 }
 
+async function loadBaseUrl() {
+  try {
+    const res = await api("/admin/settings/public-base-url", { headers: authHeaders() });
+    const data = await res.json();
+    $("base-url-input").value = data.url || "";
+    $("base-url-status").textContent = data.source === "setting"
+      ? "Using the saved origin."
+      : "Blank → links use the request origin (" + data.effective + ").";
+  } catch (e) {
+    $("base-url-status").textContent = e.message;
+  }
+}
+
+async function saveBaseUrl() {
+  try {
+    const res = await api("/admin/settings/public-base-url", {
+      method: "PUT",
+      headers: authHeaders(),
+      body: JSON.stringify({ url: $("base-url-input").value.trim() }),
+    });
+    const data = await res.json();
+    $("base-url-input").value = data.url || "";
+    $("base-url-status").textContent = data.source === "setting"
+      ? "Using the saved origin."
+      : "Blank → links use the request origin (" + data.effective + ").";
+    notify(data.source === "setting" ? "Email link origin saved." : "Email link origin cleared.");
+  } catch (e) { notify(e.message, "err"); }
+}
+
 async function loadUsers(more = false) {
   const offset = more ? userCache.length : 0;
   try {
@@ -2524,7 +2461,7 @@ function userRow(u) {
   tr.appendChild(elm("td", "muted", (u.created_at || "").slice(0, 10)));
 
   const tdAct = document.createElement("td");
-  const upd = elm("button", "small", "Edit / Reset");
+  const upd = elm("button", "small", "Edit");
   upd.onclick = () => editUser(u);
   tdAct.appendChild(upd);
   const del = elm("button", "small danger", "Delete");
@@ -2535,25 +2472,91 @@ function userRow(u) {
 }
 
 function editUser(u) {
-  const cat = prompt("New category for " + u.email + " (empty = keep " + u.category + "):", u.category);
-  if (cat === null) return;
-  const name = prompt("New name (empty = keep):", u.name);
-  if (name === null) return;
-  const resetPass = confirm("Reset " + u.email + "'s password to a random one?");
-  let newPass = null;
-  if (resetPass) { newPass = randomPassword(); prompt("Copy the new password for " + u.email + ":", newPass); }
-  const body = {
-    category: (cat || "").trim() || undefined,
-    name: (name || "").trim() || undefined,
-    password: newPass || undefined,
+  // Editing in a form rather than a chain of prompts lets an admin set a
+  // chosen password (masked) instead of being handed a random one.
+  openModal("Edit user · " + u.email);
+  const body = $("modal-body");
+  body.innerHTML = "";
+
+  const form = elm("div", "row-form");
+
+  const nameField = elm("div", "field");
+  nameField.appendChild(elm("label", "", "Name"));
+  const nameInput = document.createElement("input");
+  nameInput.value = u.name || "";
+  nameField.appendChild(nameInput);
+  form.appendChild(nameField);
+
+  const catField = elm("div", "field");
+  catField.appendChild(elm("label", "", "Category"));
+  const catInput = document.createElement("select");
+  for (const opt of $("user-cat").options) {
+    catInput.appendChild(new Option(opt.textContent, opt.value));
+  }
+  // The catalog may have been reloaded since this user was created; keep their
+  // current category selectable even if it is no longer offered.
+  if (![...catInput.options].some((o) => o.value === u.category)) {
+    catInput.appendChild(new Option(u.category, u.category));
+  }
+  catInput.value = u.category;
+  catField.appendChild(catInput);
+  form.appendChild(catField);
+
+  const passField = elm("div", "field");
+  passField.appendChild(elm("label", "", "New password (min 8)"));
+  const passRow = document.createElement("div");
+  passRow.style.display = "flex";
+  passRow.style.gap = "8px";
+  const passInput = document.createElement("input");
+  passInput.type = "password";
+  passInput.placeholder = "Leave blank to keep current";
+  passInput.autocomplete = "new-password";
+  passInput.style.flex = "1";
+  const genPass = elm("button", "small", "Generate");
+  genPass.type = "button";
+  genPass.onclick = () => { passInput.value = randomPassword(); passInput.type = "text"; };
+  passRow.appendChild(passInput);
+  passRow.appendChild(genPass);
+  passField.appendChild(passRow);
+  passField.appendChild(elm("div", "hint", "Type a password, or Generate one. Leave blank to keep the current password."));
+  form.appendChild(passField);
+
+  const actions = elm("div", "actions");
+  actions.style.gridColumn = "1 / -1";
+  const save = elm("button", "primary", "Save changes");
+  const cancel = elm("button", "small", "Cancel");
+  cancel.onclick = () => $("modal-bg").classList.add("hidden");
+  actions.appendChild(save);
+  actions.appendChild(cancel);
+  form.appendChild(actions);
+
+  body.appendChild(form);
+
+  save.onclick = async () => {
+    const password = passInput.value;
+    if (password && password.length < 8) {
+      notify("Password must be at least 8 characters.", "err");
+      return;
+    }
+    const payload = {
+      name: nameInput.value.trim() || undefined,
+      category: catInput.value || undefined,
+      password: password || undefined,
+    };
+    setBusy(save, true, "saving…");
+    try {
+      const d = await (await api("/admin/users/" + encodeURIComponent(u.id), {
+        method: "PATCH", headers: authHeaders(), body: JSON.stringify(payload),
+      })).json();
+      notify("Updated " + d.name + " (" + d.category + ")" + (password ? " · password set" : "") + ".");
+      $("modal-bg").classList.add("hidden");
+      loadUsers();
+    } catch (e) {
+      notify("Update failed: " + e.message, "err");
+    } finally {
+      setBusy(save, false);
+    }
   };
-  api("/admin/users/" + encodeURIComponent(u.id), {
-    method: "PATCH", headers: authHeaders(),
-    body: JSON.stringify(body),
-  }).then((res) => res.json()).then((d) => {
-    notify("Updated " + d.name + " (" + d.category + ")" + (newPass ? " · new password set" : "") + ".");
-    loadUsers();
-  }).catch((e) => { notify("Update failed: " + e.message, "err"); });
 }
 
 function randomPassword() {
@@ -2725,21 +2728,19 @@ $("btn-refresh-orgs").addEventListener("click", loadOrganisations);
 $("btn-create-org").addEventListener("click", createOrganisation);
 $("btn-refresh-org-content").addEventListener("click", loadOrgContent);
 $("btn-org-upload").addEventListener("click", uploadToOrganisation);
-$("btn-legacy-scan").addEventListener("click", scanLegacyContent);
 $("btn-refresh-members").addEventListener("click", loadOrgMembers);
 $("btn-convert-user").addEventListener("click", convertFreeUser);
-$("btn-upload").addEventListener("click", uploadFiles);
 $("btn-shared-upload").addEventListener("click", uploadShared);
 $("btn-refresh-shared").addEventListener("click", loadSharedDocuments);
 $("btn-create-ws").addEventListener("click", createWorkspace);
 $("btn-create-user").addEventListener("click", createUser);
 const g = $("btn-gen-pass");
 if (g) g.addEventListener("click", () => { $("user-pass").value = randomPassword(); $("user-pass").type = "text"; });
-$("btn-refresh-docs").addEventListener("click", loadDocuments);
 $("btn-refresh-ws").addEventListener("click", loadWorkspaces);
 $("btn-refresh-users").addEventListener("click", () => loadUsers(false));
 $("btn-refresh-verify").addEventListener("click", loadVerifications);
 $("btn-refresh-outbox").addEventListener("click", loadOutbox);
+$("btn-save-base-url").addEventListener("click", () => saveBaseUrl());
 
 // Confirming or consuming from the list rather than opening a row keeps the
 // common case one click, and both reload the panel they changed.
@@ -2773,10 +2774,6 @@ $("dl-users-csv").addEventListener("click", (e) => { e.preventDefault(); downloa
 $("dl-workspaces-csv").addEventListener("click", (e) => { e.preventDefault(); downloadCsv("/admin/workspaces/export.csv", "workspaces.csv"); });
 
 let searchTimer = null;
-$("doc-search").addEventListener("input", () => {
-  clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => renderDocuments($("doc-search").value.trim().toLowerCase()), 150);
-});
 $("ws-search").addEventListener("input", () => {
   renderWorkspaces($("ws-search").value.trim().toLowerCase());
 });
@@ -2791,8 +2788,7 @@ $("audit-search").addEventListener("input", () => {
 
 $("tab-overview").addEventListener("click", () => showTab("tab-overview"));
 $("tab-organisations").addEventListener("click", () => showTab("tab-organisations"));
-$("tab-documents").addEventListener("click", () => showTab("tab-documents"));
-$("tab-workspaces").addEventListener("click", () => showTab("tab-workspaces"));
+$("tab-content").addEventListener("click", () => showTab("tab-content"));
 $("tab-users").addEventListener("click", () => showTab("tab-users"));
 $("tab-audit").addEventListener("click", () => showTab("tab-audit"));
 $("tab-usage").addEventListener("click", () => showTab("tab-usage"));
