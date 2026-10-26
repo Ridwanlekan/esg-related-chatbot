@@ -27,9 +27,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest"]
 # Multi-format ingestion (PDF, Office, HTML, AsciiDoc, images, ...).
-ingest = ["docling==2.137.0"]
+ingest = ["docling==2.142.0"]
 # Adds audio/video transcription (Whisper). Also needs the ffmpeg binary.
-ingest-asr = ["docling[asr]==2.137.0"]
+ingest-asr = ["docling[asr]==2.142.0"]
 # Voice mode: on-device STT and TTS. Cloud STT/TTS need nothing extra, since
 # they reuse the openai client already required by the base install.
 # faster-whisper pulls in PyAV, which bundles the ffmpeg libraries, so no ffmpeg
